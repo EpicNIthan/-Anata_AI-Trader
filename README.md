@@ -68,11 +68,11 @@ ENABLE_MARKET_COLLECTOR=true
 ENABLE_NEWS_COLLECTOR=true
 ```
 
-The Binance collector writes candles and market ticks. The news collector writes articles and sentiment rows from multiple providers:
+The Binance collector writes candles and market ticks. The news collector writes articles and sentiment rows from free-first providers:
 
-- CryptoPanic: crypto-specific news, primary when `CRYPTOPANIC_TOKEN` is set.
+- RSS: crypto-specific news from configured feeds such as CoinDesk, Cointelegraph, and Decrypt.
 - GDELT: global/world/macroeconomic news, no API key required.
-- NewsAPI: delayed/free fallback and dev source only.
+- NewsAPI: delayed/free fallback and dev source only, disabled unless `NEWSAPI_ENABLED=true`.
 
 Collector diagnostics:
 
@@ -82,6 +82,7 @@ curl http://localhost:8000/api/market/latest
 curl -X POST http://localhost:8000/api/market/backfill -H "Content-Type: application/json" -d "{\"limit\":100}"
 curl http://localhost:8000/api/news/status
 curl http://localhost:8000/api/news/latest
+curl http://localhost:8000/api/news/latest?provider=rss
 curl http://localhost:8000/api/news/latest?provider=gdelt
 curl -X POST http://localhost:8000/api/news/run-once -H "Content-Type: application/json" -d "{\"provider\":\"gdelt\"}"
 ```

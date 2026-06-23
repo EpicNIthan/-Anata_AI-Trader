@@ -14,10 +14,12 @@ BINANCE_REST_BASE_URL=https://data-api.binance.vision
 BINANCE_WS_BASE_URL=wss://data-stream.binance.vision
 STORE_LIVE_CANDLE_UPDATES=true
 PAPER_TRADE_TIMEFRAME=1m
-NEWS_API_KEY=your_real_key_here
-NEWS_PROVIDER=cryptopanic,gdelt,newsapi
-CRYPTOPANIC_TOKEN=your_cryptopanic_token_here
+NEWS_API_KEY=
+NEWS_PROVIDER=rss,gdelt,newsapi
+RSS_NEWS_ENABLED=true
+RSS_FEEDS=https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml,https://cointelegraph.com/rss,https://decrypt.co/feed
 GDELT_ENABLED=true
+NEWSAPI_ENABLED=false
 NEWS_POLL_INTERVAL_SECONDS=120
 ENABLE_MARKET_COLLECTOR=true
 ENABLE_NEWS_COLLECTOR=true

@@ -110,17 +110,18 @@ def news_snapshot(session: Session, collector_state: dict[str, Any] | None = Non
     age_seconds = None
     if latest and latest.published_at:
         age_seconds = (datetime.now(timezone.utc) - _aware(latest.published_at)).total_seconds()
+    enabled_providers = {item.upper() for item in settings.news_providers}
     provider_config = {
-        "cryptopanic": {
-            "enabled": "CRYPTOPANIC" in {item.upper() for item in settings.news_providers},
-            "configured": bool(settings.cryptopanic_token),
-            "role": "crypto-specific real-time news",
+        "rss": {
+            "enabled": settings.rss_news_enabled and "RSS" in enabled_providers,
+            "configured": bool(settings.rss_feeds),
+            "role": "free crypto RSS feeds",
             "delayed": False,
             "fallback": False,
-            "warning": None if settings.cryptopanic_token else "CRYPTOPANIC_TOKEN missing",
+            "warning": None if settings.rss_feeds else "RSS_FEEDS missing",
         },
         "gdelt": {
-            "enabled": settings.gdelt_enabled and "GDELT" in {item.upper() for item in settings.news_providers},
+            "enabled": settings.gdelt_enabled and "GDELT" in enabled_providers,
             "configured": True,
             "role": "global macro/world risk",
             "delayed": False,
@@ -128,7 +129,7 @@ def news_snapshot(session: Session, collector_state: dict[str, Any] | None = Non
             "warning": None,
         },
         "newsapi": {
-            "enabled": "NEWSAPI" in {item.upper() for item in settings.news_providers},
+            "enabled": settings.newsapi_enabled and "NEWSAPI" in enabled_providers,
             "configured": bool(settings.news_api_key),
             "role": "delayed/free fallback",
             "delayed": True,

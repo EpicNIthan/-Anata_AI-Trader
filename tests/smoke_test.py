@@ -5,6 +5,25 @@ import sys
 import time
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+SMOKE_FEED_PATH = ROOT / "_smoke_feed.xml"
+SMOKE_FEED_PATH.write_text(
+    """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Smoke Crypto Feed</title>
+    <item>
+      <title>Bitcoin and Ethereum liquidity improves</title>
+      <link>https://example.com/smoke-bitcoin-ethereum</link>
+      <pubDate>Wed, 24 Jun 2026 04:00:00 GMT</pubDate>
+      <description>BTC, ETH, Solana, BNB, and XRP traders watch inflation and risk.</description>
+    </item>
+  </channel>
+</rss>
+""",
+    encoding="utf-8",
+)
+
 os.environ["DATABASE_URL"] = "sqlite:///./_smoke_trading_lab.db"
 os.environ["TRADING_MODE"] = "paper"
 os.environ["ENABLE_MARKET_COLLECTOR"] = "false"
@@ -12,12 +31,14 @@ os.environ["ENABLE_NEWS_COLLECTOR"] = "false"
 os.environ["AUTO_TRADER_ENABLED"] = "false"
 os.environ["AUTO_TRADER_INTERVAL_SECONDS"] = "1"
 os.environ["AUTO_TRADER_SYMBOLS"] = "BTCUSDT"
-os.environ["NEWS_PROVIDER"] = "cryptopanic,gdelt,newsapi"
+os.environ["NEWS_PROVIDER"] = "rss,gdelt,newsapi"
+os.environ["RSS_NEWS_ENABLED"] = "true"
+os.environ["RSS_FEEDS"] = f"file://{SMOKE_FEED_PATH}"
 os.environ["GDELT_ENABLED"] = "false"
-os.environ["CRYPTOPANIC_TOKEN"] = ""
+os.environ["NEWSAPI_ENABLED"] = "false"
 os.environ["NEWS_API_KEY"] = ""
 os.environ["PAPER_START_BALANCE"] = "10000"
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient
 from sqlalchemy import func, inspect, select
@@ -81,6 +102,11 @@ def main() -> None:
         news_run = client.post("/api/news/run-once")
         assert news_run.status_code == 200, news_run.text
         assert "providers" in news_run.json(), news_run.text
+        assert news_run.json()["rows_saved"] > 0, news_run.text
+        rss_latest = client.get("/api/news/latest?provider=rss")
+        assert rss_latest.status_code == 200, rss_latest.text
+        assert rss_latest.json()[0]["provider"] == "rss", rss_latest.text
+        assert "BTCUSDT" in rss_latest.json()[0]["affected_symbols"], rss_latest.text
 
         mock_news = client.post(
             "/api/news/mock",
@@ -148,6 +174,8 @@ def main() -> None:
     engine.dispose()
     if db_path.exists():
         db_path.unlink()
+    if SMOKE_FEED_PATH.exists():
+        SMOKE_FEED_PATH.unlink()
     print("smoke_ok=true")
 
 

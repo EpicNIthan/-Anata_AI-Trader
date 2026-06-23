@@ -12,6 +12,7 @@ from sqlalchemy import func, or_, select
 
 from app.ai.news_sentiment import analyze_news
 from app.config import settings
+from app.collectors.rss_news_collector import RssNewsCollector
 from app.db.models import NewsArticle, NewsSentiment
 from app.db.session import SessionLocal
 
@@ -22,6 +23,7 @@ SYMBOL_KEYWORDS = {
     "ETHUSDT": {"eth", "ether", "ethereum"},
     "BNBUSDT": {"bnb", "binance"},
     "SOLUSDT": {"sol", "solana"},
+    "XRPUSDT": {"xrp", "ripple"},
     "USDT": {"usdt", "tether", "stablecoin"},
 }
 
@@ -44,7 +46,7 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 def _sanitize_error(exc: Exception) -> str:
     message = str(exc).strip() or type(exc).__name__
-    for secret in (settings.news_api_key, settings.cryptopanic_token):
+    for secret in (settings.news_api_key,):
         if secret:
             message = message.replace(secret, "***")
     return message.replace("apiKey=your_news_api_key", "apiKey=***")
@@ -67,7 +69,7 @@ def _affected_symbols(text: str, extra_codes: list[str] | None = None) -> list[s
             affected.add("BTCUSDT")
         elif normalized == "ETH":
             affected.add("ETHUSDT")
-        elif normalized in {"BNB", "SOL"}:
+        elif normalized in {"BNB", "SOL", "XRP"}:
             affected.add(f"{normalized}USDT")
         elif normalized == "USDT":
             affected.add("USDT")
@@ -126,56 +128,57 @@ class BaseNewsProvider:
     def unavailable_reason(self) -> str | None:
         return None
 
+    @property
+    def last_warning(self) -> str | None:
+        return None
+
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         raise NotImplementedError
 
 
-class CryptoPanicProvider(BaseNewsProvider):
-    provider = "cryptopanic"
-    role = "crypto-specific real-time news"
+class RssProvider(BaseNewsProvider):
+    provider = "rss"
+    role = "free crypto RSS feeds"
+
+    def __init__(self) -> None:
+        self._last_warning: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return settings.rss_news_enabled and _provider_enabled(self.provider)
 
     @property
     def configured(self) -> bool:
-        return bool(settings.cryptopanic_token)
+        return bool(settings.rss_feeds)
 
     @property
     def unavailable_reason(self) -> str | None:
-        return None if self.configured else "CRYPTOPANIC_TOKEN missing"
+        return None if self.configured else "RSS_FEEDS missing"
+
+    @property
+    def last_warning(self) -> str | None:
+        return self._last_warning
 
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         if not self.configured:
             return []
-        response = await client.get(
-            "https://cryptopanic.com/api/v1/posts/",
-            params={
-                "auth_token": settings.cryptopanic_token,
-                "public": "true",
-                "kind": "news",
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
+        collector = RssNewsCollector()
+        items = await collector.fetch(client, settings.rss_feeds)
+        self._last_warning = "; ".join(
+            f"{feed}: {error}" for feed, error in collector.last_errors.items()
+        ) or None
         articles: list[NormalizedArticle] = []
-        for item in payload.get("results", []):
-            title = item.get("title") or ""
-            url = item.get("url") or item.get("slug") or ""
-            if not title or not url:
-                continue
-            source_obj = item.get("source") or {}
-            currencies = item.get("currencies") or []
-            codes = [currency.get("code", "") for currency in currencies if isinstance(currency, dict)]
-            published_at = _parse_datetime(item.get("published_at")) or datetime.now(timezone.utc)
-            raw_text = " ".join(part for part in [title, item.get("domain") or "", item.get("slug") or ""] if part)
+        for item in items:
             articles.append(
                 NormalizedArticle(
                     provider=self.provider,
-                    source=source_obj.get("title") or source_obj.get("domain") or "cryptopanic",
-                    title=title,
-                    url=url,
-                    published_at=published_at,
-                    raw_text=raw_text,
-                    raw_payload=item,
-                    affected_symbols=_affected_symbols(raw_text, codes),
+                    source=item.source,
+                    title=item.title,
+                    url=item.url,
+                    published_at=item.published_at,
+                    raw_text=item.raw_text,
+                    raw_payload=item.raw_payload,
+                    affected_symbols=_affected_symbols(item.raw_text),
                 )
             )
         return articles
@@ -191,8 +194,8 @@ class GdeltProvider(BaseNewsProvider):
 
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         query = (
-            "bitcoin OR btc OR ethereum OR crypto OR cryptocurrency OR binance OR okx OR "
-            "tether OR stablecoin OR sec OR fed OR inflation OR interest rates OR war"
+            'bitcoin OR ethereum OR crypto OR cryptocurrency OR binance OR okx OR '
+            'tether OR stablecoin OR sec OR "federal reserve" OR inflation OR "interest rates" OR war'
         )
         params = {
             "query": query,
@@ -245,6 +248,10 @@ class NewsApiProvider(BaseNewsProvider):
     fallback = True
 
     @property
+    def enabled(self) -> bool:
+        return settings.newsapi_enabled and _provider_enabled(self.provider)
+
+    @property
     def configured(self) -> bool:
         return bool(settings.news_api_key)
 
@@ -294,7 +301,7 @@ class NewsCollector:
     def __init__(self, poll_seconds: int | None = None) -> None:
         self.poll_seconds = poll_seconds or settings.news_poll_seconds
         self.providers: list[BaseNewsProvider] = [
-            CryptoPanicProvider(),
+            RssProvider(),
             GdeltProvider(),
             NewsApiProvider(),
         ]
@@ -378,7 +385,7 @@ class NewsCollector:
                     status.rows_saved += saved
                     if saved:
                         status.last_saved_at = datetime.now(timezone.utc).isoformat()
-                    status.last_error = None
+                    status.last_error = provider.last_warning
                     total_saved += saved
                 except Exception as exc:
                     logger.exception("News provider failed: %s", provider.provider)
@@ -398,10 +405,13 @@ class NewsCollector:
             for item in articles:
                 existing = session.scalar(
                     select(NewsArticle).where(
-                        NewsArticle.source_name == item.provider,
                         or_(
-                            NewsArticle.url == item.url,
-                            (NewsArticle.title == item.title) & (NewsArticle.published_at == item.published_at),
+                            (NewsArticle.source == item.source) & (NewsArticle.url == item.url),
+                            (NewsArticle.source_name == item.provider)
+                            & or_(
+                                NewsArticle.url == item.url,
+                                (NewsArticle.title == item.title) & (NewsArticle.published_at == item.published_at),
+                            ),
                         ),
                     )
                 )
@@ -414,8 +424,8 @@ class NewsCollector:
                     url=item.url,
                     published_at=item.published_at,
                     raw_text=item.raw_text,
-                    raw=item.raw_payload,
-                    raw_payload=item.raw_payload,
+                    raw={**item.raw_payload, "provider": item.provider},
+                    raw_payload={**item.raw_payload, "provider": item.provider},
                 )
                 session.add(article)
                 session.flush()

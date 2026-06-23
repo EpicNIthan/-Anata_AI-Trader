@@ -14,6 +14,11 @@ def _csv(value: str | None, default: str) -> list[str]:
     return [item.strip().upper() for item in raw.split(",") if item.strip()]
 
 
+def _csv_raw(value: str | None, default: str) -> list[str]:
+    raw = value if value is not None else default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value in (None, ""):
@@ -68,14 +73,21 @@ class Settings:
     news_api_key: str | None = field(default_factory=lambda: _secret("NEWS_API_KEY"))
     news_provider_url: str = os.getenv("NEWS_PROVIDER_URL", "https://newsapi.org/v2/everything")
     news_providers: list[str] = field(
-        default_factory=lambda: _csv(os.getenv("NEWS_PROVIDER") or os.getenv("NEWS_PROVIDERS"), "cryptopanic,gdelt,newsapi")
+        default_factory=lambda: _csv(os.getenv("NEWS_PROVIDER") or os.getenv("NEWS_PROVIDERS"), "rss,gdelt,newsapi")
+    )
+    rss_news_enabled: bool = field(default_factory=lambda: _bool("RSS_NEWS_ENABLED", True))
+    rss_feeds: list[str] = field(
+        default_factory=lambda: _csv_raw(
+            os.getenv("RSS_FEEDS"),
+            "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml,https://cointelegraph.com/rss,https://decrypt.co/feed",
+        )
     )
     news_query: str = os.getenv("NEWS_QUERY", "crypto OR bitcoin OR ethereum OR macro economy")
     news_poll_seconds: int = field(
         default_factory=lambda: _int("NEWS_POLL_INTERVAL_SECONDS", _int("NEWS_POLL_SECONDS", 300))
     )
-    cryptopanic_token: str | None = field(default_factory=lambda: _secret("CRYPTOPANIC_TOKEN"))
     gdelt_enabled: bool = field(default_factory=lambda: _bool("GDELT_ENABLED", True))
+    newsapi_enabled: bool = field(default_factory=lambda: _bool("NEWSAPI_ENABLED", False))
     news_mock_fallback_enabled: bool = field(default_factory=lambda: _bool("NEWS_MOCK_FALLBACK_ENABLED"))
     paper_start_balance: float = field(default_factory=lambda: _float("PAPER_START_BALANCE", 10000.0))
     model_dir: Path = field(default_factory=lambda: Path(os.getenv("MODEL_DIR", "./models")))
