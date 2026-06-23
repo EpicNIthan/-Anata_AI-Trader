@@ -10,6 +10,8 @@ Set these in Railway project variables:
 TRADING_MODE=paper
 BINANCE_SYMBOLS=BTCUSDT,ETHUSDT
 BINANCE_INTERVAL=1m
+BINANCE_REST_BASE_URL=https://data-api.binance.vision
+BINANCE_WS_BASE_URL=wss://data-stream.binance.vision
 STORE_LIVE_CANDLE_UPDATES=true
 PAPER_TRADE_TIMEFRAME=1m
 NEWS_API_KEY=your_real_key_here
@@ -45,4 +47,3 @@ If Binance is blocked locally but reachable from Railway, market backfill and we
 ## Safety
 
 The app is paper-only. Do not add exchange API keys or live-order credentials yet.
-

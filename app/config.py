@@ -35,6 +35,17 @@ def _bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _secret(name: str) -> str | None:
+    value = os.getenv(name)
+    if value in (None, ""):
+        return None
+    cleaned = value.strip()
+    placeholders = {"your_news_api_key", "your_real_key_here", "your_api_key_here", "change_me"}
+    if cleaned.lower() in placeholders:
+        return None
+    return cleaned
+
+
 def _database_url() -> str:
     url = os.getenv("DATABASE_URL", "sqlite:///./trading_lab.db")
     if url.startswith("postgres://"):
@@ -52,8 +63,9 @@ class Settings:
     )
     binance_interval: str = os.getenv("BINANCE_INTERVAL", "1m")
     store_live_candle_updates: bool = field(default_factory=lambda: _bool("STORE_LIVE_CANDLE_UPDATES", True))
-    binance_rest_base_url: str = os.getenv("BINANCE_REST_BASE_URL", "https://api.binance.com")
-    news_api_key: str | None = os.getenv("NEWS_API_KEY") or None
+    binance_rest_base_url: str = os.getenv("BINANCE_REST_BASE_URL", "https://data-api.binance.vision")
+    binance_ws_base_url: str = os.getenv("BINANCE_WS_BASE_URL", "wss://data-stream.binance.vision")
+    news_api_key: str | None = field(default_factory=lambda: _secret("NEWS_API_KEY"))
     news_provider_url: str = os.getenv("NEWS_PROVIDER_URL", "https://newsapi.org/v2/everything")
     news_query: str = os.getenv("NEWS_QUERY", "crypto OR bitcoin OR ethereum OR macro economy")
     news_poll_seconds: int = field(default_factory=lambda: _int("NEWS_POLL_SECONDS", 300))

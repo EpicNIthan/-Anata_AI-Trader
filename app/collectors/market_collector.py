@@ -45,7 +45,7 @@ class BinanceMarketCollector:
     @property
     def stream_url(self) -> str:
         streams = "/".join(self.subscribed_streams)
-        return f"wss://stream.binance.com:9443/stream?streams={streams}"
+        return f"{settings.binance_ws_base_url.rstrip('/')}/stream?streams={streams}"
 
     async def run(self, stop_event: asyncio.Event, state: Any | None = None) -> None:
         if websockets is None:

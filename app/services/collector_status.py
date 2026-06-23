@@ -111,7 +111,7 @@ def news_snapshot(session: Session, collector_state: dict[str, Any] | None = Non
     if latest and latest.published_at:
         age_seconds = (datetime.now(timezone.utc) - _aware(latest.published_at)).total_seconds()
     missing_key = not bool(settings.news_api_key)
-    warning = "NEWS_API_KEY missing" if missing_key else None
+    warning = "NEWS_API_KEY missing or placeholder" if missing_key else None
     return {
         "collector": collector_state or {},
         "news_count": news_count,

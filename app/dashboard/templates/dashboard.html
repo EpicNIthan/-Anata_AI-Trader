@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Anata AI Trading Lab</title>
     <meta http-equiv="refresh" content="5">
-    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+    <link rel="stylesheet" href="/static/styles.css">
   </head>
   <body>
     <header class="topbar">
@@ -268,6 +268,6 @@
     <script>
       window.EQUITY_POINTS = {{ equity_points_json|safe }};
     </script>
-    <script src="{{ url_for('static', path='/dashboard.js') }}"></script>
+    <script src="/static/dashboard.js"></script>
   </body>
 </html>

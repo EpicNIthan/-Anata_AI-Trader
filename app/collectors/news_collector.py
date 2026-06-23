@@ -27,6 +27,13 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def _sanitize_error(exc: Exception) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    if settings.news_api_key:
+        message = message.replace(settings.news_api_key, "***")
+    return message.replace("apiKey=your_news_api_key", "apiKey=***")
+
+
 class NewsCollector:
     def __init__(self, poll_seconds: int | None = None) -> None:
         self.poll_seconds = poll_seconds or settings.news_poll_seconds
@@ -37,7 +44,7 @@ class NewsCollector:
 
     @property
     def unavailable_reason(self) -> str:
-        return "NEWS_API_KEY missing"
+        return "NEWS_API_KEY missing or placeholder"
 
     async def run(self, stop_event: asyncio.Event, state: Any | None = None) -> None:
         if not self.can_collect:
@@ -57,7 +64,7 @@ class NewsCollector:
             except Exception as exc:
                 logger.exception("News collector error")
                 if state:
-                    state.mark_error(str(exc))
+                    state.mark_error(_sanitize_error(exc))
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self.poll_seconds)
             except asyncio.TimeoutError:
