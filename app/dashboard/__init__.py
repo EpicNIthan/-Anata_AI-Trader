@@ -1,0 +1,2 @@
+"""Dashboard routes and assets."""
+

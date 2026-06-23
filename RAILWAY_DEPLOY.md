@@ -1,0 +1,48 @@
+# Railway Deploy Checklist
+
+This app is Railway-ready through `Dockerfile` and `railway.json`.
+
+## Required Railway Variables
+
+Set these in Railway project variables:
+
+```env
+TRADING_MODE=paper
+BINANCE_SYMBOLS=BTCUSDT,ETHUSDT
+BINANCE_INTERVAL=1m
+STORE_LIVE_CANDLE_UPDATES=true
+PAPER_TRADE_TIMEFRAME=1m
+NEWS_API_KEY=your_real_key_here
+ENABLE_MARKET_COLLECTOR=true
+ENABLE_NEWS_COLLECTOR=true
+AUTO_TRADER_ENABLED=false
+AUTO_TRADER_INTERVAL_SECONDS=60
+AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT
+PAPER_START_BALANCE=10000
+```
+
+Add a Railway PostgreSQL service. Railway should provide `DATABASE_URL`; the app accepts Railway's `postgresql://...` URL and converts it for `psycopg`.
+
+## Start Command
+
+Railway uses:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
+
+## After Deploy
+
+Open:
+
+- `/health`
+- `/dashboard`
+- `/api/market/status`
+- `/api/news/status`
+
+If Binance is blocked locally but reachable from Railway, market backfill and websocket messages should begin there.
+
+## Safety
+
+The app is paper-only. Do not add exchange API keys or live-order credentials yet.
+

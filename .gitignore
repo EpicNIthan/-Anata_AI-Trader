@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+trading_lab.db
+_smoke_trading_lab.db
+models/
+datasets/
+.pytest_cache/
+*.log
+uvicorn*.log
