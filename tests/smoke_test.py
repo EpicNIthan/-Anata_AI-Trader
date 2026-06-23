@@ -12,13 +12,17 @@ os.environ["ENABLE_NEWS_COLLECTOR"] = "false"
 os.environ["AUTO_TRADER_ENABLED"] = "false"
 os.environ["AUTO_TRADER_INTERVAL_SECONDS"] = "1"
 os.environ["AUTO_TRADER_SYMBOLS"] = "BTCUSDT"
+os.environ["NEWS_PROVIDER"] = "cryptopanic,gdelt,newsapi"
+os.environ["GDELT_ENABLED"] = "false"
+os.environ["CRYPTOPANIC_TOKEN"] = ""
+os.environ["NEWS_API_KEY"] = ""
 os.environ["PAPER_START_BALANCE"] = "10000"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
 from sqlalchemy import func, inspect, select
 
-from app.db.models import AiDecision, Candle, ExperienceRecord, Feature
+from app.db.models import AiDecision, Candle, ExperienceRecord, Feature, NewsArticle, NewsSentiment
 from app.db.session import engine
 from app.db.session import SessionLocal
 from app.main import app
@@ -73,6 +77,25 @@ def main() -> None:
         experiences = client.get("/api/experiences")
         assert experiences.status_code == 200, experiences.text
         assert len(experiences.json()) >= 1, experiences.text
+
+        news_run = client.post("/api/news/run-once")
+        assert news_run.status_code == 200, news_run.text
+        assert "providers" in news_run.json(), news_run.text
+
+        mock_news = client.post(
+            "/api/news/mock",
+            json={
+                "title": "Mock BTC macro update",
+                "body": "Bitcoin and Ethereum traders watch inflation, the Fed, and liquidity risk.",
+            },
+        )
+        assert mock_news.status_code == 200, mock_news.text
+        assert mock_news.json()["rows_saved"] == 1, mock_news.text
+        with SessionLocal() as session:
+            news_count = session.scalar(select(func.count(NewsArticle.id))) or 0
+            sentiment_count = session.scalar(select(func.count(NewsSentiment.id))) or 0
+        assert news_count > 0
+        assert sentiment_count > 0
 
         collector_status = client.get("/api/collectors/status")
         assert collector_status.status_code == 200, collector_status.text

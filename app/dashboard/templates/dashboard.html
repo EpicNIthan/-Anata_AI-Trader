@@ -114,13 +114,21 @@
             <h2>News Data</h2>
             <span class="{{ 'negative' if news_status.warning or news_status.stale else 'positive' }}">{{ news_status.warning or ('Stale' if news_status.stale else 'Fresh') }}</span>
           </div>
-          <dl class="decision">
-            <dt>Configured</dt><dd>{{ 'Yes' if news_status.news_api_key_configured else 'No' }}</dd>
-            <dt>Latest News</dt><dd>{{ news_status.latest_news_time or '-' }}</dd>
-            <dt>Latest Source</dt><dd>{{ news_status.latest_source or '-' }}</dd>
-            <dt>Sentiment Rows</dt><dd>{{ news_status.sentiment_count }}</dd>
-            <dt>Experiences</dt><dd>{{ news_status.experience_count }}</dd>
-          </dl>
+          <div class="provider-list">
+            {% for provider, item in news_status.providers.items() %}
+              <div class="provider-row">
+                <strong>{{ provider|title }}</strong>
+                <span>{{ item.role }}</span>
+                <span>{{ 'Enabled' if item.enabled else 'Disabled' }} | {{ 'Configured' if item.configured else 'Missing config' }}</span>
+                <span>{{ 'Fallback' if item.fallback else 'Primary' }}{% if item.delayed %} | Delayed/free{% endif %}</span>
+                <span>Articles {{ item.article_count or 0 }}</span>
+                <span>Latest {{ item.latest_article_at or '-' }}</span>
+                {% if item.last_error %}
+                  <span class="warning">{{ item.last_error }}</span>
+                {% endif %}
+              </div>
+            {% endfor %}
+          </div>
         </article>
 
         <article class="panel">

@@ -126,8 +126,21 @@ def news_status(request: Request, session: Session = Depends(get_session)) -> di
 
 
 @router.get("/news/latest")
-def news_latest(session: Session = Depends(get_session), limit: int = 25) -> list[dict[str, Any]]:
-    return latest_news(session, limit=limit)
+def news_latest(
+    session: Session = Depends(get_session),
+    limit: int = 25,
+    provider: str | None = None,
+) -> list[dict[str, Any]]:
+    return latest_news(session, limit=limit, provider=provider)
+
+
+@router.post("/news/run-once")
+async def news_run_once(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    payload = payload or {}
+    provider = payload.get("provider")
+    if provider:
+        provider = str(provider).lower()
+    return await NewsCollector().fetch_once(provider_filter=provider)
 
 
 @router.post("/news/mock")

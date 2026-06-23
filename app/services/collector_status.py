@@ -110,10 +110,61 @@ def news_snapshot(session: Session, collector_state: dict[str, Any] | None = Non
     age_seconds = None
     if latest and latest.published_at:
         age_seconds = (datetime.now(timezone.utc) - _aware(latest.published_at)).total_seconds()
-    missing_key = not bool(settings.news_api_key)
-    warning = "NEWS_API_KEY missing or placeholder" if missing_key else None
+    provider_config = {
+        "cryptopanic": {
+            "enabled": "CRYPTOPANIC" in {item.upper() for item in settings.news_providers},
+            "configured": bool(settings.cryptopanic_token),
+            "role": "crypto-specific real-time news",
+            "delayed": False,
+            "fallback": False,
+            "warning": None if settings.cryptopanic_token else "CRYPTOPANIC_TOKEN missing",
+        },
+        "gdelt": {
+            "enabled": settings.gdelt_enabled and "GDELT" in {item.upper() for item in settings.news_providers},
+            "configured": True,
+            "role": "global macro/world risk",
+            "delayed": False,
+            "fallback": False,
+            "warning": None,
+        },
+        "newsapi": {
+            "enabled": "NEWSAPI" in {item.upper() for item in settings.news_providers},
+            "configured": bool(settings.news_api_key),
+            "role": "delayed/free fallback",
+            "delayed": True,
+            "fallback": True,
+            "warning": None if settings.news_api_key else "NEWS_API_KEY missing or placeholder",
+        },
+    }
+    provider_details = ((collector_state or {}).get("details") or {}).get("providers") or {}
+    providers: dict[str, Any] = {}
+    for provider, base in provider_config.items():
+        latest_provider = session.scalar(
+            select(NewsArticle)
+            .where(NewsArticle.source_name == provider)
+            .order_by(desc(NewsArticle.published_at))
+            .limit(1)
+        )
+        count_provider = session.scalar(
+            select(func.count(NewsArticle.id)).where(NewsArticle.source_name == provider)
+        ) or 0
+        live = provider_details.get(provider, {})
+        providers[provider] = {
+            **base,
+            **live,
+            "article_count": count_provider,
+            "latest_article_at": _dt(latest_provider.published_at if latest_provider else None),
+            "latest_title": latest_provider.title if latest_provider else None,
+            "last_error": live.get("last_error") or base["warning"],
+        }
+    warning = "; ".join(
+        provider["last_error"]
+        for provider in providers.values()
+        if provider["enabled"] and provider.get("last_error") and not provider.get("configured")
+    ) or None
     return {
         "collector": collector_state or {},
+        "providers": providers,
         "news_count": news_count,
         "sentiment_count": sentiment_count,
         "experience_count": experience_count,
@@ -128,16 +179,18 @@ def news_snapshot(session: Session, collector_state: dict[str, Any] | None = Non
     }
 
 
-def latest_news(session: Session, limit: int = 25) -> list[dict[str, Any]]:
-    rows = session.execute(
+def latest_news(session: Session, limit: int = 25, provider: str | None = None) -> list[dict[str, Any]]:
+    query = (
         select(NewsArticle, NewsSentiment)
         .outerjoin(NewsSentiment, NewsSentiment.article_id == NewsArticle.id)
-        .order_by(desc(NewsArticle.published_at))
-        .limit(limit)
-    ).all()
+    )
+    if provider:
+        query = query.where(NewsArticle.source_name == provider.lower())
+    rows = session.execute(query.order_by(desc(NewsArticle.published_at)).limit(limit)).all()
     return [
         {
             "id": article.id,
+            "provider": article.source_name,
             "title": article.title,
             "source": article.source,
             "url": article.url,

@@ -67,8 +67,15 @@ class Settings:
     binance_ws_base_url: str = os.getenv("BINANCE_WS_BASE_URL", "wss://data-stream.binance.vision")
     news_api_key: str | None = field(default_factory=lambda: _secret("NEWS_API_KEY"))
     news_provider_url: str = os.getenv("NEWS_PROVIDER_URL", "https://newsapi.org/v2/everything")
+    news_providers: list[str] = field(
+        default_factory=lambda: _csv(os.getenv("NEWS_PROVIDER") or os.getenv("NEWS_PROVIDERS"), "cryptopanic,gdelt,newsapi")
+    )
     news_query: str = os.getenv("NEWS_QUERY", "crypto OR bitcoin OR ethereum OR macro economy")
-    news_poll_seconds: int = field(default_factory=lambda: _int("NEWS_POLL_SECONDS", 300))
+    news_poll_seconds: int = field(
+        default_factory=lambda: _int("NEWS_POLL_INTERVAL_SECONDS", _int("NEWS_POLL_SECONDS", 300))
+    )
+    cryptopanic_token: str | None = field(default_factory=lambda: _secret("CRYPTOPANIC_TOKEN"))
+    gdelt_enabled: bool = field(default_factory=lambda: _bool("GDELT_ENABLED", True))
     news_mock_fallback_enabled: bool = field(default_factory=lambda: _bool("NEWS_MOCK_FALLBACK_ENABLED"))
     paper_start_balance: float = field(default_factory=lambda: _float("PAPER_START_BALANCE", 10000.0))
     model_dir: Path = field(default_factory=lambda: Path(os.getenv("MODEL_DIR", "./models")))

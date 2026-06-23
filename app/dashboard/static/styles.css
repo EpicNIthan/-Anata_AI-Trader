@@ -255,6 +255,23 @@ th {
   gap: 10px;
 }
 
+.provider-list {
+  display: grid;
+  gap: 10px;
+}
+
+.provider-row {
+  display: grid;
+  gap: 4px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.provider-row span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .news-list a {
   display: grid;
   gap: 4px;

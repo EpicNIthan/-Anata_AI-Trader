@@ -68,7 +68,11 @@ ENABLE_MARKET_COLLECTOR=true
 ENABLE_NEWS_COLLECTOR=true
 ```
 
-The Binance collector writes candles and market ticks. The news collector writes articles and sentiment rows when `NEWS_API_KEY` is set.
+The Binance collector writes candles and market ticks. The news collector writes articles and sentiment rows from multiple providers:
+
+- CryptoPanic: crypto-specific news, primary when `CRYPTOPANIC_TOKEN` is set.
+- GDELT: global/world/macroeconomic news, no API key required.
+- NewsAPI: delayed/free fallback and dev source only.
 
 Collector diagnostics:
 
@@ -78,6 +82,8 @@ curl http://localhost:8000/api/market/latest
 curl -X POST http://localhost:8000/api/market/backfill -H "Content-Type: application/json" -d "{\"limit\":100}"
 curl http://localhost:8000/api/news/status
 curl http://localhost:8000/api/news/latest
+curl http://localhost:8000/api/news/latest?provider=gdelt
+curl -X POST http://localhost:8000/api/news/run-once -H "Content-Type: application/json" -d "{\"provider\":\"gdelt\"}"
 ```
 
 Market status exposes `last_message_at`, `last_saved_at`, `messages_received`, `rows_saved`, `last_error`, `subscribed_streams`, `websocket_url`, and whether candles are live-updated or closed-only. Binance streams are lowercase, for example `btcusdt@kline_1m`.
@@ -88,7 +94,7 @@ Use this to see live candle changes before candle close:
 STORE_LIVE_CANDLE_UPDATES=true
 ```
 
-If `NEWS_API_KEY` is missing, the news worker reports `NEWS_API_KEY missing` and does not pretend to run. For UI/sentiment testing without a provider:
+If one provider fails or is missing a token, the other providers continue. For UI/sentiment testing without a provider:
 
 ```powershell
 curl -X POST http://localhost:8000/api/news/mock -H "Content-Type: application/json" -d "{\"title\":\"Mock BTC update\",\"body\":\"Bitcoin rallies as liquidity improves\"}"

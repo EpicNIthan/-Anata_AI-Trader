@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from app.ai.news_sentiment import analyze_news
 from app.config import settings
@@ -15,13 +17,26 @@ from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
 
+SYMBOL_KEYWORDS = {
+    "BTCUSDT": {"btc", "bitcoin"},
+    "ETHUSDT": {"eth", "ether", "ethereum"},
+    "BNBUSDT": {"bnb", "binance"},
+    "SOLUSDT": {"sol", "solana"},
+    "USDT": {"usdt", "tether", "stablecoin"},
+}
+
 
 def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
+        if value.isdigit() and len(value) == 14:
+            return datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
         normalized = value.replace("Z", "+00:00")
-        return datetime.fromisoformat(normalized)
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
     except ValueError:
         logger.debug("Could not parse news timestamp: %s", value)
         return None
@@ -29,40 +44,306 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 def _sanitize_error(exc: Exception) -> str:
     message = str(exc).strip() or type(exc).__name__
-    if settings.news_api_key:
-        message = message.replace(settings.news_api_key, "***")
+    for secret in (settings.news_api_key, settings.cryptopanic_token):
+        if secret:
+            message = message.replace(secret, "***")
     return message.replace("apiKey=your_news_api_key", "apiKey=***")
+
+
+def _provider_enabled(name: str) -> bool:
+    return name.lower() in {provider.lower() for provider in settings.news_providers}
+
+
+def _affected_symbols(text: str, extra_codes: list[str] | None = None) -> list[str]:
+    tokens = {part.strip(".,:;!?()[]{}\"'").lower() for part in text.split()}
+    affected = {
+        symbol
+        for symbol, words in SYMBOL_KEYWORDS.items()
+        if tokens & words
+    }
+    for code in extra_codes or []:
+        normalized = code.strip().upper()
+        if normalized == "BTC":
+            affected.add("BTCUSDT")
+        elif normalized == "ETH":
+            affected.add("ETHUSDT")
+        elif normalized in {"BNB", "SOL"}:
+            affected.add(f"{normalized}USDT")
+        elif normalized == "USDT":
+            affected.add("USDT")
+    return sorted(affected)
+
+
+@dataclass
+class NormalizedArticle:
+    provider: str
+    source: str
+    title: str
+    url: str
+    published_at: datetime
+    raw_text: str
+    raw_payload: dict[str, Any]
+    affected_symbols: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProviderStatus:
+    provider: str
+    enabled: bool
+    configured: bool
+    role: str
+    delayed: bool = False
+    fallback: bool = False
+    running: bool = False
+    last_run_at: str | None = None
+    last_saved_at: str | None = None
+    rows_saved: int = 0
+    messages_received: int = 0
+    last_error: str | None = None
+    latest_article_at: str | None = None
+    latest_title: str | None = None
+    article_count: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class BaseNewsProvider:
+    provider = "base"
+    role = "news"
+    delayed = False
+    fallback = False
+
+    @property
+    def enabled(self) -> bool:
+        return _provider_enabled(self.provider)
+
+    @property
+    def configured(self) -> bool:
+        return True
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        return None
+
+    async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
+        raise NotImplementedError
+
+
+class CryptoPanicProvider(BaseNewsProvider):
+    provider = "cryptopanic"
+    role = "crypto-specific real-time news"
+
+    @property
+    def configured(self) -> bool:
+        return bool(settings.cryptopanic_token)
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        return None if self.configured else "CRYPTOPANIC_TOKEN missing"
+
+    async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
+        if not self.configured:
+            return []
+        response = await client.get(
+            "https://cryptopanic.com/api/v1/posts/",
+            params={
+                "auth_token": settings.cryptopanic_token,
+                "public": "true",
+                "kind": "news",
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        articles: list[NormalizedArticle] = []
+        for item in payload.get("results", []):
+            title = item.get("title") or ""
+            url = item.get("url") or item.get("slug") or ""
+            if not title or not url:
+                continue
+            source_obj = item.get("source") or {}
+            currencies = item.get("currencies") or []
+            codes = [currency.get("code", "") for currency in currencies if isinstance(currency, dict)]
+            published_at = _parse_datetime(item.get("published_at")) or datetime.now(timezone.utc)
+            raw_text = " ".join(part for part in [title, item.get("domain") or "", item.get("slug") or ""] if part)
+            articles.append(
+                NormalizedArticle(
+                    provider=self.provider,
+                    source=source_obj.get("title") or source_obj.get("domain") or "cryptopanic",
+                    title=title,
+                    url=url,
+                    published_at=published_at,
+                    raw_text=raw_text,
+                    raw_payload=item,
+                    affected_symbols=_affected_symbols(raw_text, codes),
+                )
+            )
+        return articles
+
+
+class GdeltProvider(BaseNewsProvider):
+    provider = "gdelt"
+    role = "global macro/world risk"
+
+    @property
+    def enabled(self) -> bool:
+        return settings.gdelt_enabled and _provider_enabled(self.provider)
+
+    async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
+        query = (
+            "bitcoin OR btc OR ethereum OR crypto OR cryptocurrency OR binance OR okx OR "
+            "tether OR stablecoin OR sec OR fed OR inflation OR interest rates OR war"
+        )
+        params = {
+            "query": query,
+            "mode": "ArtList",
+            "format": "json",
+            "maxrecords": 50,
+            "sort": "HybridRel",
+        }
+        url = f"https://api.gdeltproject.org/api/v2/doc/doc?{urlencode(params)}"
+        response = await client.get(url)
+        response.raise_for_status()
+        payload = response.json()
+        articles: list[NormalizedArticle] = []
+        for item in payload.get("articles", []):
+            title = item.get("title") or ""
+            article_url = item.get("url") or ""
+            if not title or not article_url:
+                continue
+            source = item.get("domain") or item.get("sourceCommonName") or "gdelt"
+            published_at = _parse_datetime(item.get("seendate")) or datetime.now(timezone.utc)
+            raw_text = " ".join(
+                part
+                for part in [
+                    title,
+                    item.get("domain") or "",
+                    item.get("language") or "",
+                    item.get("sourcecountry") or "",
+                ]
+                if part
+            )
+            articles.append(
+                NormalizedArticle(
+                    provider=self.provider,
+                    source=source,
+                    title=title,
+                    url=article_url,
+                    published_at=published_at,
+                    raw_text=raw_text,
+                    raw_payload=item,
+                    affected_symbols=_affected_symbols(raw_text),
+                )
+            )
+        return articles
+
+
+class NewsApiProvider(BaseNewsProvider):
+    provider = "newsapi"
+    role = "delayed/free fallback"
+    delayed = True
+    fallback = True
+
+    @property
+    def configured(self) -> bool:
+        return bool(settings.news_api_key)
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        return None if self.configured else "NEWS_API_KEY missing or placeholder"
+
+    async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
+        if not self.configured:
+            return []
+        response = await client.get(
+            settings.news_provider_url,
+            params={
+                "q": settings.news_query,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": 50,
+                "apiKey": settings.news_api_key,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        articles: list[NormalizedArticle] = []
+        for item in payload.get("articles", []):
+            title = item.get("title") or ""
+            url = item.get("url") or ""
+            if not title or not url:
+                continue
+            source = (item.get("source") or {}).get("name") or "newsapi"
+            body = item.get("content") or item.get("description") or title
+            articles.append(
+                NormalizedArticle(
+                    provider=self.provider,
+                    source=source,
+                    title=title,
+                    url=url,
+                    published_at=_parse_datetime(item.get("publishedAt")) or datetime.now(timezone.utc),
+                    raw_text=body,
+                    raw_payload=item,
+                    affected_symbols=_affected_symbols(body),
+                )
+            )
+        return articles
 
 
 class NewsCollector:
     def __init__(self, poll_seconds: int | None = None) -> None:
         self.poll_seconds = poll_seconds or settings.news_poll_seconds
+        self.providers: list[BaseNewsProvider] = [
+            CryptoPanicProvider(),
+            GdeltProvider(),
+            NewsApiProvider(),
+        ]
+        self.statuses: dict[str, ProviderStatus] = {
+            provider.provider: ProviderStatus(
+                provider=provider.provider,
+                enabled=provider.enabled,
+                configured=provider.configured,
+                role=provider.role,
+                delayed=provider.delayed,
+                fallback=provider.fallback,
+                last_error=provider.unavailable_reason if provider.enabled and not provider.configured else None,
+            )
+            for provider in self.providers
+        }
 
     @property
     def can_collect(self) -> bool:
-        return bool(settings.news_api_key) or settings.news_mock_fallback_enabled
+        return any(provider.enabled and provider.configured for provider in self.providers)
 
     @property
     def unavailable_reason(self) -> str:
-        return "NEWS_API_KEY missing or placeholder"
+        enabled = [provider for provider in self.providers if provider.enabled]
+        if not enabled:
+            return "No news providers enabled"
+        return "; ".join(provider.unavailable_reason or "" for provider in enabled if not provider.configured) or "No news providers configured"
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        self.refresh_db_counts()
+        return {name: status.as_dict() for name, status in self.statuses.items()}
 
     async def run(self, stop_event: asyncio.Event, state: Any | None = None) -> None:
         if not self.can_collect:
             if state:
                 state.warning = self.unavailable_reason
+                state.details = {"providers": self.snapshot()}
                 state.mark_error(self.unavailable_reason)
             return
 
         while not stop_event.is_set():
             try:
                 if state:
-                    state.mark_message({"provider": "mock" if not settings.news_api_key else settings.news_provider_url})
-                count = await self.fetch_once()
+                    state.mark_message({"providers": self.snapshot()})
+                result = await self.fetch_once()
                 if state:
-                    state.mark_saved(count, {"articles_stored": count, "rows_saved": count})
-                    state.last_error = None
+                    state.mark_saved(result["rows_saved"], {"providers": self.snapshot(), **result})
+                    state.last_error = self._combined_errors()
             except Exception as exc:
-                logger.exception("News collector error")
+                logger.exception("News collector loop error")
                 if state:
                     state.mark_error(_sanitize_error(exc))
             try:
@@ -70,66 +351,89 @@ class NewsCollector:
             except asyncio.TimeoutError:
                 continue
 
-    async def fetch_once(self) -> int:
-        if not settings.news_api_key:
-            if settings.news_mock_fallback_enabled:
-                return self.store_mock_article()
-            raise RuntimeError(self.unavailable_reason)
-
-        params = {
-            "q": settings.news_query,
-            "language": "en",
-            "sortBy": "publishedAt",
-            "pageSize": 50,
-            "apiKey": settings.news_api_key,
-        }
+    async def fetch_once(self, provider_filter: str | None = None) -> dict[str, Any]:
+        total_saved = 0
+        per_provider: dict[str, Any] = {}
         async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(settings.news_provider_url, params=params)
-            response.raise_for_status()
-            payload = response.json()
+            for provider in self.providers:
+                if provider_filter and provider.provider != provider_filter.lower():
+                    continue
+                status = self.statuses[provider.provider]
+                status.enabled = provider.enabled
+                status.configured = provider.configured
+                if not provider.enabled:
+                    status.last_error = "disabled"
+                    per_provider[provider.provider] = status.as_dict()
+                    continue
+                if not provider.configured:
+                    status.last_error = provider.unavailable_reason
+                    per_provider[provider.provider] = status.as_dict()
+                    continue
+                status.running = True
+                status.messages_received += 1
+                status.last_run_at = datetime.now(timezone.utc).isoformat()
+                try:
+                    articles = await provider.fetch(client)
+                    saved = self.store_articles(articles)
+                    status.rows_saved += saved
+                    if saved:
+                        status.last_saved_at = datetime.now(timezone.utc).isoformat()
+                    status.last_error = None
+                    total_saved += saved
+                except Exception as exc:
+                    logger.exception("News provider failed: %s", provider.provider)
+                    status.last_error = _sanitize_error(exc)
+                finally:
+                    status.running = False
+                    per_provider[provider.provider] = status.as_dict()
+        self.refresh_db_counts()
+        return {
+            "rows_saved": total_saved,
+            "providers": per_provider,
+        }
 
-        return self.store_articles(payload.get("articles", []), provider_payload=payload)
-
-    def store_articles(self, articles: list[dict[str, Any]], provider_payload: dict[str, Any] | None = None) -> int:
+    def store_articles(self, articles: list[NormalizedArticle]) -> int:
         stored = 0
         with SessionLocal() as session:
             for item in articles:
-                url = item.get("url")
-                title = item.get("title") or ""
-                if not url or not title:
-                    continue
-                source = (item.get("source") or {}).get("name") or "unknown"
-                existing = session.scalar(select(NewsArticle).where(NewsArticle.source == source, NewsArticle.url == url))
+                existing = session.scalar(
+                    select(NewsArticle).where(
+                        NewsArticle.source_name == item.provider,
+                        or_(
+                            NewsArticle.url == item.url,
+                            (NewsArticle.title == item.title) & (NewsArticle.published_at == item.published_at),
+                        ),
+                    )
+                )
                 if existing:
                     continue
-
-                body = item.get("content") or item.get("description") or title
                 article = NewsArticle(
-                    source=source,
-                    source_name=source,
-                    title=title,
-                    url=url,
-                    published_at=_parse_datetime(item.get("publishedAt")) or datetime.now(timezone.utc),
-                    raw_text=body,
-                    raw=item,
-                    raw_payload=item,
+                    source=item.source,
+                    source_name=item.provider,
+                    title=item.title,
+                    url=item.url,
+                    published_at=item.published_at,
+                    raw_text=item.raw_text,
+                    raw=item.raw_payload,
+                    raw_payload=item.raw_payload,
                 )
                 session.add(article)
                 session.flush()
 
-                sentiment_score, risk_score, topics, affected_symbols = analyze_news(body)
+                sentiment_score, risk_score, topics, affected_symbols = analyze_news(item.raw_text)
+                merged_symbols = sorted(set(affected_symbols) | set(item.affected_symbols))
                 session.add(
                     NewsSentiment(
                         article_id=article.id,
                         sentiment_score=sentiment_score,
                         risk_score=risk_score,
                         topics=topics,
-                        affected_symbols=affected_symbols,
-                        source_name="placeholder-v1",
+                        affected_symbols=merged_symbols,
+                        source_name=f"{item.provider}:placeholder-v1",
                         raw_payload={
-                            "text_length": len(body),
+                            "provider": item.provider,
                             "interface": "analyze_news",
-                            "provider_status": (provider_payload or {}).get("status"),
+                            "text_length": len(item.raw_text),
                         },
                     )
                 )
@@ -139,12 +443,34 @@ class NewsCollector:
 
     def store_mock_article(self, title: str | None = None, body: str | None = None) -> int:
         now = datetime.now(timezone.utc)
-        article = {
-            "source": {"name": "mock-news"},
-            "title": title or f"Mock crypto market update {now.isoformat()}",
-            "url": f"mock://news/{int(now.timestamp())}",
-            "publishedAt": now.isoformat(),
-            "description": body or "Bitcoin and Ethereum market conditions remain mixed as traders watch liquidity, regulation, and macro risk.",
-            "content": body or "Bitcoin and Ethereum market conditions remain mixed as traders watch liquidity, regulation, and macro risk.",
-        }
-        return self.store_articles([article], provider_payload={"status": "mock"})
+        text = body or "Bitcoin and Ethereum market conditions remain mixed as traders watch liquidity, regulation, and macro risk."
+        article = NormalizedArticle(
+            provider="mock",
+            source="mock-news",
+            title=title or f"Mock crypto market update {now.isoformat()}",
+            url=f"mock://news/{int(now.timestamp())}",
+            published_at=now,
+            raw_text=text,
+            raw_payload={"status": "mock", "body": text},
+            affected_symbols=_affected_symbols(text),
+        )
+        return self.store_articles([article])
+
+    def refresh_db_counts(self) -> None:
+        with SessionLocal() as session:
+            for provider, status in self.statuses.items():
+                status.article_count = int(
+                    session.scalar(select(func.count(NewsArticle.id)).where(NewsArticle.source_name == provider)) or 0
+                )
+                latest = session.scalar(
+                    select(NewsArticle)
+                    .where(NewsArticle.source_name == provider)
+                    .order_by(NewsArticle.published_at.desc())
+                    .limit(1)
+                )
+                status.latest_article_at = latest.published_at.isoformat() if latest and latest.published_at else None
+                status.latest_title = latest.title if latest else None
+
+    def _combined_errors(self) -> str | None:
+        errors = [status.last_error for status in self.statuses.values() if status.enabled and status.last_error]
+        return "; ".join(errors) if errors else None
