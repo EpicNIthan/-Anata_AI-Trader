@@ -42,6 +42,14 @@
     if (className) element.classList.add(className);
   }
 
+  function updateBook(price) {
+    const mark = Number(price);
+    if (!Number.isFinite(mark)) return;
+    setText("bookAsk", money(mark * 1.0002, 2));
+    setText("bookMid", money(mark, 2));
+    setText("bookBid", money(mark * 0.9998, 2));
+  }
+
   function setupChart() {
     const element = $("chart");
     if (!element || state.chart || !window.LightweightCharts) return;
@@ -107,6 +115,10 @@
         setText("latestPrice", money(last.close, 2));
         setText("priceChange", pct(change, 2));
         setClass("priceChange", cls(change));
+        setText(`railPrice${state.symbol}`, money(last.close, 2));
+        setText(`railChange${state.symbol}`, pct(change, 2));
+        setClass(`railChange${state.symbol}`, cls(change));
+        updateBook(last.close);
         setText("volumeMetric", number(last.volume, 2));
         setText("smaMetric", smaData.length ? money(smaData.at(-1).value, 2) : "-");
         setText("chartStatus", `${candles.length} candles`);
@@ -268,8 +280,19 @@
     $("symbolSelect")?.addEventListener("change", (event) => {
       state.symbol = event.target.value;
       $("signalSymbol").value = state.symbol;
+      document.querySelectorAll("[data-market-symbol]").forEach((item) => item.classList.toggle("active", item.dataset.marketSymbol === state.symbol));
       state.lastCandlesKey = "";
       refreshChart();
+    });
+    document.querySelectorAll("[data-market-symbol]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.symbol = button.dataset.marketSymbol;
+        $("symbolSelect").value = state.symbol;
+        $("signalSymbol").value = state.symbol;
+        document.querySelectorAll("[data-market-symbol]").forEach((item) => item.classList.toggle("active", item === button));
+        state.lastCandlesKey = "";
+        refreshChart();
+      });
     });
     $("newsProviderFilter")?.addEventListener("change", refreshNews);
     $("signalForm")?.addEventListener("submit", submitSignal);

@@ -175,15 +175,82 @@ h2 {
 
 .trading-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-columns: 260px minmax(0, 1fr) 340px;
   gap: 10px;
   min-height: 500px;
 }
 
 .chart-panel,
-.order-panel {
+.order-panel,
+.market-rail {
   min-width: 0;
   padding: 10px;
+}
+
+.market-rail {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.market-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 8px;
+  width: 100%;
+  padding: 10px;
+  text-align: left;
+  background: var(--panel-2);
+}
+
+.market-row.active {
+  border-color: var(--yellow);
+  background: #19180f;
+}
+
+.market-row span {
+  font-weight: 800;
+}
+
+.market-row strong {
+  font-size: 15px;
+}
+
+.market-row em {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-style: normal;
+}
+
+.mini-book {
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.book-line,
+.book-mid {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.book-line.ask {
+  color: var(--bad);
+}
+
+.book-line.bid {
+  color: var(--good);
+}
+
+.book-mid {
+  color: var(--yellow);
+  font-size: 20px;
+  font-weight: 900;
 }
 
 .panel-head {

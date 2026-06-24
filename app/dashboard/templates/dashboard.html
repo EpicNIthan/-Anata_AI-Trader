@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Anata AI Trader</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v2">
     <script defer src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
       window.DASHBOARD_CONFIG = {
@@ -14,7 +14,7 @@
       };
     </script>
   </head>
-  <body>
+  <body style="background:#0b0e11;color:#e7edf3;">
     <header class="topbar">
       <div class="brand">
         <h1>Anata AI Trader</h1>
@@ -41,6 +41,32 @@
       </section>
 
       <section class="trading-grid">
+        <aside class="market-rail">
+          <div class="panel-head">
+            <h2>Markets</h2>
+            <span>USDT</span>
+          </div>
+          <button class="market-row active" data-market-symbol="BTCUSDT">
+            <span>BTCUSDT</span>
+            <strong id="railPriceBTCUSDT">-</strong>
+            <em id="railChangeBTCUSDT">-</em>
+          </button>
+          <button class="market-row" data-market-symbol="ETHUSDT">
+            <span>ETHUSDT</span>
+            <strong id="railPriceETHUSDT">-</strong>
+            <em id="railChangeETHUSDT">-</em>
+          </button>
+          <div class="mini-book">
+            <div class="panel-head">
+              <h2>Paper Book</h2>
+              <span>Simulated</span>
+            </div>
+            <div class="book-line ask"><span>Ask</span><b id="bookAsk">-</b></div>
+            <div class="book-mid" id="bookMid">-</div>
+            <div class="book-line bid"><span>Bid</span><b id="bookBid">-</b></div>
+          </div>
+        </aside>
+
         <article class="chart-panel">
           <div class="panel-head compact">
             <div class="symbol-line">
@@ -180,6 +206,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v2"></script>
   </body>
 </html>
