@@ -35,6 +35,11 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "paper_trades": {
         "raw_payload": "JSON",
     },
+    "positions": {
+        "notional": "FLOAT DEFAULT 0",
+        "margin_used": "FLOAT DEFAULT 0",
+        "leverage": "FLOAT DEFAULT 1",
+    },
     "model_versions": {
         "model_id": "VARCHAR(128)",
         "feature_schema_version": "VARCHAR(64)",

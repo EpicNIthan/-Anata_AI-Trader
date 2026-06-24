@@ -156,14 +156,14 @@
 
         <section id="tab-positions" class="tab-panel active">
           <table>
-            <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry Price</th><th>Mark Price</th><th>PnL</th><th>PnL %</th><th>Notional</th><th>Stop Loss</th><th>Take Profit</th><th>Open Time</th><th>Action</th></tr></thead>
-            <tbody id="positionsBody"><tr><td colspan="12" class="empty">Loading</td></tr></tbody>
+            <thead><tr><th>Symbol</th><th>Side</th><th>Leverage</th><th>Margin</th><th>Qty</th><th>Entry Price</th><th>Mark Price</th><th>PnL</th><th>PnL %</th><th>Notional</th><th>Stop Loss</th><th>Take Profit</th><th>Open Time</th><th>Action</th></tr></thead>
+            <tbody id="positionsBody"><tr><td colspan="14" class="empty">Loading</td></tr></tbody>
           </table>
         </section>
 
         <section id="tab-trades" class="tab-panel">
           <table>
-            <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Realized PnL</th><th>Reason</th></tr></thead>
+            <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Price</th><th>Fee</th><th>Realized PnL</th><th>Reason</th></tr></thead>
             <tbody id="tradesBody"></tbody>
           </table>
         </section>
@@ -226,6 +226,10 @@
         </section>
 
         <section id="tab-sentiment" class="tab-panel">
+          <div class="panel-tools">
+            <button id="reprocessSentimentButton" class="secondary">Reprocess Sentiment</button>
+            <output id="sentimentActionResult"></output>
+          </div>
           <table>
             <thead><tr><th>Time</th><th>Model</th><th>Label</th><th>Confidence</th><th>Sentiment</th><th>Risk</th><th>Topics</th><th>Title</th></tr></thead>
             <tbody id="sentimentBody"></tbody>

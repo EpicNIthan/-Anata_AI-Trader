@@ -7,7 +7,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db.models import AccountEquity, Candle, PaperTrade, Position
+from app.db.models import AccountEquity, Candle, LiveCandleUpdate, PaperTrade, Position
 from app.trading.risk_manager import RiskManager
 
 
@@ -74,6 +74,8 @@ class PaperEngine:
                 symbol=normalized_symbol,
                 price=mark_price or 0.0,
                 max_notional=risk.max_notional,
+                margin_required=risk.margin_required,
+                leverage=risk.leverage,
                 reason=reason,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
@@ -109,17 +111,22 @@ class PaperEngine:
         symbol: str,
         price: float,
         max_notional: float,
+        margin_required: float,
+        leverage: float,
         reason: str | None,
         stop_loss: float | None,
         take_profit: float | None,
         existing_position: Position | None,
     ) -> ExecutionResult:
         account = self._latest_account(create=True)
-        notional = min(max_notional, account.cash_balance / (1.0 + settings.paper_fee_rate))
+        notional = max_notional
+        margin_required = min(margin_required or (notional / max(leverage, 1.0)), account.cash_balance)
         quantity = notional / price
         fee = notional * settings.paper_fee_rate
         if quantity <= 0:
             return ExecutionResult("REJECTED", "Computed quantity was zero.")
+        if margin_required + fee > account.cash_balance:
+            return ExecutionResult("REJECTED", "Not enough paper cash for margin plus fee.")
 
         if existing_position is None:
             position = Position(
@@ -128,6 +135,9 @@ class PaperEngine:
                 quantity=quantity,
                 entry_price=price,
                 current_price=price,
+                notional=notional,
+                margin_used=margin_required,
+                leverage=leverage,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 status="OPEN",
@@ -135,16 +145,20 @@ class PaperEngine:
             self.session.add(position)
         else:
             combined_quantity = existing_position.quantity + quantity
+            existing_margin = existing_position.margin_used or self._fallback_margin(existing_position)
             existing_position.entry_price = (
                 existing_position.entry_price * existing_position.quantity + notional
             ) / combined_quantity
             existing_position.quantity = combined_quantity
             existing_position.current_price = price
+            existing_position.margin_used = existing_margin + margin_required
+            existing_position.notional = combined_quantity * existing_position.entry_price
+            existing_position.leverage = leverage
             existing_position.stop_loss = stop_loss or existing_position.stop_loss
             existing_position.take_profit = take_profit or existing_position.take_profit
             position = existing_position
 
-        cash_after = account.cash_balance - notional - fee
+        cash_after = account.cash_balance - margin_required - fee
         trade = PaperTrade(
             symbol=symbol,
             action="BUY",
@@ -156,6 +170,11 @@ class PaperEngine:
             realized_pnl=0.0,
             status="FILLED",
             reason=reason,
+            raw_payload={
+                "paper_leverage": leverage,
+                "margin_required": margin_required,
+                "fee_rate": settings.paper_fee_rate,
+            },
         )
         self.session.add(trade)
         self.session.flush()
@@ -166,7 +185,13 @@ class PaperEngine:
         position.unrealized_pnl = (price - position.entry_price) * position.quantity
         self.session.commit()
         self.session.refresh(trade)
-        return ExecutionResult("FILLED", "Paper BUY filled.", trade_id=trade.id, balance=equity_row.cash_balance, equity=equity_row.equity)
+        return ExecutionResult(
+            "FILLED",
+            f"Paper BUY filled at {leverage:g}x using ${margin_required:,.2f} margin.",
+            trade_id=trade.id,
+            balance=equity_row.cash_balance,
+            equity=equity_row.equity,
+        )
 
     def _close(
         self,
@@ -181,16 +206,21 @@ class PaperEngine:
             account = self._latest_account(create=True)
             return ExecutionResult("REJECTED", "No open long position exists to close.", balance=account.cash_balance, equity=account.equity)
 
-        close_quantity = min(requested_quantity or existing_position.quantity, existing_position.quantity)
+        original_quantity = existing_position.quantity
+        close_quantity = min(requested_quantity or original_quantity, original_quantity)
         proceeds = close_quantity * price
         fee = proceeds * settings.paper_fee_rate
         gross_pnl = (price - existing_position.entry_price) * close_quantity
         realized_pnl = gross_pnl - fee
         account = self._latest_account(create=True)
-        cash_after = account.cash_balance + proceeds - fee
+        margin_before = existing_position.margin_used or self._fallback_margin(existing_position)
+        released_margin = margin_before * (close_quantity / original_quantity) if original_quantity else margin_before
+        cash_after = account.cash_balance + released_margin + gross_pnl - fee
 
         existing_position.quantity -= close_quantity
         existing_position.current_price = price
+        existing_position.margin_used = max(margin_before - released_margin, 0.0)
+        existing_position.notional = existing_position.quantity * existing_position.entry_price
         existing_position.realized_pnl += realized_pnl
         existing_position.unrealized_pnl = (price - existing_position.entry_price) * existing_position.quantity
         if existing_position.quantity <= 1e-12:
@@ -209,6 +239,12 @@ class PaperEngine:
             realized_pnl=realized_pnl,
             status="FILLED",
             reason=reason,
+            raw_payload={
+                "paper_leverage": existing_position.leverage or settings.paper_leverage,
+                "released_margin": released_margin,
+                "gross_pnl": gross_pnl,
+                "fee_rate": settings.paper_fee_rate,
+            },
         )
         self.session.add(trade)
         self.session.flush()
@@ -217,7 +253,13 @@ class PaperEngine:
         trade.equity_after = equity_row.equity
         self.session.commit()
         self.session.refresh(trade)
-        return ExecutionResult("FILLED", "Paper SELL filled.", trade_id=trade.id, balance=equity_row.cash_balance, equity=equity_row.equity)
+        return ExecutionResult(
+            "FILLED",
+            f"Paper SELL filled; released ${released_margin:,.2f} margin.",
+            trade_id=trade.id,
+            balance=equity_row.cash_balance,
+            equity=equity_row.equity,
+        )
 
     def _latest_account(self, create: bool = False) -> AccountEquity:
         latest = self.session.scalar(select(AccountEquity).order_by(desc(AccountEquity.timestamp)).limit(1))
@@ -238,7 +280,7 @@ class PaperEngine:
 
     def _record_equity(self, cash_balance: float, price_by_symbol: dict[str, float | None] | None = None) -> AccountEquity:
         price_by_symbol = price_by_symbol or {}
-        market_value = 0.0
+        reserved_margin = 0.0
         unrealized_pnl = 0.0
         open_positions = list(self.session.scalars(select(Position).where(Position.status == "OPEN")))
         for position in open_positions:
@@ -247,11 +289,14 @@ class PaperEngine:
                 price = self._resolve_price(position.symbol, None) or position.current_price or position.entry_price
             position.current_price = price
             position.unrealized_pnl = (price - position.entry_price) * position.quantity
-            market_value += position.quantity * price
+            margin_used = position.margin_used or self._fallback_margin(position)
+            position.margin_used = margin_used
+            position.notional = position.quantity * position.entry_price
+            reserved_margin += margin_used
             unrealized_pnl += position.unrealized_pnl
 
         realized_pnl = float(self.session.scalar(select(func.coalesce(func.sum(PaperTrade.realized_pnl), 0.0))) or 0.0)
-        equity = cash_balance + market_value
+        equity = cash_balance + reserved_margin + unrealized_pnl
         peak_equity = float(self.session.scalar(select(func.max(AccountEquity.equity))) or equity)
         drawdown = (equity - peak_equity) / peak_equity if peak_equity else 0.0
         row = AccountEquity(
@@ -260,7 +305,7 @@ class PaperEngine:
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl,
             drawdown=drawdown,
-            raw={"open_positions": len(open_positions)},
+            raw={"open_positions": len(open_positions), "reserved_margin": reserved_margin, "paper_leverage": settings.paper_leverage},
         )
         self.session.add(row)
         self.session.flush()
@@ -277,5 +322,13 @@ class PaperEngine:
         candle = self.session.scalar(
             select(Candle).where(Candle.symbol == symbol).order_by(desc(Candle.open_time)).limit(1)
         )
+        live_update = self.session.scalar(
+            select(LiveCandleUpdate).where(LiveCandleUpdate.symbol == symbol).order_by(desc(LiveCandleUpdate.open_time)).limit(1)
+        )
+        if live_update and (candle is None or live_update.open_time >= candle.open_time):
+            return live_update.close
         return candle.close if candle else None
 
+    def _fallback_margin(self, position: Position) -> float:
+        leverage = position.leverage or settings.paper_leverage or 1.0
+        return (position.quantity * position.entry_price) / max(leverage, 1.0)

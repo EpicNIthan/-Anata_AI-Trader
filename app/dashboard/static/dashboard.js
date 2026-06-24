@@ -265,6 +265,8 @@
       <tr>
         <td>${escapeHtml(row.symbol)}</td>
         <td>${escapeHtml(row.side)}</td>
+        <td>${number(row.leverage, 1)}x</td>
+        <td>${money(row.margin_used)}</td>
         <td>${number(row.quantity, 6)}</td>
         <td>${money(row.entry_price)}</td>
         <td>${money(row.current_price)}</td>
@@ -275,7 +277,7 @@
         <td>${row.take_profit ? money(row.take_profit) : "-"}</td>
         <td>${when(row.opened_at)}</td>
         <td><button data-close-position="${escapeHtml(row.symbol)}">Close</button></td>
-      </tr>`).join("") : `<tr><td colspan="12" class="empty">No open positions</td></tr>`;
+      </tr>`).join("") : `<tr><td colspan="14" class="empty">No open positions</td></tr>`;
     body.querySelectorAll("[data-close-position]").forEach((button) => {
       button.addEventListener("click", () => sendSignal({ symbol: button.dataset.closePosition, action: "CLOSE", confidence: 0.9, source: "dashboard-close" }));
     });
@@ -455,6 +457,25 @@
     }
   }
 
+  async function reprocessSentiment() {
+    const output = $("sentimentActionResult");
+    if (output) output.textContent = "Reprocessing...";
+    try {
+      const data = await api("/api/sentiment/reprocess", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: 200, reset_model: true }),
+      });
+      const model = data.active_model || {};
+      if (output) output.textContent = `${data.processed} articles · ${model.active_model || "-"}${model.hf_last_error ? ` · ${model.hf_last_error}` : ""}`;
+      await refreshSentiment();
+      await refreshFeatures();
+      await refreshSummary();
+    } catch (error) {
+      if (output) output.textContent = `Reprocess failed: ${error.message}`;
+    }
+  }
+
   function wireEvents() {
     function requestChartReload(message) {
       state.forceFit = true;
@@ -489,6 +510,7 @@
     $("exportDatasetDiagnosticsButton")?.addEventListener("click", () => exportDataset("dbActionResult"));
     $("runCleanupButton")?.addEventListener("click", runCleanup);
     $("archiveDataButton")?.addEventListener("click", archiveData);
+    $("reprocessSentimentButton")?.addEventListener("click", reprocessSentiment);
     document.querySelectorAll("[data-worker]").forEach((button) => button.addEventListener("click", () => collectorAction(button.dataset.worker, button.dataset.action)));
     document.querySelectorAll("[data-auto-trader]").forEach((button) => button.addEventListener("click", () => autoTraderAction(button.dataset.autoTrader)));
     document.querySelectorAll("[data-tab]").forEach((button) => {

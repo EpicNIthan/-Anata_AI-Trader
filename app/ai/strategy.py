@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from app.config import settings
 from app.db.models import Feature
 from app.features.schema import values_from_feature
 
@@ -37,6 +38,18 @@ class RuleBasedStrategy:
         flow_score = trader_crowd_score * 0.25 + ((taker_buy_pressure - 0.5) * 0.35 if taker_buy_pressure else 0.0)
         score = price_change * 4.0 + sentiment * 0.35 + flow_score - risk * 0.45 - crowd_risk_score * 0.20
         confidence = max(0.0, min(0.95, 0.50 + abs(score) + min(volatility * 4.0, 0.15)))
+        round_trip_fee = settings.paper_fee_rate * 2.0
+        expected_edge = abs(price_change) + abs(sentiment) * 0.003 + abs(trader_crowd_score) * 0.002
+
+        if expected_edge < round_trip_fee + settings.strategy_min_edge_after_fees:
+            return StrategyDecision(
+                action="HOLD",
+                confidence=max(0.50, confidence),
+                reason=(
+                    "Expected edge is too small after estimated round-trip paper fees "
+                    f"({expected_edge:.4%} edge vs {(round_trip_fee + settings.strategy_min_edge_after_fees):.4%} required)."
+                ),
+            )
 
         if risk >= 0.80:
             return StrategyDecision(

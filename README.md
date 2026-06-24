@@ -143,6 +143,11 @@ AUTO_TRADER_ENABLED=false
 AUTO_TRADER_INTERVAL_SECONDS=60
 AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT
 PAPER_TRADE_TIMEFRAME=1m
+PAPER_LEVERAGE=10
+PAPER_MAX_LEVERAGE=20
+RISK_MAX_TRADE_SIZE_PCT=0.50
+STRATEGY_MIN_EDGE_AFTER_FEES=0.001
+AUTO_CLOSE_MIN_NET_PROFIT_PCT=0.001
 EXPLORATION_MODE=true
 EXPLORATION_RATE=0.05
 MIN_PAPER_TRADE_NOTIONAL=50
@@ -173,6 +178,10 @@ Safety behavior:
 - Paper mode only.
 - No live exchange order execution.
 - Uses the existing risk manager.
+- Uses explicit paper-only leverage. `PAPER_LEVERAGE=10` means a $500 margin allocation creates up to $5,000 fake notional exposure. Fees are still charged on notional.
+- Sizes new entries from 0% to `RISK_MAX_TRADE_SIZE_PCT` of equity as margin based on confidence. With `RISK_MAX_TRADE_SIZE_PCT=0.50`, very high-confidence paper trades can use up to 50% of equity as margin.
+- Avoids weak entries when the expected edge is smaller than round-trip paper fees plus `STRATEGY_MIN_EDGE_AFTER_FEES`.
+- Avoids closing tiny green positions when the closing fee would eat the profit, unless the bot is cutting a loss.
 - Blocks rapid duplicate long entries for the same symbol.
 - Blocks new auto-trader buys during cooldown after a recent realized loss.
 - Optional exploration mode only runs in paper mode and uses tiny fake notionals while still passing through risk checks.
@@ -185,6 +194,14 @@ curl http://localhost:8000/api/db/diagnostics
 curl -X POST http://localhost:8000/api/db/cleanup
 curl -X POST http://localhost:8000/api/db/archive
 ```
+
+Reprocess existing news sentiment after enabling Hugging Face:
+
+```powershell
+curl -X POST http://localhost:8000/api/sentiment/reprocess -H "Content-Type: application/json" -d "{\"limit\":200,\"reset_model\":true}"
+```
+
+`/api/dashboard/summary` and the dashboard sentiment status show whether HF really loaded. If `hf_loaded=false`, the app is still using the rule-based fallback. This can happen if Railway cannot download the model or does not have enough memory for `transformers`/`torch`.
 
 Data lifecycle rules:
 
@@ -286,6 +303,9 @@ Set environment variables in Railway:
 - `AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
 - `DERIVATIVES_ENABLED=true`
 - `ENABLE_DERIVATIVES_COLLECTOR=true` if you want trader-flow data to run automatically
+- `PAPER_LEVERAGE=10`
+- `RISK_MAX_TRADE_SIZE_PCT=0.50`
+- `STRATEGY_MIN_EDGE_AFTER_FEES=0.001`
 - `NEWS_API_KEY` if using the news collector
 - risk settings such as `RISK_MAX_TRADE_SIZE_PCT`
 

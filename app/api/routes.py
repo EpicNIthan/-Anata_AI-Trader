@@ -9,7 +9,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.ai.experience_buffer import record_experience
-from app.ai.news_sentiment import active_sentiment_model
+from app.ai.news_sentiment import active_sentiment_model, analyze_news, reset_sentiment_model_cache
 from app.ai.strategy import RuleBasedStrategy
 from app.api.webhooks import SignalRequest
 from app.config import settings
@@ -1077,6 +1077,43 @@ def sentiment_latest(session: Session = Depends(get_session), limit: int = 50) -
     ]
 
 
+@router.post("/sentiment/reprocess")
+def sentiment_reprocess(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    limit = min(max(int(payload.get("limit") or 100), 1), 1000)
+    reset_model = bool(payload.get("reset_model", True))
+    if reset_model:
+        reset_sentiment_model_cache()
+    articles = list(session.scalars(select(NewsArticle).order_by(desc(NewsArticle.published_at)).limit(limit)))
+    processed = 0
+    for article in articles:
+        text = f"{article.title or ''}\n{article.raw_text or ''}".strip()
+        result = analyze_news(text)
+        sentiment = session.scalar(select(NewsSentiment).where(NewsSentiment.article_id == article.id).limit(1))
+        if sentiment is None:
+            sentiment = NewsSentiment(article_id=article.id)
+            session.add(sentiment)
+        sentiment.sentiment_score = result.sentiment_score
+        sentiment.risk_score = result.risk_score
+        sentiment.topics = result.topics
+        sentiment.affected_symbols = result.affected_symbols
+        sentiment.model_name = result.model_name
+        sentiment.sentiment_label = result.label
+        sentiment.confidence = result.confidence
+        sentiment.source_name = f"{article.source_name or 'unknown'}:{result.model_name}"
+        sentiment.raw_payload = result.raw_payload
+        processed += 1
+    session.commit()
+    return {
+        "processed": processed,
+        "active_model": active_sentiment_model(),
+    }
+
+
 @router.get("/trades")
 def trades(session: Session = Depends(get_session), limit: int = 50) -> list[dict[str, Any]]:
     rows = session.scalars(select(PaperTrade).order_by(desc(PaperTrade.created_at)).limit(limit)).all()
@@ -1109,6 +1146,9 @@ def positions(session: Session = Depends(get_session)) -> list[dict[str, Any]]:
             "entry_price": row.entry_price,
             "current_price": row.current_price,
             "notional": row.quantity * row.current_price,
+            "entry_notional": row.notional,
+            "margin_used": row.margin_used,
+            "leverage": row.leverage,
             "unrealized_pnl": row.unrealized_pnl,
             "unrealized_pnl_pct": (row.unrealized_pnl / (row.quantity * row.entry_price)) if row.quantity and row.entry_price else 0.0,
             "realized_pnl": row.realized_pnl,

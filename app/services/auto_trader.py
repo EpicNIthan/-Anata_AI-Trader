@@ -151,6 +151,7 @@ class AutoTraderService:
         )
         strategy_decision = RuleBasedStrategy().decide(feature)
         decision, decision_source = self._maybe_explore(session, symbol, strategy_decision)
+        decision = self._fee_aware_close_decision(session, symbol, decision)
         duplicate_result = self._duplicate_or_loss_cooldown(session, symbol, decision)
         if duplicate_result:
             execution_result = duplicate_result
@@ -277,6 +278,40 @@ class AutoTraderService:
         session.commit()
         session.refresh(ai_decision)
         return ai_decision
+
+    def _fee_aware_close_decision(
+        self,
+        session,
+        symbol: str,
+        decision: StrategyDecision,
+    ) -> StrategyDecision:
+        if decision.action.upper() not in {"SELL", "CLOSE"}:
+            return decision
+        existing_position = session.scalar(
+            select(Position)
+            .where(Position.symbol == symbol, Position.status == "OPEN")
+            .order_by(desc(Position.opened_at))
+            .limit(1)
+        )
+        if existing_position is None:
+            return decision
+        mark_price = existing_position.current_price
+        gross_pnl = (mark_price - existing_position.entry_price) * existing_position.quantity
+        close_notional = existing_position.quantity * mark_price
+        close_fee = close_notional * settings.paper_fee_rate
+        min_net_profit = close_notional * settings.auto_close_min_net_profit_pct
+        if gross_pnl > 0 and gross_pnl <= close_fee + min_net_profit:
+            return StrategyDecision(
+                action="HOLD",
+                confidence=max(decision.confidence, settings.risk_min_confidence),
+                reason=(
+                    "Close skipped because gross profit is too small after fees "
+                    f"(gross ${gross_pnl:.4f}, fee ${close_fee:.4f}, required net ${min_net_profit:.4f})."
+                ),
+                stop_loss=decision.stop_loss,
+                take_profit=decision.take_profit,
+            )
+        return decision
 
     def _duplicate_or_loss_cooldown(
         self,

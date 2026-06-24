@@ -143,6 +143,10 @@ def main() -> None:
         sentiment_latest = client.get("/api/sentiment/latest")
         assert sentiment_latest.status_code == 200, sentiment_latest.text
         assert sentiment_latest.json()[0]["model_name"], sentiment_latest.text
+        sentiment_reprocess = client.post("/api/sentiment/reprocess", json={"limit": 5, "reset_model": True}, auth=auth)
+        assert sentiment_reprocess.status_code == 200, sentiment_reprocess.text
+        assert sentiment_reprocess.json()["processed"] >= 1, sentiment_reprocess.text
+        assert "active_model" in sentiment_reprocess.json(), sentiment_reprocess.text
 
         mock_news = client.post(
             "/api/news/mock",

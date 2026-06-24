@@ -15,6 +15,9 @@ class RiskResult:
     accepted: bool
     reason: str
     max_notional: float
+    margin_required: float = 0.0
+    leverage: float = 1.0
+    allocation_pct: float = 0.0
 
 
 class RiskManager:
@@ -38,7 +41,14 @@ class RiskManager:
         if normalized_action in {"SELL", "CLOSE"}:
             if existing_position is None:
                 return RiskResult(False, "No open long position exists to close; shorting is disabled.", 0.0)
-            return RiskResult(True, "Close action reduces existing exposure.", existing_position.quantity * existing_position.current_price)
+            return RiskResult(
+                True,
+                "Close action reduces existing long exposure; shorting is disabled.",
+                existing_position.quantity * existing_position.current_price,
+                margin_required=0.0,
+                leverage=existing_position.leverage or self._paper_leverage(),
+                allocation_pct=0.0,
+            )
 
         if normalized_action != "BUY":
             return RiskResult(False, f"Unsupported action: {normalized_action}", 0.0)
@@ -60,13 +70,42 @@ class RiskManager:
         if existing_position is None and open_positions >= settings.risk_max_open_positions:
             return RiskResult(False, "Max open position limit reached.", 0.0)
 
-        max_notional = min(cash_balance / (1.0 + settings.paper_fee_rate), equity * settings.risk_max_trade_size_pct)
+        leverage = self._paper_leverage()
+        allocation_pct = self._confidence_allocation(confidence)
+        if allocation_pct <= 0:
+            return RiskResult(False, "Signal confidence did not earn a positive position size.", 0.0)
+
+        max_margin = min(
+            cash_balance / (1.0 + settings.paper_fee_rate * leverage),
+            equity * allocation_pct,
+        )
+        max_notional = max_margin * leverage
         if requested_notional is not None:
             max_notional = min(max_notional, requested_notional)
+            max_margin = max_notional / leverage
         if max_notional <= 0:
             return RiskResult(False, "No cash is available for a new paper trade.", 0.0)
 
-        return RiskResult(True, "Risk checks passed.", max_notional)
+        return RiskResult(
+            True,
+            f"Risk checks passed. Paper leverage {leverage:g}x, margin allocation {allocation_pct:.1%}.",
+            max_notional,
+            margin_required=max_margin,
+            leverage=leverage,
+            allocation_pct=allocation_pct,
+        )
+
+    def _paper_leverage(self) -> float:
+        requested = max(settings.paper_leverage, 1.0)
+        max_allowed = max(settings.paper_max_leverage, 1.0)
+        return min(requested, max_allowed)
+
+    def _confidence_allocation(self, confidence: float) -> float:
+        if confidence <= settings.risk_min_confidence:
+            return 0.0
+        span = max(1.0 - settings.risk_min_confidence, 1e-9)
+        confidence_scale = max(0.0, min(1.0, (confidence - settings.risk_min_confidence) / span))
+        return max(0.0, min(settings.risk_max_trade_size_pct, settings.risk_max_trade_size_pct * confidence_scale))
 
     def _daily_realized_pnl(self) -> float:
         now = datetime.now(timezone.utc)
@@ -92,4 +131,3 @@ class RiskManager:
             return False
         large_loss_threshold = max(equity * settings.risk_max_daily_loss_pct * 0.5, 1.0)
         return abs(latest_loss.realized_pnl) >= large_loss_threshold
-

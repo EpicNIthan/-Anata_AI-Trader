@@ -78,6 +78,7 @@ LABEL_TO_SCORE = {
     "neutral": 0.0,
     "negative": -1.0,
 }
+HF_LAST_ERROR: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,14 +121,19 @@ def _keyword_analysis(text: str) -> tuple[float, float, list[str], list[str]]:
 
 @lru_cache(maxsize=1)
 def _hf_pipeline() -> Any | None:
+    global HF_LAST_ERROR
     if not settings.enable_hf_sentiment:
+        HF_LAST_ERROR = None
         return None
     try:
         from transformers import pipeline
 
         logger.info("Loading Hugging Face sentiment model: %s", settings.news_sentiment_model)
-        return pipeline("sentiment-analysis", model=settings.news_sentiment_model)
-    except Exception:
+        model = pipeline("sentiment-analysis", model=settings.news_sentiment_model)
+        HF_LAST_ERROR = None
+        return model
+    except Exception as exc:
+        HF_LAST_ERROR = f"{type(exc).__name__}: {exc}"
         logger.exception("Failed to load Hugging Face sentiment model; falling back to rules")
         return None
 
@@ -199,6 +205,13 @@ def active_sentiment_model() -> dict[str, Any]:
         "active_model": settings.news_sentiment_model if hf_loaded else "rule-based-fallback-v1",
         "hf_enabled": settings.enable_hf_sentiment,
         "hf_loaded": hf_loaded,
+        "hf_last_error": HF_LAST_ERROR,
         "fallback": not hf_loaded,
         "future_models": ["ProsusAI/finbert", "ElKulako/cryptobert"],
     }
+
+
+def reset_sentiment_model_cache() -> None:
+    global HF_LAST_ERROR
+    HF_LAST_ERROR = None
+    _hf_pipeline.cache_clear()
