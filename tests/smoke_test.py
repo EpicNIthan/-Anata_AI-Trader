@@ -268,7 +268,13 @@ def main() -> None:
         assert decisions.json()[0]["decision_source"] in {"exploration", "position-management", "risk-exit", "strategy"}, decisions.text
         summary_after_auto = client.get("/api/dashboard/summary")
         assert summary_after_auto.status_code == 200, summary_after_auto.text
-        assert summary_after_auto.json()["trading"]["exploration_trades"] + summary_after_auto.json()["trading"]["skipped_trades"] >= 1
+        trading_counts = summary_after_auto.json()["trading"]
+        assert (
+            trading_counts["strategy_trades"]
+            + trading_counts["exploration_trades"]
+            + trading_counts["skipped_trades"]
+            >= 1
+        ), summary_after_auto.text
 
         with SessionLocal() as session:
             decisions_after = session.scalar(select(func.count(AiDecision.id))) or 0

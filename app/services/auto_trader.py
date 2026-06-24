@@ -74,6 +74,7 @@ class AutoTraderService:
                 "max_loss_pct_of_margin": settings.auto_position_max_loss_pct,
                 "default_stop_loss_pct": settings.auto_default_stop_loss_pct,
                 "default_take_profit_pct": settings.auto_default_take_profit_pct,
+                "fast_profit_exit_pct": settings.auto_fast_profit_exit_pct,
                 "profit_close_min_net_pct": settings.auto_close_min_net_profit_pct,
             },
         }
@@ -326,6 +327,7 @@ class AutoTraderService:
         net_pnl = gross_pnl - close_fee
         margin = position.margin_used or ((position.quantity * position.entry_price) / max(position.leverage or settings.paper_leverage, 1.0))
         pnl_on_margin = net_pnl / margin if margin else 0.0
+        net_profit_pct = net_pnl / close_notional if close_notional else 0.0
         now = datetime.now(timezone.utc)
         opened_at = position.opened_at
         if opened_at.tzinfo is None:
@@ -365,17 +367,18 @@ class AutoTraderService:
                     ),
                     "position-management",
                 )
-            return (
-                StrategyDecision(
-                    action="HOLD",
-                    confidence=max(strategy_decision.confidence, settings.risk_min_confidence),
-                    reason=(
-                        "Take profit is hit, but minimum profit-hold time is active "
-                        f"({age_seconds:.0f}/{settings.auto_take_profit_min_hold_seconds}s)."
+            if net_profit_pct >= settings.auto_fast_profit_exit_pct:
+                return (
+                    StrategyDecision(
+                        action="CLOSE",
+                        confidence=0.95,
+                        reason=(
+                            "Fast profit exit: take profit hit before minimum hold, "
+                            f"but net profit {net_profit_pct:.2%} is strong enough."
+                        ),
                     ),
-                ),
-                "position-management",
-            )
+                    "position-management",
+                )
         if settings.auto_max_hold_seconds > 0 and age_seconds >= settings.auto_max_hold_seconds and net_pnl >= 0:
             return (
                 StrategyDecision(
@@ -408,14 +411,20 @@ class AutoTraderService:
         close_notional = existing_position.quantity * mark_price
         close_fee = close_notional * settings.paper_fee_rate
         min_net_profit = close_notional * settings.auto_close_min_net_profit_pct
+        net_profit = gross_pnl - close_fee
+        net_profit_pct = net_profit / close_notional if close_notional else 0.0
         age_seconds = self._position_age_seconds(existing_position)
-        if gross_pnl > 0 and age_seconds < settings.auto_min_hold_seconds:
+        if (
+            gross_pnl > 0
+            and age_seconds < settings.auto_min_hold_seconds
+            and net_profit_pct < settings.auto_fast_profit_exit_pct
+        ):
             return StrategyDecision(
                 action="HOLD",
                 confidence=max(decision.confidence, settings.risk_min_confidence),
                 reason=(
-                    "Profit close skipped because minimum hold time is active "
-                    f"({age_seconds:.0f}/{settings.auto_min_hold_seconds}s)."
+                    "Weak profit close skipped because minimum hold time is active "
+                    f"({age_seconds:.0f}/{settings.auto_min_hold_seconds}s, net profit {net_profit_pct:.2%})."
                 ),
                 stop_loss=decision.stop_loss,
                 take_profit=decision.take_profit,

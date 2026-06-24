@@ -149,11 +149,12 @@ RISK_MAX_TRADE_SIZE_PCT=0.50
 STRATEGY_MIN_EDGE_AFTER_FEES=0.001
 AUTO_CLOSE_MIN_NET_PROFIT_PCT=0.001
 AUTO_MIN_HOLD_SECONDS=900
-AUTO_TAKE_PROFIT_MIN_HOLD_SECONDS=900
+AUTO_TAKE_PROFIT_MIN_HOLD_SECONDS=0
 AUTO_MAX_HOLD_SECONDS=14400
 AUTO_POSITION_MAX_LOSS_PCT=0.10
 AUTO_DEFAULT_STOP_LOSS_PCT=0.01
 AUTO_DEFAULT_TAKE_PROFIT_PCT=0.02
+AUTO_FAST_PROFIT_EXIT_PCT=0.006
 EXPLORATION_MODE=true
 EXPLORATION_RATE=0.05
 MIN_PAPER_TRADE_NOTIONAL=50
@@ -187,7 +188,9 @@ Safety behavior:
 - Uses explicit paper-only leverage. `PAPER_LEVERAGE=10` means a $500 margin allocation creates up to $5,000 fake notional exposure. Fees are still charged on notional.
 - Sizes new entries from 0% to `RISK_MAX_TRADE_SIZE_PCT` of equity as margin based on confidence. With `RISK_MAX_TRADE_SIZE_PCT=0.50`, very high-confidence paper trades can use up to 50% of equity as margin.
 - Avoids weak entries when the expected edge is smaller than round-trip paper fees plus `STRATEGY_MIN_EDGE_AFTER_FEES`.
-- Keeps normal/profit exits open for at least `AUTO_MIN_HOLD_SECONDS` so the bot does not churn in and out after one minute.
+- Keeps weak/noisy strategy exits open for at least `AUTO_MIN_HOLD_SECONDS` so the bot does not churn in and out after one minute.
+- Allows take-profit exits immediately by default with `AUTO_TAKE_PROFIT_MIN_HOLD_SECONDS=0`.
+- Allows fast profit exits during the minimum hold if net profit is at least `AUTO_FAST_PROFIT_EXIT_PCT`.
 - Closes immediately when a stop loss or max-position-loss rule is hit, even if that means taking a small loss now.
 - Avoids closing tiny green positions when the closing fee would eat the profit, unless the bot is cutting a loss.
 - Adds default paper stop loss / take profit levels to new entries when the strategy did not provide them.
@@ -316,6 +319,8 @@ Set environment variables in Railway:
 - `RISK_MAX_TRADE_SIZE_PCT=0.50`
 - `STRATEGY_MIN_EDGE_AFTER_FEES=0.001`
 - `AUTO_MIN_HOLD_SECONDS=900`
+- `AUTO_TAKE_PROFIT_MIN_HOLD_SECONDS=0`
+- `AUTO_FAST_PROFIT_EXIT_PCT=0.006`
 - `AUTO_POSITION_MAX_LOSS_PCT=0.10`
 - `AUTO_DEFAULT_STOP_LOSS_PCT=0.01`
 - `NEWS_API_KEY` if using the news collector
