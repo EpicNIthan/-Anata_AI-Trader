@@ -1,6 +1,6 @@
 # Anata AI Crypto Trading Lab
 
-A real paper-only AI crypto trading lab built with Python, FastAPI, SQLAlchemy, PostgreSQL, Binance market streams, configurable news polling, feature building, a replaceable strategy interface, and a dashboard.
+A real paper-only AI crypto trading lab built with Python, FastAPI, SQLAlchemy, PostgreSQL, Binance market streams, public futures trader-flow data, configurable news polling, feature building, a replaceable strategy interface, and a dashboard.
 
 No live exchange order APIs are wired. There are no real trading keys, no withdrawals, and no real-money execution.
 
@@ -8,7 +8,8 @@ No live exchange order APIs are wired. There are no real trading keys, no withdr
 
 - FastAPI app with `/health`, dashboard routes, API routes, and `/api/signal`.
 - SQLAlchemy models for candles, news, sentiment, features, paper trades, positions, model versions, training runs, AI decisions, and account equity.
-- Binance websocket kline collector for symbols such as `BTCUSDT` and `ETHUSDT`.
+- Binance websocket kline collector for liquid USDT symbols such as `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `BNBUSDT`, `XRPUSDT`, `ADAUSDT`, `DOGEUSDT`, `AVAXUSDT`, `LINKUSDT`, and `LTCUSDT`.
+- Binance Futures public aggregate collector for long/short ratios, top-trader ratios, taker buy/sell flow, open interest, and funding rate.
 - REST news collector with a configurable provider URL and API key.
 - Placeholder news sentiment interface shaped for a future Hugging Face model.
 - Feature builder combining candle behavior and sentiment/risk scores.
@@ -87,6 +88,17 @@ curl http://localhost:8000/api/news/latest?provider=gdelt
 curl -X POST http://localhost:8000/api/news/run-once -H "Content-Type: application/json" -d "{\"provider\":\"gdelt\"}"
 ```
 
+Trader-flow / derivatives diagnostics:
+
+```powershell
+curl -X POST http://localhost:8000/api/collectors/derivatives/start
+curl http://localhost:8000/api/derivatives/status
+curl http://localhost:8000/api/derivatives/latest?symbol=BTCUSDT
+curl -X POST http://localhost:8000/api/derivatives/run-once -H "Content-Type: application/json" -d "{\"symbols\":[\"BTCUSDT\"],\"mock\":true}"
+```
+
+The derivatives collector uses public aggregate data only. It does not know individual trader win rate. It approximates current crowd behavior through account long/short ratios, taker buy/sell pressure, open interest, and funding. Those values are stored in `external_data_events` and compacted into `training_features`.
+
 Market status exposes `last_message_at`, `last_saved_at`, `messages_received`, `rows_saved`, `last_error`, `subscribed_streams`, `websocket_url`, and whether candles are live-updated or closed-only. Binance streams are lowercase, for example `btcusdt@kline_1m`.
 
 Use this to see live candle changes before candle close:
@@ -129,15 +141,21 @@ Environment:
 ```env
 AUTO_TRADER_ENABLED=false
 AUTO_TRADER_INTERVAL_SECONDS=60
-AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT
+AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT
 PAPER_TRADE_TIMEFRAME=1m
 EXPLORATION_MODE=true
 EXPLORATION_RATE=0.05
 MIN_PAPER_TRADE_NOTIONAL=50
+DERIVATIVES_ENABLED=true
+ENABLE_DERIVATIVES_COLLECTOR=false
+DERIVATIVES_POLL_INTERVAL_SECONDS=300
+DERIVATIVES_PERIOD=5m
+DERIVATIVES_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT
 LIVE_UPDATE_RETENTION_HOURS=48
 RAW_NEWS_RETENTION_DAYS=30
 RAW_TICK_RETENTION_DAYS=7
 DIAGNOSTIC_RETENTION_DAYS=7
+EXTERNAL_DATA_RETENTION_DAYS=365
 EXPERIENCE_RETENTION_DAYS=365
 CLOSED_CANDLE_RETENTION_DAYS=1095
 ```
@@ -174,11 +192,22 @@ Data lifecycle rules:
 - `candles` stores closed candles for long-term training.
 - `training_features` stores compact numeric feature rows for model training/export.
 - Raw ticks, live updates, old diagnostic rows, and raw news payloads are cleaned or compacted by the daily lifecycle job.
+- Public external data such as derivatives flow is kept longer as compact numeric/payload rows, while old raw payloads are compacted.
 - Training exports read compact features first, so raw logs can be compacted after features are built and archived.
 
 ## Training Workflow
 
-Features are stored as versioned JSON payloads. The current schema is `price-news-v2`; `price-news-v1` remains available for older models. Missing future values default to `0` or `null` so older models keep running when new data sources are added.
+Features are stored as versioned JSON payloads. The current schema is `price-news-v3`; `price-news-v2` and `price-news-v1` remain available for older models. Missing future values default to `0` or `null` so older models keep running when new data sources are added.
+
+`price-news-v3` adds public trader-flow features:
+
+- crowd long/short account percentages
+- top-trader account and position long percentages
+- taker buy pressure and buy/sell ratio
+- open interest value and open interest change
+- funding rate
+- combined `trader_crowd_score`
+- combined `crowd_risk_score`
 
 Build features through the API or internal jobs, then export:
 
@@ -253,7 +282,10 @@ Set environment variables in Railway:
 
 - `DATABASE_URL`
 - `TRADING_MODE=paper`
-- `BINANCE_SYMBOLS=BTCUSDT,ETHUSDT`
+- `BINANCE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
+- `AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
+- `DERIVATIVES_ENABLED=true`
+- `ENABLE_DERIVATIVES_COLLECTOR=true` if you want trader-flow data to run automatically
 - `NEWS_API_KEY` if using the news collector
 - risk settings such as `RISK_MAX_TRADE_SIZE_PCT`
 

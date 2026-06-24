@@ -137,6 +137,7 @@ def dashboard(
         "news": session.scalar(select(func.count(NewsArticle.id))) or 0,
         "experiences": session.scalar(select(func.count(ExperienceRecord.id))) or 0,
     }
+    dashboard_symbols = list(dict.fromkeys([*settings.binance_symbols, *settings.auto_trader_symbols, *settings.derivatives_symbols]))
 
     context: dict[str, Any] = {
         "request": request,
@@ -156,6 +157,8 @@ def dashboard(
         "latest_auto_decision": latest_auto_decision,
         "latest_decisions": latest_decisions,
         "data_counts": data_counts,
+        "dashboard_symbols": dashboard_symbols,
+        "default_symbol": dashboard_symbols[0] if dashboard_symbols else "BTCUSDT",
         "equity_points_json": json.dumps(equity_points),
         "fmt": _fmt,
         "dt": _dt,

@@ -27,6 +27,19 @@
     ["volatility", "volatility"],
     ["volume_change", "volume_change"],
     ["trend_score", "trend_score"],
+    ["crowd_long_account_pct", "crowd_long_account_pct"],
+    ["crowd_short_account_pct", "crowd_short_account_pct"],
+    ["crowd_long_short_ratio", "crowd_long_short_ratio"],
+    ["top_trader_long_account_pct", "top_trader_long_account_pct"],
+    ["top_trader_position_long_pct", "top_trader_position_long_pct"],
+    ["taker_buy_pressure", "taker_buy_pressure"],
+    ["taker_buy_sell_ratio", "taker_buy_sell_ratio"],
+    ["open_interest_value", "open_interest_value"],
+    ["open_interest_change", "open_interest_change"],
+    ["funding_rate", "funding_rate"],
+    ["trader_crowd_score", "trader_crowd_score"],
+    ["crowd_risk_score", "crowd_risk_score"],
+    ["derivatives_recency_weight", "derivatives_recency_weight"],
   ];
 
   const $ = (id) => document.getElementById(id);
@@ -226,6 +239,7 @@
 
       setText("marketDiagnostics", JSON.stringify(data.market, null, 2));
       setText("newsDiagnostics", JSON.stringify(data.news?.providers || data.news, null, 2));
+      setText("derivativesDiagnostics", JSON.stringify(data.derivatives || {}, null, 2));
       setText("autoDiagnostics", JSON.stringify(data.auto_trader, null, 2));
       const trading = data.trading || {};
       setText("strategyTradeCount", number(trading.strategy_trades, 0));
@@ -324,6 +338,19 @@
             <span>sentiment ${featureValue(item.sentiment_score)} · confidence ${featureValue(item.sentiment_confidence)} · risk ${featureValue(item.risk_score)}</span>
           </div>
         `).join("") : `<div class="empty">No recent news context used for this symbol</div>`;
+      }
+
+      const derivativesContext = data.derivatives_context || [];
+      const derivativesBox = $("featureDerivativesContext");
+      if (derivativesBox) {
+        derivativesBox.innerHTML = derivativesContext.length ? derivativesContext.map((item) => `
+          <div class="news-context-item">
+            <strong>${escapeHtml(item.data_type || "-")}</strong>
+            <p>${escapeHtml(JSON.stringify(item.payload || {}))}</p>
+            <span>${escapeHtml(item.source_name || "-")} / ${when(item.event_time)}</span>
+            <span>value ${featureValue(item.numeric_value)}</span>
+          </div>
+        `).join("") : `<div class="empty">No trader-flow context collected for this symbol</div>`;
       }
     } catch (error) {
       setText("featureInspectorStatus", `Error: ${error.message}`);

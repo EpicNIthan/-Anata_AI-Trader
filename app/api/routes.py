@@ -13,6 +13,7 @@ from app.ai.news_sentiment import active_sentiment_model
 from app.ai.strategy import RuleBasedStrategy
 from app.api.webhooks import SignalRequest
 from app.config import settings
+from app.collectors.derivatives_collector import BinanceDerivativesCollector
 from app.collectors.market_collector import BinanceMarketCollector, format_collector_error
 from app.collectors.news_collector import NewsCollector
 from app.db.models import (
@@ -56,6 +57,19 @@ INSPECTOR_FEATURE_KEYS = [
     "volatility",
     "volume_change",
     "trend_score",
+    "crowd_long_account_pct",
+    "crowd_short_account_pct",
+    "crowd_long_short_ratio",
+    "top_trader_long_account_pct",
+    "top_trader_position_long_pct",
+    "taker_buy_pressure",
+    "taker_buy_sell_ratio",
+    "open_interest_value",
+    "open_interest_change",
+    "funding_rate",
+    "trader_crowd_score",
+    "crowd_risk_score",
+    "derivatives_recency_weight",
 ]
 
 
@@ -250,6 +264,22 @@ def _data_lifecycle(request: Request):
     return service
 
 
+def _derivatives_snapshot(session: Session, worker_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    worker_state = worker_state or {}
+    collector = BinanceDerivativesCollector()
+    status = collector.status(session)
+    return {
+        **status,
+        "running": bool(worker_state.get("running")),
+        "messages_received": worker_state.get("messages_received", 0),
+        "rows_saved": worker_state.get("rows_saved", 0),
+        "last_message_at": worker_state.get("last_message_at"),
+        "last_saved_at": worker_state.get("last_saved_at"),
+        "last_error": worker_state.get("last_error"),
+        "details": worker_state.get("details"),
+    }
+
+
 def _decision_source(row: AiDecision) -> str:
     raw = row.raw or row.raw_payload or {}
     source = raw.get("decision_source") if isinstance(raw, dict) else None
@@ -335,6 +365,7 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
         "paper_start_balance": settings.paper_start_balance,
         "market": market_snapshot(session, collectors.get("market", {})),
         "news": news_snapshot(session, collectors.get("news", {})),
+        "derivatives": _derivatives_snapshot(session, collectors.get("derivatives", {})),
         "collectors": collectors,
         "auto_trader": _auto_trader(request).status(),
         "trading": _trading_diagnostics(session),
@@ -358,6 +389,7 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
             "features": session.scalar(select(func.count(Feature.id))) or 0,
             "training_features": session.scalar(select(func.count(TrainingFeature.id))) or 0,
             "experiences": session.scalar(select(func.count(ExperienceRecord.id))) or 0,
+            "external_data_events": session.scalar(select(func.count(ExternalDataEvent.id))) or 0,
             "trades": session.scalar(select(func.count(PaperTrade.id))) or 0,
             "open_positions": session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0,
         },
@@ -392,6 +424,56 @@ def auto_trader_status(request: Request) -> dict[str, Any]:
 @router.get("/collectors/status")
 def collector_status(request: Request) -> dict[str, Any]:
     return _worker_manager(request).snapshot()
+
+
+@router.get("/derivatives/status")
+def derivatives_status(request: Request, session: Session = Depends(get_session)) -> dict[str, Any]:
+    state = _worker_manager(request).snapshot().get("derivatives", {})
+    return _derivatives_snapshot(session, state)
+
+
+@router.get("/derivatives/latest")
+def derivatives_latest(
+    session: Session = Depends(get_session),
+    symbol: str | None = None,
+    data_type: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    query = select(ExternalDataEvent).where(ExternalDataEvent.source_name.like("binance_futures_%"))
+    if symbol:
+        query = query.where(ExternalDataEvent.symbol == symbol.upper())
+    if data_type:
+        query = query.where(ExternalDataEvent.data_type == data_type)
+    rows = session.scalars(query.order_by(desc(ExternalDataEvent.event_time)).limit(min(max(limit, 1), 200))).all()
+    return [
+        {
+            "id": row.id,
+            "source_name": row.source_name,
+            "data_type": row.data_type,
+            "symbol": row.symbol,
+            "event_time": _dt(row.event_time),
+            "numeric_value": row.numeric_value,
+            "payload": row.payload,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/derivatives/run-once")
+async def derivatives_run_once(
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    symbols = payload.get("symbols")
+    if isinstance(symbols, str):
+        symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+    if symbols is not None and not isinstance(symbols, list):
+        raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
+    period = payload.get("period")
+    mock = bool(payload.get("mock", False))
+    collector = BinanceDerivativesCollector(symbols=symbols, period=period)
+    return await collector.fetch_once(mock=mock)
 
 
 @router.get("/db/diagnostics")
@@ -610,14 +692,14 @@ def news_mock(
 
 @router.post("/collectors/{name}/start")
 async def start_collector(name: str, request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
-    if name not in {"market", "news"}:
+    if name not in {"market", "news", "derivatives"}:
         raise HTTPException(status_code=404, detail="Unknown collector")
     return await _worker_manager(request).start(name)
 
 
 @router.post("/collectors/{name}/stop")
 async def stop_collector(name: str, request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
-    if name not in {"market", "news"}:
+    if name not in {"market", "news", "derivatives"}:
         raise HTTPException(status_code=404, detail="Unknown collector")
     return await _worker_manager(request).stop(name)
 
@@ -809,8 +891,21 @@ def training_export(
 
 
 @router.get("/data-events")
-def data_events(session: Session = Depends(get_session), limit: int = 50) -> list[dict[str, Any]]:
-    rows = session.scalars(select(ExternalDataEvent).order_by(desc(ExternalDataEvent.event_time)).limit(limit)).all()
+def data_events(
+    session: Session = Depends(get_session),
+    limit: int = 50,
+    symbol: str | None = None,
+    source_name: str | None = None,
+    data_type: str | None = None,
+) -> list[dict[str, Any]]:
+    query = select(ExternalDataEvent)
+    if symbol:
+        query = query.where(ExternalDataEvent.symbol == symbol.upper())
+    if source_name:
+        query = query.where(ExternalDataEvent.source_name == source_name)
+    if data_type:
+        query = query.where(ExternalDataEvent.data_type == data_type)
+    rows = session.scalars(query.order_by(desc(ExternalDataEvent.event_time)).limit(min(max(limit, 1), 200))).all()
     return [
         {
             "id": row.id,
@@ -857,7 +952,15 @@ def latest_feature(
     payload = feature.payload or {}
     metadata = payload.get("metadata", {})
     vector = {key: values.get(key, 0.0) for key in INSPECTOR_FEATURE_KEYS}
-    strategy_columns = ["price_change", "sentiment_score", "risk_score", "volatility"]
+    strategy_columns = [
+        "price_change",
+        "sentiment_score",
+        "risk_score",
+        "volatility",
+        "trader_crowd_score",
+        "crowd_risk_score",
+        "taker_buy_pressure",
+    ]
     strategy_values = values_from_feature(feature, strategy_columns)
     final_ai_input = values.get("final_ai_input") or {
         "schema_version": feature.schema_version or payload.get("schema_version") or CURRENT_FEATURE_SCHEMA_VERSION,
@@ -893,6 +996,7 @@ def latest_feature(
         "trend_score": vector["trend_score"],
         "final_ai_input": final_ai_input,
         "news_context": metadata.get("news_context", []),
+        "derivatives_context": metadata.get("derivatives_context", []),
         "raw_payload": payload,
     }
 

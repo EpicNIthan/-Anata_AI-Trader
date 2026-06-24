@@ -8,7 +8,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db.models import Candle, Feature, NewsArticle, NewsSentiment, TrainingFeature
+from app.db.models import Candle, ExternalDataEvent, Feature, NewsArticle, NewsSentiment, TrainingFeature
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, feature_payload
 
 
@@ -45,6 +45,13 @@ def _recency_weight(value: datetime | None, now: datetime, horizon_hours: float 
         return 0.25
     age_hours = max((now - timestamp).total_seconds() / 3600.0, 0.0)
     return _clamp(1.0 - (age_hours / horizon_hours), 0.0, 1.0)
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class FeatureBuilder:
@@ -103,6 +110,7 @@ class FeatureBuilder:
             volume_change = 0.0
 
         news_features = self._recent_news_features(normalized_symbol, now=datetime.now(timezone.utc))
+        derivatives_features = self._recent_derivatives_features(normalized_symbol, now=datetime.now(timezone.utc))
         sentiment_score = news_features["sentiment_score"]
         sentiment_confidence = news_features["sentiment_confidence"]
         risk_score = news_features["risk_score"]
@@ -132,6 +140,19 @@ class FeatureBuilder:
             "last_close": closes[-1] if closes else None,
             "candles_used": len(candles),
             "sentiment_articles_used": sentiment_count,
+            "crowd_long_account_pct": derivatives_features["crowd_long_account_pct"],
+            "crowd_short_account_pct": derivatives_features["crowd_short_account_pct"],
+            "crowd_long_short_ratio": derivatives_features["crowd_long_short_ratio"],
+            "top_trader_long_account_pct": derivatives_features["top_trader_long_account_pct"],
+            "top_trader_position_long_pct": derivatives_features["top_trader_position_long_pct"],
+            "taker_buy_pressure": derivatives_features["taker_buy_pressure"],
+            "taker_buy_sell_ratio": derivatives_features["taker_buy_sell_ratio"],
+            "open_interest_value": derivatives_features["open_interest_value"],
+            "open_interest_change": derivatives_features["open_interest_change"],
+            "funding_rate": derivatives_features["funding_rate"],
+            "trader_crowd_score": derivatives_features["trader_crowd_score"],
+            "crowd_risk_score": derivatives_features["crowd_risk_score"],
+            "derivatives_recency_weight": derivatives_features["derivatives_recency_weight"],
         }
         inspector_vector = {
             key: values[key]
@@ -149,6 +170,19 @@ class FeatureBuilder:
                 "volatility",
                 "volume_change",
                 "trend_score",
+                "crowd_long_account_pct",
+                "crowd_short_account_pct",
+                "crowd_long_short_ratio",
+                "top_trader_long_account_pct",
+                "top_trader_position_long_pct",
+                "taker_buy_pressure",
+                "taker_buy_sell_ratio",
+                "open_interest_value",
+                "open_interest_change",
+                "funding_rate",
+                "trader_crowd_score",
+                "crowd_risk_score",
+                "derivatives_recency_weight",
             )
         }
         values["final_ai_input"] = {
@@ -162,6 +196,9 @@ class FeatureBuilder:
                 "risk_score": risk_score,
                 "volatility": volatility,
                 "trend": trend,
+                "trader_crowd_score": derivatives_features["trader_crowd_score"],
+                "crowd_risk_score": derivatives_features["crowd_risk_score"],
+                "taker_buy_pressure": derivatives_features["taker_buy_pressure"],
             },
         }
         payload = feature_payload(
@@ -173,6 +210,7 @@ class FeatureBuilder:
                 "returns_used": len(returns),
                 "missing_future_features_default": "0/null",
                 "news_context": news_features["news_context"],
+                "derivatives_context": derivatives_features["derivatives_context"],
                 "training_quality_candles": training_quality_candles,
                 "closed_candles_used": len([candle for candle in candles if candle.is_closed]),
                 "live_candles_used": len([candle for candle in candles if not candle.is_closed]),
@@ -180,6 +218,7 @@ class FeatureBuilder:
             sources={
                 "candles": "candles",
                 "news_sentiment": "news_sentiment",
+                "derivatives": "external_data_events",
             },
         )
         feature = Feature(
@@ -213,6 +252,95 @@ class FeatureBuilder:
             self.session.commit()
             self.session.refresh(feature)
         return feature
+
+    def _recent_derivatives_features(self, symbol: str, now: datetime) -> dict[str, Any]:
+        since = now - timedelta(hours=24)
+        rows = list(
+            self.session.scalars(
+                select(ExternalDataEvent)
+                .where(
+                    ExternalDataEvent.symbol == symbol,
+                    ExternalDataEvent.source_name.like("binance_futures_%"),
+                    ExternalDataEvent.event_time >= since,
+                )
+                .order_by(desc(ExternalDataEvent.event_time))
+                .limit(100)
+            )
+        )
+        latest_by_type: dict[str, ExternalDataEvent] = {}
+        for row in rows:
+            latest_by_type.setdefault(row.data_type, row)
+
+        def payload_value(data_type: str, key: str, default: float = 0.0) -> float:
+            row = latest_by_type.get(data_type)
+            if row is None:
+                return default
+            return _float((row.payload or {}).get(key), default)
+
+        crowd_long_account_pct = payload_value("global_long_short_account_ratio", "long_account_pct")
+        crowd_short_account_pct = payload_value("global_long_short_account_ratio", "short_account_pct")
+        crowd_long_short_ratio = payload_value("global_long_short_account_ratio", "long_short_ratio")
+        top_trader_long_account_pct = payload_value("top_long_short_account_ratio", "long_account_pct")
+        top_trader_position_long_pct = payload_value("top_long_short_position_ratio", "long_account_pct")
+        taker_buy_pressure = payload_value("taker_buy_sell_volume", "buy_pressure")
+        taker_buy_sell_ratio = payload_value("taker_buy_sell_volume", "buy_sell_ratio")
+        open_interest_value = payload_value("open_interest_hist", "sum_open_interest_value")
+        if open_interest_value == 0.0:
+            open_interest_value = payload_value("open_interest", "open_interest")
+        funding_rate = payload_value("funding_rate", "funding_rate")
+
+        oi_rows = [
+            row
+            for row in rows
+            if row.data_type in {"open_interest_hist", "open_interest"} and row.numeric_value is not None
+        ]
+        oi_rows.sort(key=lambda item: item.event_time)
+        open_interest_change = 0.0
+        if len(oi_rows) >= 2:
+            open_interest_change = _safe_pct_change(float(oi_rows[-1].numeric_value or 0.0), float(oi_rows[-2].numeric_value or 0.0))
+
+        biases: list[float] = []
+        if crowd_long_account_pct or crowd_short_account_pct:
+            biases.append(_clamp((crowd_long_account_pct - crowd_short_account_pct) * 2.0, -1.0, 1.0))
+        if top_trader_long_account_pct:
+            biases.append(_clamp((top_trader_long_account_pct - 0.5) * 2.0, -1.0, 1.0))
+        if top_trader_position_long_pct:
+            biases.append(_clamp((top_trader_position_long_pct - 0.5) * 2.0, -1.0, 1.0))
+        if taker_buy_pressure:
+            biases.append(_clamp((taker_buy_pressure - 0.5) * 2.0, -1.0, 1.0))
+        trader_crowd_score = mean(biases) if biases else 0.0
+
+        funding_pressure = _clamp(funding_rate / 0.0005, -1.0, 1.0) if funding_rate else 0.0
+        crowding = max(abs(item) for item in biases) if biases else 0.0
+        crowd_risk_score = _clamp((crowding * 0.45) + (abs(funding_pressure) * 0.35) + (abs(open_interest_change) * 8.0 * 0.20), 0.0, 1.0)
+
+        recencies = [_recency_weight(row.event_time, now, horizon_hours=24.0) for row in latest_by_type.values()]
+        derivatives_recency_weight = mean(recencies) if recencies else 0.0
+        return {
+            "crowd_long_account_pct": crowd_long_account_pct,
+            "crowd_short_account_pct": crowd_short_account_pct,
+            "crowd_long_short_ratio": crowd_long_short_ratio,
+            "top_trader_long_account_pct": top_trader_long_account_pct,
+            "top_trader_position_long_pct": top_trader_position_long_pct,
+            "taker_buy_pressure": taker_buy_pressure,
+            "taker_buy_sell_ratio": taker_buy_sell_ratio,
+            "open_interest_value": open_interest_value,
+            "open_interest_change": _clamp(open_interest_change, -1.0, 1.0),
+            "funding_rate": funding_rate,
+            "trader_crowd_score": _clamp(trader_crowd_score, -1.0, 1.0),
+            "crowd_risk_score": crowd_risk_score,
+            "derivatives_recency_weight": _clamp(derivatives_recency_weight, 0.0, 1.0),
+            "derivatives_context": [
+                {
+                    "source_name": row.source_name,
+                    "data_type": row.data_type,
+                    "event_time": row.event_time.isoformat() if row.event_time else None,
+                    "numeric_value": row.numeric_value,
+                    "payload": row.payload,
+                }
+                for row in latest_by_type.values()
+            ],
+        }
 
     def _recent_news_features(self, symbol: str, now: datetime) -> dict[str, Any]:
         since = datetime.now(timezone.utc) - timedelta(hours=48)

@@ -5,7 +5,7 @@ from typing import Any
 
 from app.db.models import Feature
 
-CURRENT_FEATURE_SCHEMA_VERSION = "price-news-v2"
+CURRENT_FEATURE_SCHEMA_VERSION = "price-news-v3"
 
 FEATURE_COLUMNS_BY_SCHEMA: dict[str, list[str]] = {
     "price-news-v1": [
@@ -30,6 +30,34 @@ FEATURE_COLUMNS_BY_SCHEMA: dict[str, list[str]] = {
         "volume_change",
         "trend_score",
     ],
+    "price-news-v3": [
+        "sentiment_score",
+        "sentiment_confidence",
+        "risk_score",
+        "impact_score",
+        "recency_weight",
+        "btc_related",
+        "eth_related",
+        "macro_related",
+        "candle_return_1m",
+        "candle_return_5m",
+        "volatility",
+        "volume_change",
+        "trend_score",
+        "crowd_long_account_pct",
+        "crowd_short_account_pct",
+        "crowd_long_short_ratio",
+        "top_trader_long_account_pct",
+        "top_trader_position_long_pct",
+        "taker_buy_pressure",
+        "taker_buy_sell_ratio",
+        "open_interest_value",
+        "open_interest_change",
+        "funding_rate",
+        "trader_crowd_score",
+        "crowd_risk_score",
+        "derivatives_recency_weight",
+    ],
 }
 
 DEFAULT_FEATURE_VALUES: dict[str, float | None] = {
@@ -47,6 +75,19 @@ DEFAULT_FEATURE_VALUES: dict[str, float | None] = {
     "candle_return_1m": 0.0,
     "candle_return_5m": 0.0,
     "trend_score": 0.0,
+    "crowd_long_account_pct": 0.0,
+    "crowd_short_account_pct": 0.0,
+    "crowd_long_short_ratio": 0.0,
+    "top_trader_long_account_pct": 0.0,
+    "top_trader_position_long_pct": 0.0,
+    "taker_buy_pressure": 0.0,
+    "taker_buy_sell_ratio": 0.0,
+    "open_interest_value": 0.0,
+    "open_interest_change": 0.0,
+    "funding_rate": 0.0,
+    "trader_crowd_score": 0.0,
+    "crowd_risk_score": 0.0,
+    "derivatives_recency_weight": 0.0,
     "last_close": None,
     "candles_used": 0.0,
     "sentiment_articles_used": 0.0,

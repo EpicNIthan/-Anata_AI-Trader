@@ -34,6 +34,8 @@ async def lifespan(app: FastAPI):
         await manager.start("market")
     if settings.enable_news_collector:
         await manager.start("news")
+    if settings.enable_derivatives_collector:
+        await manager.start("derivatives")
     if settings.auto_trader_enabled:
         await auto_trader.start()
     try:
@@ -70,4 +72,5 @@ def health() -> dict[str, object]:
         "trading_mode": settings.trading_mode,
         "symbols": settings.binance_symbols,
         "auto_trader_enabled": settings.auto_trader_enabled,
+        "derivatives_enabled": settings.derivatives_enabled,
     }

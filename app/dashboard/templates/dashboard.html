@@ -4,12 +4,12 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Anata AI Trader</title>
-    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v6">
+    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v7">
     <script defer src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
       window.DASHBOARD_CONFIG = {
-        symbols: ["BTCUSDT", "ETHUSDT"],
-        defaultSymbol: "BTCUSDT",
+        symbols: {{ dashboard_symbols | tojson }},
+        defaultSymbol: {{ default_symbol | tojson }},
         defaultTimeframe: "1m"
       };
     </script>
@@ -46,16 +46,13 @@
             <h2>Markets</h2>
             <span>USDT</span>
           </div>
-          <button class="market-row active" data-market-symbol="BTCUSDT">
-            <span>BTCUSDT</span>
-            <strong id="railPriceBTCUSDT">-</strong>
-            <em id="railChangeBTCUSDT">-</em>
+          {% for symbol in dashboard_symbols %}
+          <button class="market-row {% if loop.first %}active{% endif %}" data-market-symbol="{{ symbol }}">
+            <span>{{ symbol }}</span>
+            <strong id="railPrice{{ symbol }}">-</strong>
+            <em id="railChange{{ symbol }}">-</em>
           </button>
-          <button class="market-row" data-market-symbol="ETHUSDT">
-            <span>ETHUSDT</span>
-            <strong id="railPriceETHUSDT">-</strong>
-            <em id="railChangeETHUSDT">-</em>
-          </button>
+          {% endfor %}
           <div class="mini-book">
             <div class="panel-head">
               <h2>Paper Book</h2>
@@ -71,8 +68,9 @@
           <div class="panel-head compact">
             <div class="symbol-line">
               <select id="symbolSelect" aria-label="Symbol">
-                <option>BTCUSDT</option>
-                <option>ETHUSDT</option>
+                {% for symbol in dashboard_symbols %}
+                <option {% if loop.first %}selected{% endif %}>{{ symbol }}</option>
+                {% endfor %}
               </select>
               <div>
                 <strong id="latestPrice">-</strong>
@@ -101,7 +99,7 @@
             <span>Paper only</span>
           </div>
           <form id="signalForm" class="signal-form">
-            <label>Symbol<input name="symbol" id="signalSymbol" value="BTCUSDT" required></label>
+            <label>Symbol<input name="symbol" id="signalSymbol" value="{{ default_symbol }}" required></label>
             <label>Action
               <select name="action">
                 <option>BUY</option>
@@ -124,6 +122,7 @@
           <div class="control-row">
             <button data-worker="market" data-action="start" class="secondary">Start Market</button>
             <button data-worker="news" data-action="start" class="secondary">Start News</button>
+            <button data-worker="derivatives" data-action="start" class="secondary">Start Flow</button>
           </div>
           <div class="trade-flow">
             <div class="panel-head">
@@ -209,6 +208,13 @@
               </div>
               <div id="featureNewsContext" class="news-context-list"></div>
             </div>
+            <div class="feature-card">
+              <div class="panel-head">
+                <h2>Trader Flow Context</h2>
+                <span>public futures aggregates</span>
+              </div>
+              <div id="featureDerivativesContext" class="news-context-list"></div>
+            </div>
             <div class="feature-card feature-json-card">
               <div class="panel-head">
                 <h2>final_ai_input JSON</h2>
@@ -250,6 +256,7 @@
           <div class="diagnostics-grid">
             <pre id="marketDiagnostics" class="log-box"></pre>
             <pre id="newsDiagnostics" class="log-box"></pre>
+            <pre id="derivativesDiagnostics" class="log-box"></pre>
             <pre id="autoDiagnostics" class="log-box"></pre>
             <pre id="dbDiagnostics" class="log-box"></pre>
           </div>
@@ -257,6 +264,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v6"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v7"></script>
   </body>
 </html>

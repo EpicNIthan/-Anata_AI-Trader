@@ -158,7 +158,7 @@ class TrainingFeature(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source_feature_id: Mapped[int | None] = mapped_column(ForeignKey("features.id"), nullable=True, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
-    schema_version: Mapped[str] = mapped_column(String(64), default="price-news-v2", index=True)
+    schema_version: Mapped[str] = mapped_column(String(64), default="price-news-v3", index=True)
     source_name: Mapped[str | None] = mapped_column(String(128), default="feature_builder", nullable=True, index=True)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     feature_values: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from app.collectors.derivatives_collector import BinanceDerivativesCollector
 from app.collectors.market_collector import BinanceMarketCollector
 from app.collectors.news_collector import NewsCollector
 
@@ -74,6 +75,7 @@ class WorkerManager:
         self._states: dict[str, CollectorState] = {
             "market": CollectorState(name="market"),
             "news": CollectorState(name="news"),
+            "derivatives": CollectorState(name="derivatives"),
         }
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
@@ -94,6 +96,7 @@ class WorkerManager:
 
         market_collector: BinanceMarketCollector | None = None
         news_collector: NewsCollector | None = None
+        derivatives_collector: BinanceDerivativesCollector | None = None
         if name == "market":
             market_collector = BinanceMarketCollector()
             state.set_subscription(streams=market_collector.subscribed_streams, websocket_url=market_collector.stream_url)
@@ -105,6 +108,14 @@ class WorkerManager:
                 state.warning = news_collector.unavailable_reason
                 state.mark_error(news_collector.unavailable_reason)
                 return state.as_dict()
+        elif name == "derivatives":
+            derivatives_collector = BinanceDerivativesCollector()
+            state.details = {
+                "base_url": derivatives_collector.base_url,
+                "period": derivatives_collector.period,
+                "symbols": derivatives_collector.symbols,
+                "endpoints": derivatives_collector.endpoints,
+            }
 
         state.running = True
 
@@ -114,6 +125,8 @@ class WorkerManager:
                     await (market_collector or BinanceMarketCollector()).run(stop_event, state)
                 elif name == "news":
                     await (news_collector or NewsCollector()).run(stop_event, state)
+                elif name == "derivatives":
+                    await (derivatives_collector or BinanceDerivativesCollector()).run(stop_event, state)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive worker boundary

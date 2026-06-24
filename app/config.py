@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT"
+
 
 def _csv(value: str | None, default: str) -> list[str]:
     raw = value if value is not None else default
@@ -64,12 +66,20 @@ def _database_url() -> str:
 class Settings:
     database_url: str = field(default_factory=_database_url)
     binance_symbols: list[str] = field(
-        default_factory=lambda: _csv(os.getenv("BINANCE_SYMBOLS"), "BTCUSDT,ETHUSDT")
+        default_factory=lambda: _csv(os.getenv("BINANCE_SYMBOLS"), DEFAULT_SYMBOLS)
     )
     binance_interval: str = os.getenv("BINANCE_INTERVAL", "1m")
     store_live_candle_updates: bool = field(default_factory=lambda: _bool("STORE_LIVE_CANDLE_UPDATES", True))
     binance_rest_base_url: str = os.getenv("BINANCE_REST_BASE_URL", "https://data-api.binance.vision")
     binance_ws_base_url: str = os.getenv("BINANCE_WS_BASE_URL", "wss://data-stream.binance.vision")
+    binance_futures_rest_base_url: str = os.getenv("BINANCE_FUTURES_REST_BASE_URL", "https://fapi.binance.com")
+    derivatives_enabled: bool = field(default_factory=lambda: _bool("DERIVATIVES_ENABLED", True))
+    enable_derivatives_collector: bool = field(default_factory=lambda: _bool("ENABLE_DERIVATIVES_COLLECTOR"))
+    derivatives_poll_interval_seconds: int = field(default_factory=lambda: _int("DERIVATIVES_POLL_INTERVAL_SECONDS", 300))
+    derivatives_period: str = os.getenv("DERIVATIVES_PERIOD", "5m")
+    derivatives_symbols: list[str] = field(
+        default_factory=lambda: _csv(os.getenv("DERIVATIVES_SYMBOLS"), DEFAULT_SYMBOLS)
+    )
     news_api_key: str | None = field(default_factory=lambda: _secret("NEWS_API_KEY"))
     news_provider_url: str = os.getenv("NEWS_PROVIDER_URL", "https://newsapi.org/v2/everything")
     news_providers: list[str] = field(
@@ -105,7 +115,7 @@ class Settings:
     auto_trader_enabled: bool = field(default_factory=lambda: _bool("AUTO_TRADER_ENABLED"))
     auto_trader_interval_seconds: int = field(default_factory=lambda: _int("AUTO_TRADER_INTERVAL_SECONDS", 60))
     auto_trader_symbols: list[str] = field(
-        default_factory=lambda: _csv(os.getenv("AUTO_TRADER_SYMBOLS"), "BTCUSDT,ETHUSDT")
+        default_factory=lambda: _csv(os.getenv("AUTO_TRADER_SYMBOLS"), DEFAULT_SYMBOLS)
     )
     paper_trade_timeframe: str = os.getenv("PAPER_TRADE_TIMEFRAME", "1m")
     paper_fee_rate: float = field(default_factory=lambda: _float("PAPER_FEE_RATE", 0.001))
@@ -121,6 +131,7 @@ class Settings:
     raw_news_retention_days: int = field(default_factory=lambda: _int("RAW_NEWS_RETENTION_DAYS", 30))
     raw_tick_retention_days: int = field(default_factory=lambda: _int("RAW_TICK_RETENTION_DAYS", 7))
     diagnostic_retention_days: int = field(default_factory=lambda: _int("DIAGNOSTIC_RETENTION_DAYS", 7))
+    external_data_retention_days: int = field(default_factory=lambda: _int("EXTERNAL_DATA_RETENTION_DAYS", 365))
     experience_retention_days: int = field(default_factory=lambda: _int("EXPERIENCE_RETENTION_DAYS", 365))
     closed_candle_retention_days: int = field(default_factory=lambda: _int("CLOSED_CANDLE_RETENTION_DAYS", 1095))
     archive_dir: Path = field(default_factory=lambda: Path(os.getenv("ARCHIVE_DIR", "./archives")))

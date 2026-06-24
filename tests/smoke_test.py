@@ -35,6 +35,9 @@ os.environ["EXPLORATION_MODE"] = "true"
 os.environ["EXPLORATION_RATE"] = "1.0"
 os.environ["MIN_PAPER_TRADE_NOTIONAL"] = "50"
 os.environ["ARCHIVE_DIR"] = "./_smoke_archives"
+os.environ["DERIVATIVES_ENABLED"] = "true"
+os.environ["ENABLE_DERIVATIVES_COLLECTOR"] = "false"
+os.environ["DERIVATIVES_SYMBOLS"] = "BTCUSDT"
 os.environ["NEWS_PROVIDER"] = "rss,gdelt,newsapi"
 os.environ["RSS_NEWS_ENABLED"] = "true"
 os.environ["RSS_FEEDS"] = f"file://{SMOKE_FEED_PATH}"
@@ -51,7 +54,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, inspect, select
 
 from app.collectors.market_collector import BinanceMarketCollector
-from app.db.models import AiDecision, Candle, ExperienceRecord, Feature, LiveCandleUpdate, NewsArticle, NewsSentiment, TrainingFeature
+from app.db.models import AiDecision, Candle, ExperienceRecord, ExternalDataEvent, Feature, LiveCandleUpdate, NewsArticle, NewsSentiment, TrainingFeature
 from app.db.session import engine
 from app.db.session import SessionLocal
 from app.main import app
@@ -159,6 +162,21 @@ def main() -> None:
 
         collector_status = client.get("/api/collectors/status")
         assert collector_status.status_code == 200, collector_status.text
+        assert "derivatives" in collector_status.json(), collector_status.text
+
+        derivatives_run = client.post(
+            "/api/derivatives/run-once",
+            json={"symbols": ["BTCUSDT"], "mock": True},
+            auth=auth,
+        )
+        assert derivatives_run.status_code == 200, derivatives_run.text
+        assert derivatives_run.json()["rows_saved"] >= 7, derivatives_run.text
+        derivatives_status = client.get("/api/derivatives/status")
+        assert derivatives_status.status_code == 200, derivatives_status.text
+        assert derivatives_status.json()["counts_by_type"]["funding_rate"] >= 1, derivatives_status.text
+        derivatives_latest = client.get("/api/derivatives/latest?symbol=BTCUSDT")
+        assert derivatives_latest.status_code == 200, derivatives_latest.text
+        assert len(derivatives_latest.json()) >= 1, derivatives_latest.text
 
         market_backfill = client.post(
             "/api/market/backfill",
@@ -260,14 +278,19 @@ def main() -> None:
         assert feature_latest.status_code == 200, feature_latest.text
         feature_payload = feature_latest.json()
         assert feature_payload["symbol"] == "BTCUSDT", feature_latest.text
-        assert feature_payload["schema_version"] == "price-news-v2", feature_latest.text
+        assert feature_payload["schema_version"] == "price-news-v3", feature_latest.text
         assert "sentiment_confidence" in feature_payload["vector"], feature_latest.text
         assert "candle_return_1m" in feature_payload["vector"], feature_latest.text
+        assert "trader_crowd_score" in feature_payload["vector"], feature_latest.text
+        assert feature_payload["vector"]["derivatives_recency_weight"] > 0, feature_latest.text
+        assert len(feature_payload["derivatives_context"]) >= 1, feature_latest.text
         assert "final_ai_input" in feature_payload, feature_latest.text
         assert "strategy_input" in feature_payload["final_ai_input"], feature_latest.text
         with SessionLocal() as session:
             training_feature_count = session.scalar(select(func.count(TrainingFeature.id))) or 0
+            external_event_count = session.scalar(select(func.count(ExternalDataEvent.id))) or 0
         assert training_feature_count > 0
+        assert external_event_count >= 7
 
         cleanup = client.post("/api/db/cleanup", auth=auth)
         assert cleanup.status_code == 200, cleanup.text
