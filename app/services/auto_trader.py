@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import desc, select
 
-from app.ai.experience_buffer import record_experience
+from app.ai.experience_buffer import record_experience, update_experience_rewards
 from app.ai.strategy import RuleBasedStrategy, StrategyDecision
 from app.config import settings
 from app.db.models import AiDecision, Feature, PaperTrade, Position
@@ -27,8 +28,14 @@ class AutoTraderState:
     symbols: list[str] = field(default_factory=list)
     cycles: int = 0
     decisions: int = 0
+    strategy_trades: int = 0
+    exploration_trades: int = 0
+    skipped_trades: int = 0
+    exploration_enabled: bool = False
+    exploration_rate: float = 0.0
     last_run_at: str | None = None
     last_error: str | None = None
+    last_skip_reason: str | None = None
     last_decision: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -50,7 +57,10 @@ class AutoTraderService:
             enabled=settings.auto_trader_enabled,
             interval_seconds=self.interval_seconds,
             symbols=self.symbols,
+            exploration_enabled=settings.exploration_mode and settings.is_paper_mode,
+            exploration_rate=settings.exploration_rate,
         )
+        self._rng = random.Random()
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
 
@@ -114,6 +124,7 @@ class AutoTraderService:
                     cycle_decisions.append({"symbol": symbol.upper(), "status": "ERROR", "message": str(exc)})
                     self.state.last_error = str(exc)
             PaperEngine(session).snapshot()
+            update_experience_rewards(session)
 
         self.state.cycles += 1
         self.state.decisions += len(cycle_decisions)
@@ -121,6 +132,15 @@ class AutoTraderService:
         self.state.last_decision = cycle_decisions[-1] if cycle_decisions else None
         if cycle_decisions:
             self.state.last_error = None
+        for item in cycle_decisions:
+            if item.get("trade_id"):
+                if item.get("decision_source") == "exploration":
+                    self.state.exploration_trades += 1
+                else:
+                    self.state.strategy_trades += 1
+            else:
+                self.state.skipped_trades += 1
+                self.state.last_skip_reason = item.get("message") or item.get("reason")
         return self.status()
 
     def _run_symbol(self, session, symbol: str) -> dict[str, Any]:
@@ -129,7 +149,8 @@ class AutoTraderService:
             interval=settings.paper_trade_timeframe,
             store=True,
         )
-        decision = RuleBasedStrategy().decide(feature)
+        strategy_decision = RuleBasedStrategy().decide(feature)
+        decision, decision_source = self._maybe_explore(session, symbol, strategy_decision)
         duplicate_result = self._duplicate_or_loss_cooldown(session, symbol, decision)
         if duplicate_result:
             execution_result = duplicate_result
@@ -141,6 +162,7 @@ class AutoTraderService:
                 reason=decision.reason,
                 stop_loss=decision.stop_loss,
                 take_profit=decision.take_profit,
+                notional=settings.min_paper_trade_notional if decision_source == "exploration" and decision.action == "BUY" else None,
             )
 
         execution = {
@@ -150,7 +172,18 @@ class AutoTraderService:
             "balance": execution_result.balance,
             "equity": execution_result.equity,
         }
-        ai_decision = self._record_decision(session, symbol, feature, decision, execution_result, execution)
+        execution["decision_source"] = decision_source
+        execution["strategy_action"] = strategy_decision.action
+        ai_decision = self._record_decision(
+            session,
+            symbol,
+            feature,
+            decision,
+            execution_result,
+            execution,
+            decision_source=decision_source,
+            strategy_decision=strategy_decision,
+        )
         return {
             "decision_id": ai_decision.id,
             "symbol": symbol,
@@ -159,8 +192,38 @@ class AutoTraderService:
             "action": decision.action,
             "confidence": decision.confidence,
             "reason": decision.reason,
+            "decision_source": decision_source,
+            "strategy_action": strategy_decision.action,
             **execution,
         }
+
+    def _maybe_explore(
+        self,
+        session,
+        symbol: str,
+        strategy_decision: StrategyDecision,
+    ) -> tuple[StrategyDecision, str]:
+        if not settings.is_paper_mode or not settings.exploration_mode or settings.exploration_rate <= 0:
+            return strategy_decision, "strategy"
+        if self._rng.random() >= min(max(settings.exploration_rate, 0.0), 1.0):
+            return strategy_decision, "strategy"
+
+        existing_position = session.scalar(
+            select(Position)
+            .where(Position.symbol == symbol, Position.status == "OPEN")
+            .order_by(desc(Position.opened_at))
+            .limit(1)
+        )
+        if existing_position:
+            action = self._rng.choice(["BUY", "SELL", "CLOSE"])
+        else:
+            action = "BUY"
+        confidence = max(settings.risk_min_confidence, min(max(strategy_decision.confidence, 0.0), 0.75))
+        reason = (
+            f"Exploration paper action selected to collect action-result experience. "
+            f"Original strategy wanted {strategy_decision.action}: {strategy_decision.reason}"
+        )
+        return StrategyDecision(action=action, confidence=confidence, reason=reason), "exploration"
 
     def _record_decision(
         self,
@@ -170,11 +233,13 @@ class AutoTraderService:
         decision: StrategyDecision,
         execution_result: ExecutionResult,
         execution: dict[str, Any],
+        decision_source: str,
+        strategy_decision: StrategyDecision,
     ) -> AiDecision:
         ai_decision = AiDecision(
             symbol=symbol,
-            strategy_name=RuleBasedStrategy.name,
-            source_name=self.name,
+            strategy_name=RuleBasedStrategy.name if decision_source == "strategy" else "exploration-v1",
+            source_name=self.name if decision_source == "strategy" else "auto-trader-exploration-v1",
             feature_id=feature.id,
             feature_schema_version=feature.schema_version,
             action=decision.action,
@@ -185,11 +250,29 @@ class AutoTraderService:
             execution_status=execution_result.status,
             execution_message=execution_result.message,
             trade_id=execution_result.trade_id,
-            raw=decision.model_dump(),
+            raw={
+                **decision.model_dump(),
+                "decision_source": decision_source,
+                "strategy_decision": decision.model_dump() if decision_source == "strategy" else strategy_decision.model_dump(),
+                "exploration": {
+                    "enabled": settings.exploration_mode,
+                    "rate": settings.exploration_rate,
+                    "min_notional": settings.min_paper_trade_notional,
+                },
+            },
             result=execution,
         )
         session.add(ai_decision)
         session.flush()
+        if ai_decision.trade_id:
+            trade = session.get(PaperTrade, ai_decision.trade_id)
+            if trade:
+                trade.raw_payload = {
+                    **(trade.raw_payload or {}),
+                    "decision_source": decision_source,
+                    "ai_decision_id": ai_decision.id,
+                    "auto_trader": self.name,
+                }
         record_experience(session, decision=ai_decision, feature=feature, execution_result=execution)
         session.commit()
         session.refresh(ai_decision)

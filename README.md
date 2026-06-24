@@ -131,6 +131,9 @@ AUTO_TRADER_ENABLED=false
 AUTO_TRADER_INTERVAL_SECONDS=60
 AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT
 PAPER_TRADE_TIMEFRAME=1m
+EXPLORATION_MODE=true
+EXPLORATION_RATE=0.05
+MIN_PAPER_TRADE_NOTIONAL=50
 ```
 
 Controls:
@@ -148,10 +151,18 @@ Safety behavior:
 - Uses the existing risk manager.
 - Blocks rapid duplicate long entries for the same symbol.
 - Blocks new auto-trader buys during cooldown after a recent realized loss.
+- Optional exploration mode only runs in paper mode and uses tiny fake notionals while still passing through risk checks.
+- Records whether each decision came from `strategy` or `exploration`, then updates 5m/15m/1h reward diagnostics when future candles exist.
+
+Diagnostics:
+
+```powershell
+curl http://localhost:8000/api/db/diagnostics
+```
 
 ## Training Workflow
 
-Features are stored as versioned JSON payloads. The current schema is `price-news-v1`; missing future values default to `0` or `null` so older models keep running when new data sources are added.
+Features are stored as versioned JSON payloads. The current schema is `price-news-v2`; `price-news-v1` remains available for older models. Missing future values default to `0` or `null` so older models keep running when new data sources are added.
 
 Build features through the API or internal jobs, then export:
 

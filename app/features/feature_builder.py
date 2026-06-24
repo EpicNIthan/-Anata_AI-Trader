@@ -69,13 +69,21 @@ class FeatureBuilder:
         if candle_interval:
             query = (
                 select(Candle)
+                .where(Candle.symbol == normalized_symbol, Candle.interval == candle_interval, Candle.is_closed.is_(True))
+                .order_by(desc(Candle.open_time))
+                .limit(lookback)
+            )
+        candles = list(self.session.scalars(query))
+        training_quality_candles = True
+        if len(candles) < 2 and candle_interval:
+            training_quality_candles = False
+            fallback_query = (
+                select(Candle)
                 .where(Candle.symbol == normalized_symbol, Candle.interval == candle_interval)
                 .order_by(desc(Candle.open_time))
                 .limit(lookback)
             )
-        candles = list(
-            self.session.scalars(query)
-        )
+            candles = list(self.session.scalars(fallback_query))
         candles.reverse()
 
         closes = [candle.close for candle in candles]
@@ -165,6 +173,9 @@ class FeatureBuilder:
                 "returns_used": len(returns),
                 "missing_future_features_default": "0/null",
                 "news_context": news_features["news_context"],
+                "training_quality_candles": training_quality_candles,
+                "closed_candles_used": len([candle for candle in candles if candle.is_closed]),
+                "live_candles_used": len([candle for candle in candles if not candle.is_closed]),
             },
             sources={
                 "candles": "candles",

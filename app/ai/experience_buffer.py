@@ -7,7 +7,9 @@ from typing import Any
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db.models import (
+    AccountEquity,
     AiDecision,
     Candle,
     ExperienceRecord,
@@ -108,6 +110,116 @@ def reward_from_result(session: Session, trade_id: int | None, execution_status:
     return 0.0
 
 
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _future_candle(session: Session, symbol: str, target_time: datetime) -> Candle | None:
+    return session.scalar(
+        select(Candle)
+        .where(Candle.symbol == symbol.upper(), Candle.is_closed.is_(True), Candle.open_time >= target_time)
+        .order_by(Candle.open_time)
+        .limit(1)
+    )
+
+
+def _equity_after(session: Session, target_time: datetime) -> AccountEquity | None:
+    return session.scalar(
+        select(AccountEquity)
+        .where(AccountEquity.timestamp >= target_time)
+        .order_by(AccountEquity.timestamp)
+        .limit(1)
+    )
+
+
+def update_experience_rewards(
+    session: Session,
+    *,
+    horizons_minutes: tuple[int, ...] = (5, 15, 60),
+    limit: int = 500,
+) -> int:
+    now = datetime.now(timezone.utc)
+    oldest_required = now - timedelta(minutes=min(horizons_minutes))
+    records = list(
+        session.scalars(
+            select(ExperienceRecord)
+            .where(ExperienceRecord.created_at <= oldest_required)
+            .order_by(desc(ExperienceRecord.created_at))
+            .limit(limit)
+        )
+    )
+    updated = 0
+    for record in records:
+        raw_payload = dict(record.raw_payload or {})
+        result = dict(record.result or {})
+        horizons = dict(raw_payload.get("reward_horizons") or result.get("reward_horizons") or {})
+        decision = session.get(AiDecision, record.ai_decision_id) if record.ai_decision_id else None
+        trade = session.get(PaperTrade, decision.trade_id) if decision and decision.trade_id else None
+        market_state = record.market_state or {}
+        latest_candle = market_state.get("latest_candle") or {}
+        entry_price = float((trade.price if trade else latest_candle.get("close")) or 0.0)
+        notional = float((trade.notional if trade else 0.0) or 0.0)
+        fee = float((trade.fee if trade else 0.0) or 0.0)
+        realized_pnl = float((trade.realized_pnl if trade else 0.0) or 0.0)
+        if entry_price <= 0:
+            continue
+
+        created_at = _aware(record.created_at) or now
+        for horizon in horizons_minutes:
+            key = f"{horizon}m"
+            if key in horizons:
+                continue
+            target_time = created_at + timedelta(minutes=horizon)
+            if now < target_time:
+                continue
+            future = _future_candle(session, record.symbol, target_time)
+            if future is None:
+                continue
+            future_price = float(future.close or 0.0)
+            price_change = (future_price - entry_price) / entry_price if entry_price else 0.0
+            action = record.action.upper()
+            direction = 1.0 if action == "BUY" else (-1.0 if action in {"SELL", "CLOSE"} else 0.0)
+            movement_pnl = price_change * notional * direction
+            equity = _equity_after(session, target_time)
+            drawdown = float(equity.drawdown if equity else 0.0)
+            drawdown_penalty = abs(min(drawdown, 0.0)) * max(notional, settings.min_paper_trade_notional)
+            reward = 0.0
+            if record.result and record.result.get("status") == "FILLED":
+                reward = movement_pnl + realized_pnl - fee - drawdown_penalty
+            horizons[key] = {
+                "target_time": target_time.isoformat(),
+                "future_candle_time": future.open_time.isoformat() if future.open_time else None,
+                "entry_price": entry_price,
+                "future_price": future_price,
+                "price_change": price_change,
+                "movement_pnl": movement_pnl,
+                "realized_pnl": realized_pnl,
+                "fee_penalty": fee,
+                "drawdown": drawdown,
+                "drawdown_penalty": drawdown_penalty,
+                "reward": reward,
+            }
+            updated += 1
+
+        if not horizons:
+            continue
+        raw_payload["reward_horizons"] = horizons
+        result["reward_horizons"] = horizons
+        record.raw_payload = raw_payload
+        record.result = result
+        if "5m" in horizons:
+            record.reward = float(horizons["5m"].get("reward", record.reward or 0.0))
+            if decision:
+                decision.reward = record.reward
+    if updated:
+        session.commit()
+    return updated
+
+
 def record_experience(
     session: Session,
     *,
@@ -147,4 +259,3 @@ def record_experience(
     )
     session.add(record)
     return record
-

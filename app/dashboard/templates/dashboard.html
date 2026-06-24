@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Anata AI Trader</title>
-    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v4">
+    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v5">
     <script defer src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
       window.DASHBOARD_CONFIG = {
@@ -125,6 +125,21 @@
             <button data-worker="market" data-action="start" class="secondary">Start Market</button>
             <button data-worker="news" data-action="start" class="secondary">Start News</button>
           </div>
+          <div class="trade-flow">
+            <div class="panel-head">
+              <h2>AI Trade Flow</h2>
+              <span id="tradeFlowMode">paper</span>
+            </div>
+            <div class="flow-grid">
+              <div><span>Strategy Trades</span><b id="strategyTradeCount">-</b></div>
+              <div><span>Exploration Trades</span><b id="explorationTradeCount">-</b></div>
+              <div><span>Skipped</span><b id="skippedTradeCount">-</b></div>
+              <div><span>Last Action</span><b id="lastStrategyAction">-</b></div>
+            </div>
+            <p id="tradeWarning" class="warning"></p>
+            <p id="lastStrategyReason" class="muted"></p>
+            <pre id="holdReasons" class="mini-log"></pre>
+          </div>
         </aside>
       </section>
 
@@ -156,7 +171,7 @@
 
         <section id="tab-decisions" class="tab-panel">
           <table>
-            <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Confidence</th><th>Sentiment</th><th>Risk</th><th>Strategy</th><th>Reward</th><th>Reason</th></tr></thead>
+            <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Source</th><th>Status</th><th>Confidence</th><th>Sentiment</th><th>Risk</th><th>Strategy</th><th>Reward</th><th>Reason</th></tr></thead>
             <tbody id="decisionsBody"></tbody>
           </table>
         </section>
@@ -230,11 +245,12 @@
             <pre id="marketDiagnostics" class="log-box"></pre>
             <pre id="newsDiagnostics" class="log-box"></pre>
             <pre id="autoDiagnostics" class="log-box"></pre>
+            <pre id="dbDiagnostics" class="log-box"></pre>
           </div>
         </section>
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v4"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v5"></script>
   </body>
 </html>

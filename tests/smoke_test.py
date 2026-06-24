@@ -31,6 +31,9 @@ os.environ["ENABLE_NEWS_COLLECTOR"] = "false"
 os.environ["AUTO_TRADER_ENABLED"] = "false"
 os.environ["AUTO_TRADER_INTERVAL_SECONDS"] = "1"
 os.environ["AUTO_TRADER_SYMBOLS"] = "BTCUSDT"
+os.environ["EXPLORATION_MODE"] = "true"
+os.environ["EXPLORATION_RATE"] = "1.0"
+os.environ["MIN_PAPER_TRADE_NOTIONAL"] = "50"
 os.environ["NEWS_PROVIDER"] = "rss,gdelt,newsapi"
 os.environ["RSS_NEWS_ENABLED"] = "true"
 os.environ["RSS_FEEDS"] = f"file://{SMOKE_FEED_PATH}"
@@ -163,6 +166,10 @@ def main() -> None:
         market_status = client.get("/api/market/status")
         assert market_status.status_code == 200, market_status.text
         assert market_status.json()["candle_count"] > 0, market_status.text
+        db_diagnostics = client.get("/api/db/diagnostics")
+        assert db_diagnostics.status_code == 200, db_diagnostics.text
+        assert db_diagnostics.json()["candles"]["closed_training_rows"] > 0, db_diagnostics.text
+        assert db_diagnostics.json()["candles"]["duplicate_group_count"] == 0, db_diagnostics.text
         candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5")
         assert candles.status_code == 200, candles.text
         assert len(candles.json()) > 0, candles.text
@@ -196,8 +203,13 @@ def main() -> None:
             time.sleep(0.25)
         assert auto_status.get("cycles", 0) >= 1, auto_status
         assert auto_status.get("last_run_at"), auto_status
+        assert auto_status.get("exploration_enabled") is True, auto_status
         decisions = client.get("/api/ai-decisions")
         assert decisions.status_code == 200, decisions.text
+        assert decisions.json()[0]["decision_source"] == "exploration", decisions.text
+        summary_after_auto = client.get("/api/dashboard/summary")
+        assert summary_after_auto.status_code == 200, summary_after_auto.text
+        assert summary_after_auto.json()["trading"]["exploration_trades"] + summary_after_auto.json()["trading"]["skipped_trades"] >= 1
 
         with SessionLocal() as session:
             decisions_after = session.scalar(select(func.count(AiDecision.id))) or 0

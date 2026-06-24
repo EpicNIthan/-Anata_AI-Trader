@@ -113,6 +113,9 @@ class BinanceMarketCollector:
         close_price = float(kline["c"])
         is_closed = bool(kline.get("x", False))
         candle_saved = False
+        candle_created = False
+        candle_updated = False
+        candle_source_name = "binance_kline_closed" if is_closed else "binance_kline_live"
 
         with SessionLocal() as session:
             if self.store_live_updates or is_closed:
@@ -126,9 +129,10 @@ class BinanceMarketCollector:
                     )
                 )
                 if candle is None:
+                    candle_created = True
                     candle = Candle(
                         exchange="binance",
-                        source_name="binance_kline",
+                        source_name=candle_source_name,
                         symbol=symbol,
                         interval=interval,
                         open_time=open_time,
@@ -146,6 +150,7 @@ class BinanceMarketCollector:
                     )
                     session.add(candle)
                 else:
+                    candle_updated = True
                     candle.close_time = close_time
                     candle.high = float(kline["h"])
                     candle.low = float(kline["l"])
@@ -153,7 +158,8 @@ class BinanceMarketCollector:
                     candle.volume = float(kline["v"])
                     candle.quote_volume = float(kline.get("q", 0.0))
                     candle.trades = int(kline.get("n", 0))
-                    candle.is_closed = is_closed
+                    candle.is_closed = candle.is_closed or is_closed
+                    candle.source_name = "binance_kline_closed" if candle.is_closed else candle_source_name
                     candle.raw = payload
                     candle.raw_payload = payload
 
@@ -177,6 +183,10 @@ class BinanceMarketCollector:
             "price": close_price,
             "closed": is_closed,
             "candle_saved": candle_saved,
+            "candle_created": candle_created,
+            "candle_updated": candle_updated,
+            "live_update_upserted": candle_saved and not is_closed,
+            "training_quality_closed_candle": candle_saved and is_closed,
             "rows_saved": 2 if candle_saved else 1,
             "store_live_candle_updates": self.store_live_updates,
             "closed_candles_only": not self.store_live_updates,
@@ -229,7 +239,7 @@ class BinanceMarketCollector:
                 if candle is None:
                     candle = Candle(
                         exchange="binance",
-                        source_name="binance_rest_klines",
+                        source_name="binance_rest_klines_closed",
                         symbol=symbol,
                         interval=self.interval,
                         open_time=open_time,
@@ -256,6 +266,7 @@ class BinanceMarketCollector:
                     candle.quote_volume = float(row[7])
                     candle.trades = int(row[8])
                     candle.is_closed = True
+                    candle.source_name = "binance_rest_klines_closed"
                     candle.raw = payload
                     candle.raw_payload = payload
                 rows_saved += 1

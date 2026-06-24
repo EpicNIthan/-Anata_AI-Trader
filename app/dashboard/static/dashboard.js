@@ -227,6 +227,16 @@
       setText("marketDiagnostics", JSON.stringify(data.market, null, 2));
       setText("newsDiagnostics", JSON.stringify(data.news?.providers || data.news, null, 2));
       setText("autoDiagnostics", JSON.stringify(data.auto_trader, null, 2));
+      const trading = data.trading || {};
+      setText("strategyTradeCount", number(trading.strategy_trades, 0));
+      setText("explorationTradeCount", number(trading.exploration_trades, 0));
+      setText("skippedTradeCount", number(trading.skipped_trades, 0));
+      const lastAction = trading.last_strategy_action || {};
+      setText("lastStrategyAction", lastAction.action ? `${lastAction.action} · ${lastAction.status || "-"}` : "-");
+      setText("tradeWarning", trading.latest_warning || "");
+      setText("lastStrategyReason", lastAction.reason ? `Reason: ${lastAction.reason}` : "");
+      setText("holdReasons", (trading.hold_reasons || []).map((item) => `${when(item.time)} ${item.symbol} ${item.action}/${item.status}: ${item.reason || "-"}`).join("\n"));
+      setText("tradeFlowMode", data.auto_trader?.exploration_enabled ? `explore ${pct(data.auto_trader?.exploration_rate || 0, 1)}` : "strategy");
     } catch (error) {
       setText("marketStatus", "Error");
       setClass("marketStatus", "warning");
@@ -267,8 +277,8 @@
   async function refreshDecisions() {
     const rows = await api("/api/ai-decisions?limit=50");
     $("decisionsBody").innerHTML = rows.map((row) => `
-      <tr><td>${when(row.time)}</td><td>${escapeHtml(row.symbol)}</td><td>${escapeHtml(row.action)}</td><td>${pct(row.confidence, 1)}</td><td>${number(row.sentiment_score, 3)}</td><td>${number(row.risk_score, 3)}</td><td>${escapeHtml(row.strategy)}</td><td>${number(row.reward, 4)}</td><td>${escapeHtml(row.reason || "-")}</td></tr>
-    `).join("") || `<tr><td colspan="9" class="empty">No decisions</td></tr>`;
+      <tr><td>${when(row.time)}</td><td>${escapeHtml(row.symbol)}</td><td>${escapeHtml(row.action)}</td><td>${escapeHtml(row.decision_source || "-")}</td><td>${escapeHtml(row.execution_status || "-")}</td><td>${pct(row.confidence, 1)}</td><td>${number(row.sentiment_score, 3)}</td><td>${number(row.risk_score, 3)}</td><td>${escapeHtml(row.strategy)}</td><td>${number(row.reward, 4)}</td><td>${escapeHtml(row.reason || "-")}</td></tr>
+    `).join("") || `<tr><td colspan="11" class="empty">No decisions</td></tr>`;
   }
 
   async function refreshNews() {
@@ -321,9 +331,20 @@
     }
   }
 
+  async function refreshDbDiagnostics() {
+    const output = $("dbDiagnostics");
+    if (!output) return;
+    try {
+      const data = await api("/api/db/diagnostics");
+      output.textContent = JSON.stringify(data, null, 2);
+    } catch (error) {
+      output.textContent = `DB diagnostics error: ${error.message}`;
+    }
+  }
+
   async function refreshHeavy() {
     try {
-      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures()]);
+      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures(), refreshDbDiagnostics()]);
     } catch (error) {
       console.warn("table refresh failed", error);
     }

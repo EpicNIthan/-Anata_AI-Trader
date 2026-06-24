@@ -34,6 +34,7 @@ from app.features.feature_builder import FeatureBuilder
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, values_from_feature
 from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
+from app.services.db_diagnostics import database_diagnostics
 from app.training.export_dataset import export_dataset, parse_since_date
 from app.trading.paper_engine import PaperEngine
 
@@ -213,6 +214,68 @@ def _auto_trader(request: Request):
     return service
 
 
+def _decision_source(row: AiDecision) -> str:
+    raw = row.raw or row.raw_payload or {}
+    source = raw.get("decision_source") if isinstance(raw, dict) else None
+    if source:
+        return str(source)
+    if row.source_name and "exploration" in row.source_name:
+        return "exploration"
+    return "strategy"
+
+
+def _trading_diagnostics(session: Session) -> dict[str, Any]:
+    decisions = list(session.scalars(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(500)))
+    strategy_trades = 0
+    exploration_trades = 0
+    skipped_trades = 0
+    hold_reasons: list[dict[str, Any]] = []
+    for decision in decisions:
+        source = _decision_source(decision)
+        filled = decision.trade_id is not None and decision.execution_status == "FILLED"
+        if filled and source == "exploration":
+            exploration_trades += 1
+        elif filled:
+            strategy_trades += 1
+        if not filled:
+            skipped_trades += 1
+        if decision.action == "HOLD" or decision.execution_status in {"HELD", "REJECTED"}:
+            hold_reasons.append(
+                {
+                    "time": _dt(decision.created_at),
+                    "symbol": decision.symbol,
+                    "action": decision.action,
+                    "status": decision.execution_status,
+                    "confidence": decision.confidence,
+                    "reason": decision.reason or decision.execution_message,
+                    "decision_source": source,
+                }
+            )
+    last_decision = decisions[0] if decisions else None
+    latest_warning = None
+    if last_decision and last_decision.trade_id is None and last_decision.execution_status in {"HELD", "REJECTED"}:
+        latest_warning = (
+            f"No paper trade opened: {last_decision.action} {last_decision.execution_status}. "
+            f"{last_decision.reason or last_decision.execution_message or 'No reason recorded.'}"
+        )
+    return {
+        "strategy_trades": strategy_trades,
+        "exploration_trades": exploration_trades,
+        "skipped_trades": skipped_trades,
+        "hold_reasons": hold_reasons[:10],
+        "latest_warning": latest_warning,
+        "last_strategy_action": {
+            "time": _dt(last_decision.created_at) if last_decision else None,
+            "symbol": last_decision.symbol if last_decision else None,
+            "action": last_decision.action if last_decision else None,
+            "confidence": last_decision.confidence if last_decision else None,
+            "status": last_decision.execution_status if last_decision else None,
+            "reason": (last_decision.reason or last_decision.execution_message) if last_decision else None,
+            "decision_source": _decision_source(last_decision) if last_decision else None,
+        },
+    }
+
+
 @router.get("/status")
 def status(request: Request, session: Session = Depends(get_session)) -> dict[str, Any]:
     snapshot = PaperEngine(session).snapshot()
@@ -238,6 +301,7 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
         "news": news_snapshot(session, collectors.get("news", {})),
         "collectors": collectors,
         "auto_trader": _auto_trader(request).status(),
+        "trading": _trading_diagnostics(session),
         "sentiment_model": active_sentiment_model(),
         "model": {
             "model_id": latest_model.model_id if latest_model else None,
@@ -291,6 +355,11 @@ def auto_trader_status(request: Request) -> dict[str, Any]:
 @router.get("/collectors/status")
 def collector_status(request: Request) -> dict[str, Any]:
     return _worker_manager(request).snapshot()
+
+
+@router.get("/db/diagnostics")
+def db_diagnostics(session: Session = Depends(get_session)) -> dict[str, Any]:
+    return database_diagnostics(session)
 
 
 @router.get("/market/status")
@@ -776,6 +845,8 @@ def ai_decisions(session: Session = Depends(get_session), limit: int = 50) -> li
             "symbol": row.symbol,
             "action": row.action,
             "confidence": row.confidence,
+            "decision_source": _decision_source(row),
+            "execution_status": row.execution_status,
             "sentiment_score": features.get(row.feature_id).sentiment_score if row.feature_id in features else None,
             "risk_score": features.get(row.feature_id).risk_score if row.feature_id in features else None,
             "strategy": row.strategy_name,
