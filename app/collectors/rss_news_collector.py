@@ -11,6 +11,8 @@ from xml.etree import ElementTree
 
 import httpx
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,11 +134,21 @@ class RssNewsCollector:
                 if feed_url.startswith("file://"):
                     xml_text = Path(feed_url.removeprefix("file://")).read_text(encoding="utf-8")
                 else:
-                    response = await client.get(feed_url, follow_redirects=True)
+                    response = await client.get(
+                        feed_url,
+                        follow_redirects=True,
+                        headers={
+                            "User-Agent": settings.rss_request_user_agent,
+                            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                        },
+                    )
                     response.raise_for_status()
                     xml_text = response.text
                 articles.extend(parse_rss_feed(xml_text, feed_url))
             except Exception as exc:
                 logger.exception("RSS feed failed: %s", feed_url)
-                self.last_errors[feed_url] = str(exc).strip() or type(exc).__name__
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                    self.last_errors[feed_url] = "HTTP 429 Too Many Requests; feed is rate limiting, will try later"
+                else:
+                    self.last_errors[feed_url] = str(exc).strip() or type(exc).__name__
         return articles

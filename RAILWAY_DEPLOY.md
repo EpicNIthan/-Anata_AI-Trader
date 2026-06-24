@@ -18,7 +18,10 @@ NEWS_API_KEY=
 NEWS_PROVIDER=rss,gdelt,newsapi
 RSS_NEWS_ENABLED=true
 RSS_FEEDS=https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml,https://cointelegraph.com/rss,https://decrypt.co/feed
+RSS_REQUEST_USER_AGENT=AnataAITrader/1.0 RSS reader
 GDELT_ENABLED=true
+GDELT_POLL_INTERVAL_SECONDS=900
+GDELT_MAX_RECORDS=20
 NEWSAPI_ENABLED=false
 NEWS_POLL_INTERVAL_SECONDS=120
 ENABLE_MARKET_COLLECTOR=true

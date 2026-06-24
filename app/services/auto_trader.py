@@ -158,6 +158,7 @@ class AutoTraderService:
             "feature_schema_version": feature.schema_version,
             "action": decision.action,
             "confidence": decision.confidence,
+            "reason": decision.reason,
             **execution,
         }
 
@@ -244,4 +245,3 @@ class AutoTraderService:
                 )
 
         return None
-

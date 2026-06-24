@@ -82,11 +82,14 @@ class Settings:
             "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml,https://cointelegraph.com/rss,https://decrypt.co/feed",
         )
     )
+    rss_request_user_agent: str = os.getenv("RSS_REQUEST_USER_AGENT", "AnataAITrader/1.0 RSS reader")
     news_query: str = os.getenv("NEWS_QUERY", "crypto OR bitcoin OR ethereum OR macro economy")
     news_poll_seconds: int = field(
         default_factory=lambda: _int("NEWS_POLL_INTERVAL_SECONDS", _int("NEWS_POLL_SECONDS", 300))
     )
     gdelt_enabled: bool = field(default_factory=lambda: _bool("GDELT_ENABLED", True))
+    gdelt_poll_interval_seconds: int = field(default_factory=lambda: _int("GDELT_POLL_INTERVAL_SECONDS", 900))
+    gdelt_max_records: int = field(default_factory=lambda: _int("GDELT_MAX_RECORDS", 20))
     newsapi_enabled: bool = field(default_factory=lambda: _bool("NEWSAPI_ENABLED", False))
     news_mock_fallback_enabled: bool = field(default_factory=lambda: _bool("NEWS_MOCK_FALLBACK_ENABLED"))
     paper_start_balance: float = field(default_factory=lambda: _float("PAPER_START_BALANCE", 10000.0))

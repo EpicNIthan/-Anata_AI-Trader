@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -17,6 +17,8 @@ from app.db.models import NewsArticle, NewsSentiment
 from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
+
+_PROVIDER_NEXT_ALLOWED_AT: dict[str, datetime] = {}
 
 SYMBOL_KEYWORDS = {
     "BTCUSDT": {"btc", "bitcoin"},
@@ -54,6 +56,23 @@ def _sanitize_error(exc: Exception) -> str:
 
 def _provider_enabled(name: str) -> bool:
     return name.lower() in {provider.lower() for provider in settings.news_providers}
+
+
+def _cooldown_remaining(provider: str) -> str | None:
+    next_allowed = _PROVIDER_NEXT_ALLOWED_AT.get(provider)
+    if not next_allowed:
+        return None
+    now = datetime.now(timezone.utc)
+    if now >= next_allowed:
+        _PROVIDER_NEXT_ALLOWED_AT.pop(provider, None)
+        return None
+    seconds = int((next_allowed - now).total_seconds())
+    return f"{provider.upper()} cooling down for {seconds}s to avoid free-provider rate limits"
+
+
+def _set_provider_cooldown(provider: str, seconds: int) -> None:
+    if seconds > 0:
+        _PROVIDER_NEXT_ALLOWED_AT[provider] = datetime.now(timezone.utc) + timedelta(seconds=seconds)
 
 
 def _affected_symbols(text: str, extra_codes: list[str] | None = None) -> list[str]:
@@ -132,6 +151,10 @@ class BaseNewsProvider:
     def last_warning(self) -> str | None:
         return None
 
+    @property
+    def min_interval_seconds(self) -> int:
+        return 0
+
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         raise NotImplementedError
 
@@ -192,6 +215,10 @@ class GdeltProvider(BaseNewsProvider):
     def enabled(self) -> bool:
         return settings.gdelt_enabled and _provider_enabled(self.provider)
 
+    @property
+    def min_interval_seconds(self) -> int:
+        return settings.gdelt_poll_interval_seconds
+
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         query = (
             'bitcoin OR ethereum OR crypto OR cryptocurrency OR binance OR okx OR '
@@ -201,7 +228,7 @@ class GdeltProvider(BaseNewsProvider):
             "query": query,
             "mode": "ArtList",
             "format": "json",
-            "maxrecords": 50,
+            "maxrecords": settings.gdelt_max_records,
             "sort": "HybridRel",
         }
         url = f"https://api.gdeltproject.org/api/v2/doc/doc?{urlencode(params)}"
@@ -369,11 +396,16 @@ class NewsCollector:
                 status.enabled = provider.enabled
                 status.configured = provider.configured
                 if not provider.enabled:
-                    status.last_error = "disabled"
+                    status.last_error = None
                     per_provider[provider.provider] = status.as_dict()
                     continue
                 if not provider.configured:
                     status.last_error = provider.unavailable_reason
+                    per_provider[provider.provider] = status.as_dict()
+                    continue
+                cooldown_message = _cooldown_remaining(provider.provider)
+                if cooldown_message:
+                    status.last_error = cooldown_message
                     per_provider[provider.provider] = status.as_dict()
                     continue
                 status.running = True
@@ -381,6 +413,7 @@ class NewsCollector:
                 status.last_run_at = datetime.now(timezone.utc).isoformat()
                 try:
                     articles = await provider.fetch(client)
+                    _set_provider_cooldown(provider.provider, provider.min_interval_seconds)
                     saved = self.store_articles(articles)
                     status.rows_saved += saved
                     if saved:
@@ -389,7 +422,14 @@ class NewsCollector:
                     total_saved += saved
                 except Exception as exc:
                     logger.exception("News provider failed: %s", provider.provider)
-                    status.last_error = _sanitize_error(exc)
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                        _set_provider_cooldown(provider.provider, max(provider.min_interval_seconds, 900))
+                        status.last_error = (
+                            f"{provider.provider.upper()} rate limit (HTTP 429). "
+                            f"Cooling down for {max(provider.min_interval_seconds, 900)}s."
+                        )
+                    else:
+                        status.last_error = _sanitize_error(exc)
                 finally:
                     status.running = False
                     per_provider[provider.provider] = status.as_dict()
