@@ -609,8 +609,13 @@ async def derivatives_run_once(
 
 
 @router.get("/db/diagnostics")
-def db_diagnostics(session: Session = Depends(get_session)) -> dict[str, Any]:
-    return database_diagnostics(session)
+def db_diagnostics(session: Session = Depends(get_session), include_raw_estimates: bool = False) -> dict[str, Any]:
+    return database_diagnostics(session, include_raw_estimates=include_raw_estimates)
+
+
+@router.get("/db/storage")
+def db_storage(session: Session = Depends(get_session)) -> dict[str, Any]:
+    return database_diagnostics(session, include_raw_estimates=True)
 
 
 @router.get("/db/lifecycle/status")
@@ -621,6 +626,24 @@ def db_lifecycle_status(request: Request) -> dict[str, Any]:
 @router.post("/db/cleanup")
 def db_cleanup(request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
     return _data_lifecycle(request).run_cleanup_once()
+
+
+@router.post("/db/compact")
+def db_compact(
+    request: Request,
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    tables = payload.get("archive_tables") or payload.get("tables")
+    if isinstance(tables, str):
+        tables = [item.strip() for item in tables.split(",") if item.strip()]
+    if tables is not None and not isinstance(tables, list):
+        raise HTTPException(status_code=400, detail="archive_tables must be a list or comma-separated string")
+    return _data_lifecycle(request).compact_once(
+        archive_before_delete=bool(payload.get("archive_before_delete", False)),
+        archive_tables=tables,
+    )
 
 
 @router.post("/db/archive")

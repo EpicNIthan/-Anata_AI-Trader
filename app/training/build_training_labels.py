@@ -229,6 +229,16 @@ def build_training_labels(
                     },
                     sources={"candles": "candles", "news_sentiment": "zero_unavailable", "derivatives": "zero_unavailable"},
                 )
+                training_values = dict(payload["values"])
+                training_values.pop("final_ai_input", None)
+                training_payload = {
+                    **payload,
+                    "values": training_values,
+                    "metadata": {
+                        **payload.get("metadata", {}),
+                        "debug_payload": "full final_ai_input omitted from compact training rows",
+                    },
+                }
                 session.add(
                     TrainingFeature(
                         source_feature_id=None,
@@ -236,8 +246,8 @@ def build_training_labels(
                         schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
                         source_name="historical_replay_builder",
                         as_of=as_of,
-                        feature_values=payload["values"],
-                        payload=payload,
+                        feature_values=training_values,
+                        payload=training_payload,
                     )
                 )
                 created += 1

@@ -151,6 +151,7 @@
           <button data-tab="features">AI Features</button>
           <button data-tab="sentiment">Sentiment</button>
           <button data-tab="training">Training</button>
+          <button data-tab="storage">DB Storage</button>
           <button data-tab="diagnostics">Logs / Diagnostics</button>
         </nav>
 
@@ -268,6 +269,25 @@
           <pre id="exportResult" class="log-box"></pre>
         </section>
 
+        <section id="tab-storage" class="tab-panel">
+          <div class="training-grid">
+            <div><span>Total DB Size</span><strong id="dbTotalSize">-</strong></div>
+            <div><span>Estimated Monthly Cost</span><strong id="dbMonthlyCost">-</strong></div>
+            <div><span>Largest Table</span><strong id="dbLargestTable">-</strong></div>
+            <div><span>Last Cleanup</span><strong id="dbLastCleanup">-</strong></div>
+          </div>
+          <p id="dbStorageWarning" class="warning"></p>
+          <div class="panel-tools">
+            <button id="compactDbButton" class="primary">Compact DB</button>
+            <button id="compactArchiveDbButton" class="secondary">Archive + Compact</button>
+            <output id="dbStorageActionResult"></output>
+          </div>
+          <table>
+            <thead><tr><th>Table</th><th>Rows</th><th>MB</th><th>Raw/JSON MB</th><th>Oldest</th><th>Newest</th></tr></thead>
+            <tbody id="dbStorageBody"><tr><td colspan="6" class="empty">Loading storage diagnostics</td></tr></tbody>
+          </table>
+        </section>
+
         <section id="tab-diagnostics" class="tab-panel">
           <div class="panel-tools">
             <button id="runCleanupButton" class="primary">Run Cleanup</button>
@@ -286,6 +306,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v10"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v11"></script>
   </body>
 </html>

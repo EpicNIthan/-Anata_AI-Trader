@@ -63,6 +63,7 @@ def values_for_training_feature(row: TrainingFeature | Feature) -> dict[str, Any
     values = dict(payload.get("values", {}))
     if isinstance(row, TrainingFeature):
         values.update(row.feature_values or {})
+        values.pop("final_ai_input", None)
     return values
 
 
@@ -155,6 +156,15 @@ def _sync_features_to_training_features(session: Session, schema_version: str) -
     for feature in feature_rows:
         if session.scalar(select(TrainingFeature.id).where(TrainingFeature.source_feature_id == feature.id).limit(1)):
             continue
+        values = dict((feature.payload or {}).get("values", {}))
+        values.pop("final_ai_input", None)
+        payload = dict(feature.payload or {})
+        payload["values"] = values
+        metadata = dict(payload.get("metadata") or {})
+        metadata.pop("news_context", None)
+        metadata.pop("derivatives_context", None)
+        metadata["debug_payload"] = "full final_ai_input kept on recent features rows only"
+        payload["metadata"] = metadata
         session.add(
             TrainingFeature(
                 source_feature_id=feature.id,
@@ -162,8 +172,8 @@ def _sync_features_to_training_features(session: Session, schema_version: str) -
                 schema_version=feature.schema_version,
                 source_name=feature.source_name,
                 as_of=feature.as_of,
-                feature_values=(feature.payload or {}).get("values", {}),
-                payload=feature.payload,
+                feature_values=values,
+                payload=payload,
             )
         )
         created += 1

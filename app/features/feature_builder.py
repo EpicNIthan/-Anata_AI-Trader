@@ -238,6 +238,17 @@ class FeatureBuilder:
         if store:
             self.session.add(feature)
             self.session.flush()
+            training_values = dict(payload.get("values", {}))
+            training_values.pop("final_ai_input", None)
+            training_metadata = dict(payload.get("metadata", {}))
+            training_metadata.pop("news_context", None)
+            training_metadata.pop("derivatives_context", None)
+            training_metadata["debug_payload"] = "full final_ai_input kept on recent features rows only"
+            training_payload = {
+                **payload,
+                "values": training_values,
+                "metadata": training_metadata,
+            }
             self.session.add(
                 TrainingFeature(
                     source_feature_id=feature.id,
@@ -245,8 +256,8 @@ class FeatureBuilder:
                     schema_version=feature.schema_version,
                     source_name=feature.source_name,
                     as_of=feature.as_of,
-                    feature_values=payload.get("values", {}),
-                    payload=payload,
+                    feature_values=training_values,
+                    payload=training_payload,
                 )
             )
             self.session.commit()

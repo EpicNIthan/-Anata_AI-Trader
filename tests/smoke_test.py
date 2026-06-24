@@ -9,6 +9,7 @@ import sys
 import time
 import json
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,13 @@ os.environ["EXPLORATION_MODE"] = "true"
 os.environ["EXPLORATION_RATE"] = "1.0"
 os.environ["MIN_PAPER_TRADE_NOTIONAL"] = "50"
 os.environ["ARCHIVE_DIR"] = "./_smoke_archives"
+os.environ["RAW_PAYLOAD_RETENTION_HOURS"] = "1"
+os.environ["LIVE_UPDATE_RETENTION_HOURS"] = "1"
+os.environ["ACCOUNT_EQUITY_RETENTION_DAYS"] = "7"
+os.environ["RAW_NEWS_TEXT_RETENTION_DAYS"] = "1"
+os.environ["KEEP_CLOSED_CANDLES_DAYS"] = "365"
+os.environ["KEEP_TRAINING_FEATURES_DAYS"] = "365"
+os.environ["KEEP_EXPERIENCE_DAYS"] = "365"
 os.environ["DERIVATIVES_ENABLED"] = "true"
 os.environ["ENABLE_DERIVATIVES_COLLECTOR"] = "false"
 os.environ["DERIVATIVES_SYMBOLS"] = "BTCUSDT"
@@ -63,7 +71,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, inspect, select
 
 from app.collectors.market_collector import BinanceMarketCollector
-from app.db.models import AiDecision, Candle, ExperienceRecord, ExternalDataEvent, Feature, LiveCandleUpdate, NewsArticle, NewsSentiment, TrainingFeature
+from app.db.models import AiDecision, Candle, ExperienceRecord, ExternalDataEvent, Feature, LiveCandleUpdate, ModelVersion, NewsArticle, NewsSentiment, TrainingFeature
 from app.db.session import engine
 from app.db.session import SessionLocal
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema
@@ -431,6 +439,10 @@ def main() -> None:
         assert db_diagnostics.json()["candles"]["closed_training_rows"] > 0, db_diagnostics.text
         assert db_diagnostics.json()["candles"]["live_update_rows"] == 1, db_diagnostics.text
         assert db_diagnostics.json()["candles"]["duplicate_group_count"] == 0, db_diagnostics.text
+        assert "top_largest_tables" in db_diagnostics.json(), db_diagnostics.text
+        db_storage = client.get("/api/db/storage", auth=auth)
+        assert db_storage.status_code == 200, db_storage.text
+        assert "rows_by_table" in db_storage.json(), db_storage.text
         candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5", auth=auth)
         assert candles.status_code == 200, candles.text
         assert len(candles.json()) > 0, candles.text
@@ -505,6 +517,36 @@ def main() -> None:
             external_event_count = session.scalar(select(func.count(ExternalDataEvent.id))) or 0
         assert training_feature_count > 0
         assert external_event_count >= 7
+
+        auto_stop_before_compact = client.post("/api/auto-trader/stop", auth=auth)
+        assert auto_stop_before_compact.status_code == 200, auto_stop_before_compact.text
+
+        with SessionLocal() as session:
+            compact_candle = session.scalar(select(Candle).where(Candle.is_closed.is_(True)).order_by(Candle.open_time).limit(1))
+            assert compact_candle is not None
+            compact_candle.raw_payload = {"large": "x" * 4096}
+            compact_candle.raw = {"large": "x" * 4096}
+            compact_candle.updated_at = datetime.now(timezone.utc) - timedelta(hours=2)
+            closed_candles_before_compact = session.scalar(select(func.count(Candle.id)).where(Candle.is_closed.is_(True))) or 0
+            training_features_before_compact = session.scalar(select(func.count(TrainingFeature.id))) or 0
+            model_versions_before_compact = session.scalar(select(func.count(ModelVersion.id))) or 0
+            compact_candle_id = compact_candle.id
+            session.commit()
+        compact = client.post("/api/db/compact", json={}, auth=auth)
+        assert compact.status_code == 200, compact.text
+        compact_payload = compact.json()["last_cleanup"]
+        assert compact_payload["compacted"]["candles_raw_fields"] >= 1, compact.text
+        with SessionLocal() as session:
+            closed_candles_after_compact = session.scalar(select(func.count(Candle.id)).where(Candle.is_closed.is_(True))) or 0
+            training_features_after_compact = session.scalar(select(func.count(TrainingFeature.id))) or 0
+            model_versions_after_compact = session.scalar(select(func.count(ModelVersion.id))) or 0
+            compacted_candle = session.get(Candle, compact_candle_id)
+            assert compacted_candle is not None
+            assert compacted_candle.raw_payload is None
+            assert compacted_candle.raw is None
+        assert closed_candles_after_compact == closed_candles_before_compact
+        assert training_features_after_compact == training_features_before_compact
+        assert model_versions_after_compact == model_versions_before_compact
 
         cleanup = client.post("/api/db/cleanup", auth=auth)
         assert cleanup.status_code == 200, cleanup.text

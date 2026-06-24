@@ -204,13 +204,19 @@ ENABLE_DERIVATIVES_COLLECTOR=false
 DERIVATIVES_POLL_INTERVAL_SECONDS=300
 DERIVATIVES_PERIOD=5m
 DERIVATIVES_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT
-LIVE_UPDATE_RETENTION_HOURS=48
+RAW_PAYLOAD_RETENTION_HOURS=24
+LIVE_UPDATE_RETENTION_HOURS=12
+ACCOUNT_EQUITY_RETENTION_DAYS=7
+RAW_NEWS_TEXT_RETENTION_DAYS=7
+KEEP_CLOSED_CANDLES_DAYS=365
+KEEP_TRAINING_FEATURES_DAYS=365
+KEEP_EXPERIENCE_DAYS=365
 RAW_NEWS_RETENTION_DAYS=30
 RAW_TICK_RETENTION_DAYS=7
 DIAGNOSTIC_RETENTION_DAYS=7
 EXTERNAL_DATA_RETENTION_DAYS=365
 EXPERIENCE_RETENTION_DAYS=365
-CLOSED_CANDLE_RETENTION_DAYS=1095
+CLOSED_CANDLE_RETENTION_DAYS=365
 ```
 
 Controls:
@@ -246,6 +252,8 @@ Diagnostics:
 
 ```powershell
 curl http://localhost:8000/api/db/diagnostics
+curl http://localhost:8000/api/db/storage
+curl -X POST http://localhost:8000/api/db/compact
 curl -X POST http://localhost:8000/api/db/cleanup
 curl -X POST http://localhost:8000/api/db/archive
 ```
@@ -263,9 +271,11 @@ Data lifecycle rules:
 - `live_candle_updates` is short-term chart data and is upserted by symbol/timeframe/open time.
 - `candles` stores closed candles for long-term training.
 - `training_features` stores compact numeric feature rows for model training/export.
-- Raw ticks, live updates, old diagnostic rows, and raw news payloads are cleaned or compacted by the daily lifecycle job.
+- Raw ticks, live updates, old diagnostic rows, old raw news text, and old raw payloads are cleaned or compacted by the daily lifecycle job.
 - Public external data such as derivatives flow is kept longer as compact numeric/payload rows, while old raw payloads are compacted.
 - Training exports read compact features first, so raw logs can be compacted after features are built and archived.
+- The dashboard `DB Storage` tab shows total DB size, largest tables, raw/JSON estimates, last cleanup, and buttons for `Compact DB` or `Archive + Compact`.
+- `POST /api/db/compact` strips bulky raw/debug fields but keeps closed candles, `training_features`, `experience_buffer`, `model_versions`, and `paper_trades`.
 
 ## Training Workflow
 

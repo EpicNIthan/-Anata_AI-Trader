@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db.models import (
     AccountEquity,
+    AiDecision,
     Base,
     Candle,
     ExperienceRecord,
@@ -25,6 +26,7 @@ from app.db.models import (
     MarketTick,
     NewsArticle,
     NewsSentiment,
+    PaperTrade,
     TrainingFeature,
 )
 from app.db.session import SessionLocal
@@ -32,15 +34,31 @@ from app.db.session import SessionLocal
 logger = logging.getLogger(__name__)
 
 ARCHIVE_TABLES = {
+    "account_equity": AccountEquity,
+    "ai_decisions": AiDecision,
     "candles": Candle,
+    "external_data_events": ExternalDataEvent,
     "features": Feature,
+    "live_candle_updates": LiveCandleUpdate,
+    "market_ticks": MarketTick,
+    "news_articles": NewsArticle,
+    "news_sentiment": NewsSentiment,
+    "paper_trades": PaperTrade,
     "training_features": TrainingFeature,
     "experience_buffer": ExperienceRecord,
 }
 
 TABLE_TIME_COLUMNS = {
+    "account_equity": AccountEquity.timestamp,
+    "ai_decisions": AiDecision.created_at,
     "candles": Candle.open_time,
+    "external_data_events": ExternalDataEvent.event_time,
     "features": Feature.as_of,
+    "live_candle_updates": LiveCandleUpdate.updated_at,
+    "market_ticks": MarketTick.event_time,
+    "news_articles": NewsArticle.created_at,
+    "news_sentiment": NewsSentiment.created_at,
+    "paper_trades": PaperTrade.created_at,
     "training_features": TrainingFeature.as_of,
     "experience_buffer": ExperienceRecord.created_at,
 }
@@ -67,14 +85,110 @@ def _rowcount(result: Any) -> int:
     return int(getattr(result, "rowcount", 0) or 0)
 
 
-def cleanup_old_data(session: Session) -> dict[str, Any]:
+def _compact_payload(value: dict[str, Any] | None, *, keep_debug: bool = False) -> tuple[dict[str, Any] | None, bool]:
+    if not isinstance(value, dict):
+        return value, False
+    payload = dict(value)
+    changed = False
+    values = dict(payload.get("values") or {})
+    if "final_ai_input" in values:
+        values.pop("final_ai_input", None)
+        payload["values"] = values
+        changed = True
+    if not keep_debug:
+        metadata = dict(payload.get("metadata") or {})
+        for key in ("news_context", "derivatives_context", "debug", "raw_news_context"):
+            if key in metadata:
+                metadata.pop(key, None)
+                changed = True
+        payload["metadata"] = metadata
+    return payload, changed
+
+
+def _compact_training_features(session: Session, cutoff: datetime) -> int:
+    rows = list(session.scalars(select(TrainingFeature)))
+    compacted = 0
+    for row in rows:
+        changed = False
+        values = dict(row.feature_values or {})
+        if "final_ai_input" in values:
+            values.pop("final_ai_input", None)
+            row.feature_values = values
+            changed = True
+        payload, payload_changed = _compact_payload(row.payload, keep_debug=False)
+        if payload_changed:
+            row.payload = payload
+            changed = True
+        if changed:
+            compacted += 1
+    return compacted
+
+
+def _compact_features(session: Session, cutoff: datetime) -> int:
+    rows = list(session.scalars(select(Feature).where(Feature.as_of < cutoff)))
+    compacted = 0
+    for row in rows:
+        changed = False
+        if row.raw_payload is not None:
+            row.raw_payload = None
+            changed = True
+        payload, payload_changed = _compact_payload(row.payload, keep_debug=False)
+        if payload_changed:
+            row.payload = payload
+            changed = True
+        if changed:
+            compacted += 1
+    return compacted
+
+
+def _compact_account_equity(session: Session, cutoff: datetime) -> int:
+    rows = list(session.scalars(select(AccountEquity).where(AccountEquity.timestamp < cutoff).order_by(AccountEquity.timestamp)))
+    keep_buckets: set[str] = set()
+    delete_ids: list[int] = []
+    for row in rows:
+        timestamp = row.timestamp
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        bucket = timestamp.strftime("%Y%m%d%H")
+        if bucket in keep_buckets:
+            delete_ids.append(row.id)
+            continue
+        keep_buckets.add(bucket)
+    if not delete_ids:
+        return 0
+    return _rowcount(session.execute(delete(AccountEquity).where(AccountEquity.id.in_(delete_ids))))
+
+
+def compact_database(
+    session: Session,
+    *,
+    archive_before_delete: bool = False,
+    archive_tables: list[str] | None = None,
+) -> dict[str, Any]:
+    raw_payload_cutoff = _cutoff(hours=settings.raw_payload_retention_hours)
     live_cutoff = _cutoff(hours=settings.live_update_retention_hours)
-    raw_news_cutoff = _cutoff(days=settings.raw_news_retention_days)
     raw_tick_cutoff = _cutoff(days=settings.raw_tick_retention_days)
-    diagnostic_cutoff = _cutoff(days=settings.diagnostic_retention_days)
+    raw_news_text_cutoff = _cutoff(days=settings.raw_news_text_retention_days)
+    account_equity_cutoff = _cutoff(days=settings.account_equity_retention_days)
     external_data_cutoff = _cutoff(days=settings.external_data_retention_days)
-    experience_cutoff = _cutoff(days=settings.experience_retention_days)
-    closed_candle_cutoff = _cutoff(days=settings.closed_candle_retention_days)
+    closed_candle_cutoff = _cutoff(days=settings.keep_closed_candles_days)
+    training_feature_cutoff = _cutoff(days=settings.keep_training_features_days)
+
+    archived: dict[str, Any] | None = None
+    if archive_before_delete:
+        archived = archive_old_data(
+            session,
+            before=raw_payload_cutoff,
+            tables=archive_tables or [
+                "live_candle_updates",
+                "market_ticks",
+                "news_articles",
+                "external_data_events",
+                "features",
+                "experience_buffer",
+            ],
+            delete_after_archive=False,
+        )
 
     deleted_live_updates = _rowcount(
         session.execute(delete(LiveCandleUpdate).where(LiveCandleUpdate.updated_at < live_cutoff))
@@ -89,44 +203,100 @@ def cleanup_old_data(session: Session) -> dict[str, Any]:
     deleted_old_closed_candles = _rowcount(
         session.execute(delete(Candle).where(Candle.is_closed.is_(True), Candle.open_time < closed_candle_cutoff))
     )
+    compacted_candles = _rowcount(
+        session.execute(
+            update(Candle)
+            .where(Candle.updated_at < raw_payload_cutoff)
+            .values(raw=None, raw_payload=None)
+        )
+    )
+    compacted_live_updates = _rowcount(
+        session.execute(
+            update(LiveCandleUpdate)
+            .where(LiveCandleUpdate.updated_at < raw_payload_cutoff)
+            .values(raw_payload=None)
+        )
+    )
+    compacted_market_ticks = 0
+    if settings.store_market_ticks:
+        compacted_market_ticks = _rowcount(
+            session.execute(
+                update(MarketTick)
+                .where(MarketTick.event_time < raw_payload_cutoff)
+                .values(raw=None, raw_payload=None)
+            )
+        )
     compacted_news_articles = _rowcount(
         session.execute(
             update(NewsArticle)
-            .where(NewsArticle.created_at < raw_news_cutoff)
-            .values(raw=None, raw_payload=None, raw_text=None)
+            .where(NewsArticle.created_at < raw_payload_cutoff)
+            .values(raw=None, raw_payload=None)
+        )
+    )
+    compacted_news_text = _rowcount(
+        session.execute(
+            update(NewsArticle)
+            .where(
+                NewsArticle.created_at < raw_news_text_cutoff,
+                NewsArticle.id.in_(select(NewsSentiment.article_id)),
+            )
+            .values(raw_text=None)
         )
     )
     compacted_news_sentiment = _rowcount(
         session.execute(
             update(NewsSentiment)
-            .where(NewsSentiment.created_at < raw_news_cutoff)
+            .where(NewsSentiment.created_at < raw_payload_cutoff)
             .values(raw_payload=None)
         )
     )
     compacted_experiences = _rowcount(
         session.execute(
             update(ExperienceRecord)
-            .where(ExperienceRecord.created_at < experience_cutoff)
-            .values(market_state=None, news_state=None, feature_payload=None)
+            .where(ExperienceRecord.created_at < raw_payload_cutoff)
+            .values(market_state=None, news_state=None, feature_payload=None, raw_payload=None)
         )
     )
-    deleted_account_equity = _rowcount(
-        session.execute(delete(AccountEquity).where(AccountEquity.timestamp < diagnostic_cutoff))
+    compacted_old_ai_decisions = _rowcount(
+        session.execute(
+            update(AiDecision)
+            .where(AiDecision.created_at < raw_payload_cutoff)
+            .values(market_state=None, news_state=None, raw=None, raw_payload=None)
+        )
     )
+    compacted_paper_trades = _rowcount(
+        session.execute(
+            update(PaperTrade)
+            .where(PaperTrade.created_at < raw_payload_cutoff)
+            .values(raw_payload=None)
+        )
+    )
+    compacted_account_equity = _rowcount(
+        session.execute(
+            update(AccountEquity)
+            .where(AccountEquity.timestamp < raw_payload_cutoff)
+            .values(raw=None)
+        )
+    )
+    deleted_account_equity = _compact_account_equity(session, account_equity_cutoff)
     compacted_external_events = _rowcount(
         session.execute(
             update(ExternalDataEvent)
-            .where(ExternalDataEvent.event_time < raw_news_cutoff)
+            .where(ExternalDataEvent.event_time < raw_payload_cutoff)
             .values(raw_payload=None)
         )
     )
     deleted_external_events = _rowcount(
         session.execute(delete(ExternalDataEvent).where(ExternalDataEvent.event_time < external_data_cutoff))
     )
+    compacted_features = _compact_features(session, raw_payload_cutoff)
+    compacted_training_features = _compact_training_features(session, training_feature_cutoff)
     session.commit()
     return {
         "ran_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "compact",
         "retention": retention_config(),
+        "archived": archived,
         "deleted": {
             "live_candle_updates": deleted_live_updates,
             "legacy_live_candles": deleted_legacy_live_candles,
@@ -136,17 +306,36 @@ def cleanup_old_data(session: Session) -> dict[str, Any]:
             "external_data_events": deleted_external_events,
         },
         "compacted": {
+            "candles_raw_fields": compacted_candles,
+            "live_candle_updates_raw_payload": compacted_live_updates,
+            "market_ticks_raw_fields": compacted_market_ticks,
             "news_articles_raw_fields": compacted_news_articles,
+            "news_articles_raw_text": compacted_news_text,
             "news_sentiment_raw_payload": compacted_news_sentiment,
             "experience_buffer_raw_context": compacted_experiences,
+            "ai_decisions_raw_context": compacted_old_ai_decisions,
+            "paper_trades_raw_payload": compacted_paper_trades,
+            "account_equity_raw": compacted_account_equity,
             "external_data_raw_payload": compacted_external_events,
+            "features_debug_payload": compacted_features,
+            "training_features_final_ai_input": compacted_training_features,
         },
     }
 
 
+def cleanup_old_data(session: Session) -> dict[str, Any]:
+    return compact_database(session)
+
+
 def retention_config() -> dict[str, Any]:
     return {
+        "raw_payload_retention_hours": settings.raw_payload_retention_hours,
         "live_update_retention_hours": settings.live_update_retention_hours,
+        "account_equity_retention_days": settings.account_equity_retention_days,
+        "raw_news_text_retention_days": settings.raw_news_text_retention_days,
+        "keep_closed_candles_days": settings.keep_closed_candles_days,
+        "keep_training_features_days": settings.keep_training_features_days,
+        "keep_experience_days": settings.keep_experience_days,
         "raw_news_retention_days": settings.raw_news_retention_days,
         "raw_tick_retention_days": settings.raw_tick_retention_days,
         "store_market_ticks": settings.store_market_ticks,
@@ -273,6 +462,23 @@ class DataLifecycleService:
     def run_cleanup_once(self) -> dict[str, Any]:
         with SessionLocal() as session:
             result = cleanup_old_data(session)
+        self.state.last_run_at = datetime.now(timezone.utc).isoformat()
+        self.state.last_cleanup = result
+        self.state.last_error = None
+        return self.status()
+
+    def compact_once(
+        self,
+        *,
+        archive_before_delete: bool = False,
+        archive_tables: list[str] | None = None,
+    ) -> dict[str, Any]:
+        with SessionLocal() as session:
+            result = compact_database(
+                session,
+                archive_before_delete=archive_before_delete,
+                archive_tables=archive_tables,
+            )
         self.state.last_run_at = datetime.now(timezone.utc).isoformat()
         self.state.last_cleanup = result
         self.state.last_error = None

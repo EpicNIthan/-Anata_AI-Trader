@@ -46,6 +46,7 @@
   const money = (value, digits = 2) => Number.isFinite(Number(value)) ? `$${Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}` : "-";
   const number = (value, digits = 2) => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits }) : "-";
   const pct = (value, digits = 2) => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(digits)}%` : "-";
+  const mb = (value) => Number.isFinite(Number(value)) ? `${Number(value).toFixed(2)} MB` : "-";
   const when = (value) => value ? new Date(value).toLocaleString() : "-";
   const cls = (value) => Number(value) >= 0 ? "positive" : "negative";
   const featureValue = (value) => Number.isFinite(Number(value)) ? Number(value).toFixed(6) : escapeHtml(value ?? "-");
@@ -382,6 +383,38 @@
     }
   }
 
+  async function refreshStorageDiagnostics() {
+    const body = $("dbStorageBody");
+    if (!body) return;
+    try {
+      const data = await api("/api/db/storage");
+      const lifecycle = await api("/api/db/lifecycle/status");
+      const total = data.database_total || {};
+      const largest = (data.top_largest_tables || [])[0] || {};
+      setText("dbTotalSize", total.mb !== null && total.mb !== undefined ? mb(total.mb) : "row counts only");
+      setText("dbMonthlyCost", Number.isFinite(Number(data.estimated_monthly_storage_cost_usd)) ? `$${Number(data.estimated_monthly_storage_cost_usd).toFixed(4)}` : "-");
+      setText("dbLargestTable", largest.table ? `${largest.table} (${number(largest.rows, 0)} rows)` : "-");
+      setText("dbLastCleanup", lifecycle.last_run_at ? when(lifecycle.last_run_at) : "-");
+      setText("dbStorageWarning", total.warning || "");
+      const rows = data.rows_by_table || [];
+      body.innerHTML = rows.length ? rows
+        .slice()
+        .sort((a, b) => Number(b.bytes || b.raw_payload_estimate?.bytes || 0) - Number(a.bytes || a.raw_payload_estimate?.bytes || 0))
+        .map((row) => `
+          <tr>
+            <td>${escapeHtml(row.table)}</td>
+            <td>${number(row.rows, 0)}</td>
+            <td>${row.mb !== null && row.mb !== undefined ? number(row.mb, 3) : "-"}</td>
+            <td>${number(row.raw_payload_estimate?.mb || 0, 3)}</td>
+            <td>${when(row.oldest)}</td>
+            <td>${when(row.newest)}</td>
+          </tr>
+        `).join("") : `<tr><td colspan="6" class="empty">No tables found</td></tr>`;
+    } catch (error) {
+      body.innerHTML = `<tr><td colspan="6" class="empty">Storage diagnostics failed: ${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
   async function refreshModels() {
     const body = $("modelsBody");
     if (!body) return;
@@ -581,9 +614,29 @@
       const data = await api("/api/db/cleanup", { method: "POST" });
       if (output) output.textContent = `Cleanup done: ${JSON.stringify(data.last_cleanup?.deleted || {})}`;
       await refreshDbDiagnostics();
+      await refreshStorageDiagnostics();
       await refreshSummary();
     } catch (error) {
       if (output) output.textContent = `Cleanup failed: ${error.message}`;
+    }
+  }
+
+  async function compactDatabase(archiveBeforeDelete = false) {
+    const output = $("dbStorageActionResult") || $("dbActionResult");
+    if (output) output.textContent = archiveBeforeDelete ? "Archiving and compacting..." : "Compacting...";
+    try {
+      const data = await api("/api/db/compact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archive_before_delete: archiveBeforeDelete }),
+      });
+      const cleanup = data.last_cleanup || {};
+      if (output) output.textContent = `Compact done. Deleted ${JSON.stringify(cleanup.deleted || {})}; compacted ${JSON.stringify(cleanup.compacted || {})}`;
+      await refreshDbDiagnostics();
+      await refreshStorageDiagnostics();
+      await refreshSummary();
+    } catch (error) {
+      if (output) output.textContent = `Compact failed: ${error.message}`;
     }
   }
 
@@ -598,6 +651,7 @@
       });
       if (output) output.textContent = `Archive done: ${(data.exports || []).map((item) => item.path).join(", ") || "no rows"}`;
       await refreshDbDiagnostics();
+      await refreshStorageDiagnostics();
     } catch (error) {
       if (output) output.textContent = `Archive failed: ${error.message}`;
     }
@@ -660,6 +714,8 @@
     $("refreshModelsButton")?.addEventListener("click", refreshModels);
     $("exportDatasetDiagnosticsButton")?.addEventListener("click", () => exportDataset("dbActionResult"));
     $("runCleanupButton")?.addEventListener("click", runCleanup);
+    $("compactDbButton")?.addEventListener("click", () => compactDatabase(false));
+    $("compactArchiveDbButton")?.addEventListener("click", () => compactDatabase(true));
     $("archiveDataButton")?.addEventListener("click", archiveData);
     $("reprocessSentimentButton")?.addEventListener("click", reprocessSentiment);
     document.querySelectorAll("[data-worker]").forEach((button) => button.addEventListener("click", () => collectorAction(button.dataset.worker, button.dataset.action)));
@@ -668,6 +724,7 @@
       button.addEventListener("click", () => {
         document.querySelectorAll("[data-tab]").forEach((item) => item.classList.toggle("active", item === button));
         document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === `tab-${button.dataset.tab}`));
+        if (button.dataset.tab === "storage") refreshStorageDiagnostics();
       });
     });
     document.querySelectorAll("[data-timeframe]").forEach((button) => {
@@ -693,6 +750,7 @@
     setTimeout(setupChart, 300);
     tickFast();
     refreshHeavy();
+    refreshStorageDiagnostics();
     setInterval(tickFast, 1000);
     setInterval(refreshHeavy, 6000);
   }

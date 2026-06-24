@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import desc, func, select, text
@@ -36,6 +38,67 @@ def _postgres_table_sizes(session: Session) -> dict[str, dict[str, float | int]]
     }
 
 
+def _postgres_database_size(session: Session) -> int | None:
+    try:
+        return int(session.execute(text("SELECT pg_database_size(current_database())")).scalar_one() or 0)
+    except Exception:
+        return None
+
+
+def _postgres_column_size(session: Session, table_name: str, column_name: str) -> int | None:
+    quoted_table = table_name.replace('"', '""')
+    quoted_column = column_name.replace('"', '""')
+    try:
+        return int(
+            session.execute(text(f'SELECT COALESCE(SUM(pg_column_size("{quoted_column}")), 0) FROM "{quoted_table}"')).scalar_one()
+            or 0
+        )
+    except Exception:
+        return None
+
+
+def _json_column_estimate(session: Session, table_name: str, column_name: str, *, limit: int = 1000) -> int | None:
+    table = Base.metadata.tables[table_name]
+    if column_name not in table.c:
+        return None
+    total_rows = _count_rows(session, table_name)
+    if total_rows <= 0:
+        return 0
+    rows = session.execute(select(table.c[column_name]).where(table.c[column_name].is_not(None)).limit(limit)).all()
+    if not rows:
+        return 0
+    sample_bytes = 0
+    for (value,) in rows:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            sample_bytes += len(value.encode("utf-8"))
+        else:
+            sample_bytes += len(json.dumps(value, separators=(",", ":"), default=str).encode("utf-8"))
+    non_null_sample = len(rows)
+    if non_null_sample <= 0:
+        return 0
+    return int((sample_bytes / non_null_sample) * total_rows)
+
+
+def _raw_payload_estimate(session: Session, table_name: str, *, size_supported: bool) -> dict[str, Any]:
+    table = Base.metadata.tables[table_name]
+    estimates: dict[str, int] = {}
+    for column_name in ("raw_payload", "raw", "raw_text", "payload", "feature_values", "market_state", "news_state", "feature_payload", "result"):
+        if column_name not in table.c:
+            continue
+        value = _postgres_column_size(session, table_name, column_name) if size_supported else None
+        if value is None:
+            value = _json_column_estimate(session, table_name, column_name)
+        estimates[column_name] = int(value or 0)
+    total = sum(estimates.values())
+    return {
+        "bytes": total,
+        "mb": round(total / 1024 / 1024, 4),
+        "columns": {key: {"bytes": value, "mb": round(value / 1024 / 1024, 4)} for key, value in estimates.items()},
+    }
+
+
 def _table_time_bounds(session: Session, table_name: str) -> dict[str, str | None]:
     table = Base.metadata.tables[table_name]
     for column_name in (
@@ -59,24 +122,37 @@ def _table_time_bounds(session: Session, table_name: str) -> dict[str, str | Non
     return {"time_column": None, "oldest": None, "newest": None}
 
 
-def database_diagnostics(session: Session) -> dict[str, Any]:
+def database_diagnostics(session: Session, *, include_raw_estimates: bool = False) -> dict[str, Any]:
     bind = session.get_bind()
     dialect = bind.dialect.name if bind is not None else "unknown"
     table_names = sorted(Base.metadata.tables.keys())
     size_supported = dialect == "postgresql"
     sizes = _postgres_table_sizes(session) if size_supported else {}
+    database_total_bytes = _postgres_database_size(session) if size_supported else None
+    if database_total_bytes is None and dialect == "sqlite" and bind is not None:
+        database_path = getattr(bind.url, "database", None)
+        if database_path and database_path not in {":memory:", ""}:
+            path = Path(database_path)
+            if path.exists():
+                database_total_bytes = path.stat().st_size
 
     rows_by_table: list[dict[str, Any]] = []
     for table_name in table_names:
         count = _count_rows(session, table_name)
         size = sizes.get(table_name)
         time_bounds = _table_time_bounds(session, table_name)
+        raw_payload_size = (
+            _raw_payload_estimate(session, table_name, size_supported=size_supported)
+            if include_raw_estimates
+            else {"bytes": None, "mb": None, "columns": {}}
+        )
         rows_by_table.append(
             {
                 "table": table_name,
                 "rows": count,
                 "mb": size["mb"] if size else None,
                 "bytes": size["bytes"] if size else None,
+                "raw_payload_estimate": raw_payload_size,
                 **time_bounds,
             }
         )
@@ -132,16 +208,31 @@ def database_diagnostics(session: Session) -> dict[str, Any]:
     live_update_count = int(session.scalar(select(func.count(LiveCandleUpdate.id))) or 0)
     latest_candle = session.scalar(select(Candle).order_by(desc(Candle.open_time)).limit(1))
     latest_live_update = session.scalar(select(LiveCandleUpdate).order_by(desc(LiveCandleUpdate.updated_at)).limit(1))
-    total_bytes = sum(int(item.get("bytes") or 0) for item in sizes.values()) if size_supported else None
+    total_bytes = database_total_bytes
+    if total_bytes is None and size_supported:
+        total_bytes = sum(int(item.get("bytes") or 0) for item in sizes.values())
+    top_largest_tables = sorted(
+        rows_by_table,
+        key=lambda item: int(item.get("bytes") or item.get("raw_payload_estimate", {}).get("bytes") or 0),
+        reverse=True,
+    )[:10]
+    total_mb = round((total_bytes or 0) / 1024 / 1024, 4) if total_bytes is not None else None
+    storage_gb = (total_bytes or 0) / 1024 / 1024 / 1024 if total_bytes is not None else None
+    estimated_monthly_cost_usd = round(storage_gb * 0.25, 4) if storage_gb is not None else None
 
     return {
         "dialect": dialect,
         "size_supported": size_supported,
         "database_total": {
             "bytes": total_bytes,
-            "mb": round((total_bytes or 0) / 1024 / 1024, 4) if total_bytes is not None else None,
+            "mb": total_mb,
+            "gb": round(storage_gb, 4) if storage_gb is not None else None,
+            "warning": "DB is over 1GB. Run compact/archive and keep Railway inference-only." if total_mb and total_mb > 1024 else None,
         },
+        "estimated_monthly_storage_cost_usd": estimated_monthly_cost_usd,
+        "cost_note": "Rough planning estimate only; Railway billing can differ by plan/region.",
         "rows_by_table": rows_by_table,
+        "top_largest_tables": top_largest_tables,
         "candles": {
             "closed_training_rows": closed_count,
             "live_update_rows": live_update_count,
