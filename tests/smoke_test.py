@@ -166,6 +166,14 @@ def main() -> None:
         candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5")
         assert candles.status_code == 200, candles.text
         assert len(candles.json()) > 0, candles.text
+        candles_5m = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=5m&limit=5")
+        assert candles_5m.status_code == 200, candles_5m.text
+        assert len(candles_5m.json()) > 0, candles_5m.text
+        assert candles_5m.json()[-1]["source_name"] == "aggregated_from_1m", candles_5m.text
+        candles_1s = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1s&limit=5")
+        assert candles_1s.status_code == 200, candles_1s.text
+        assert len(candles_1s.json()) > 0, candles_1s.text
+        assert candles_1s.json()[-1]["source_name"] == "1m_live_fallback", candles_1s.text
         summary = client.get("/api/dashboard/summary")
         assert summary.status_code == 200, summary.text
         assert summary.json()["sentiment_model"]["active_model"], summary.text

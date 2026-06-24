@@ -51,6 +51,138 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _timeframe_seconds(value: str | None) -> int | None:
+    timeframe = (value or "1m").strip().lower()
+    if len(timeframe) < 2:
+        return None
+    try:
+        amount = int(timeframe[:-1])
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(timeframe[-1])
+    if multiplier is None:
+        return None
+    return amount * multiplier
+
+
+def _serialize_candle(
+    *,
+    candle_id: int | None,
+    symbol: str,
+    timeframe: str,
+    open_time: datetime | None,
+    close_time: datetime | None,
+    open_price: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: float,
+    is_closed: bool,
+    source_name: str | None,
+    base_interval: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": candle_id,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "base_interval": base_interval or timeframe,
+        "source_name": source_name,
+        "time": int(open_time.timestamp()) if open_time else None,
+        "open_time": _dt(open_time),
+        "close_time": _dt(close_time),
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
+        "is_closed": is_closed,
+    }
+
+
+def _serialize_stored_candle(row: Candle, requested_timeframe: str | None = None, source_name: str | None = None) -> dict[str, Any]:
+    return _serialize_candle(
+        candle_id=row.id,
+        symbol=row.symbol,
+        timeframe=requested_timeframe or row.interval,
+        open_time=row.open_time,
+        close_time=row.close_time,
+        open_price=row.open,
+        high=row.high,
+        low=row.low,
+        close=row.close,
+        volume=row.volume,
+        is_closed=row.is_closed,
+        source_name=source_name or row.source_name,
+        base_interval=row.interval,
+    )
+
+
+def _aggregate_from_base_candles(
+    rows: list[Candle],
+    *,
+    symbol: str,
+    timeframe: str,
+    timeframe_seconds: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    buckets: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    current_bucket_start: int | None = None
+
+    for row in rows:
+        if not row.open_time:
+            continue
+        row_start = int(row.open_time.timestamp())
+        bucket_start = row_start - (row_start % timeframe_seconds)
+        bucket_open_time = datetime.fromtimestamp(bucket_start, tz=timezone.utc)
+        if current is None or bucket_start != current_bucket_start:
+            if current is not None:
+                buckets.append(current)
+            current_bucket_start = bucket_start
+            current = {
+                "open_time": bucket_open_time,
+                "close_time": row.close_time,
+                "open": row.open,
+                "high": row.high,
+                "low": row.low,
+                "close": row.close,
+                "volume": row.volume or 0.0,
+                "is_closed": bool(row.is_closed),
+            }
+            continue
+
+        current["close_time"] = row.close_time or current["close_time"]
+        current["high"] = max(_float(current["high"]), row.high)
+        current["low"] = min(_float(current["low"]), row.low)
+        current["close"] = row.close
+        current["volume"] = _float(current["volume"]) + _float(row.volume)
+        current["is_closed"] = bool(current["is_closed"]) and bool(row.is_closed)
+
+    if current is not None:
+        buckets.append(current)
+
+    return [
+        _serialize_candle(
+            candle_id=None,
+            symbol=symbol,
+            timeframe=timeframe,
+            open_time=bucket["open_time"],
+            close_time=bucket["close_time"],
+            open_price=_float(bucket["open"]),
+            high=_float(bucket["high"]),
+            low=_float(bucket["low"]),
+            close=_float(bucket["close"]),
+            volume=_float(bucket["volume"]),
+            is_closed=bool(bucket["is_closed"]),
+            source_name="aggregated_from_1m",
+            base_interval="1m",
+        )
+        for bucket in buckets[-limit:]
+    ]
+
+
 def _worker_manager(request: Request):
     manager = getattr(request.app.state, "worker_manager", None)
     if manager is None:
@@ -189,32 +321,55 @@ def market_candles(
     timeframe: str = "1m",
     limit: int = 300,
 ) -> list[dict[str, Any]]:
+    symbol = symbol.upper()
+    timeframe = timeframe.strip().lower() or "1m"
+    safe_limit = min(max(limit, 1), 1000)
+    target_seconds = _timeframe_seconds(timeframe)
+    if target_seconds is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported timeframe: {timeframe}")
+
     rows = list(
         session.scalars(
             select(Candle)
-            .where(Candle.symbol == symbol.upper(), Candle.interval == timeframe)
+            .where(Candle.symbol == symbol, Candle.interval == timeframe)
             .order_by(desc(Candle.open_time))
-            .limit(min(max(limit, 1), 1000))
+            .limit(safe_limit)
         )
     )
     rows.reverse()
-    return [
-        {
-            "id": row.id,
-            "symbol": row.symbol,
-            "timeframe": row.interval,
-            "time": int(row.open_time.timestamp()) if row.open_time else None,
-            "open_time": _dt(row.open_time),
-            "close_time": _dt(row.close_time),
-            "open": row.open,
-            "high": row.high,
-            "low": row.low,
-            "close": row.close,
-            "volume": row.volume,
-            "is_closed": row.is_closed,
-        }
-        for row in rows
-    ]
+    if rows:
+        return [_serialize_stored_candle(row) for row in rows]
+
+    base_interval = "1m"
+    base_seconds = 60
+    requested_base_ratio = max(target_seconds // base_seconds, 1)
+    base_limit = min(max(safe_limit * requested_base_ratio + requested_base_ratio, 200), 6000)
+    base_rows = list(
+        session.scalars(
+            select(Candle)
+            .where(Candle.symbol == symbol, Candle.interval == base_interval)
+            .order_by(desc(Candle.open_time))
+            .limit(base_limit)
+        )
+    )
+    base_rows.reverse()
+    if not base_rows:
+        return []
+
+    if target_seconds < base_seconds:
+        fallback_rows = base_rows[-safe_limit:]
+        return [
+            _serialize_stored_candle(row, requested_timeframe=timeframe, source_name="1m_live_fallback")
+            for row in fallback_rows
+        ]
+
+    return _aggregate_from_base_candles(
+        base_rows,
+        symbol=symbol,
+        timeframe=timeframe,
+        timeframe_seconds=target_seconds,
+        limit=safe_limit,
+    )
 
 
 @router.post("/market/backfill")

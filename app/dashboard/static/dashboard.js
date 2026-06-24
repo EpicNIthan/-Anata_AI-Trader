@@ -8,6 +8,10 @@
     volumeSeries: null,
     smaSeries: null,
     lastCandlesKey: "",
+    lastSeriesKey: "",
+    forceFit: true,
+    chartRequestId: 0,
+    resizeObserver: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -53,7 +57,11 @@
   function setupChart() {
     const element = $("chart");
     if (!element || state.chart || !window.LightweightCharts) return;
+    const width = Math.max(element.clientWidth || 0, 320);
+    const height = Math.max(element.clientHeight || 0, 360);
     state.chart = LightweightCharts.createChart(element, {
+      width,
+      height,
       layout: { background: { color: "#0c1015" }, textColor: "#8793a0" },
       grid: { vertLines: { color: "#151b22" }, horzLines: { color: "#151b22" } },
       rightPriceScale: { borderColor: "#252c35" },
@@ -74,6 +82,13 @@
       scaleMargins: { top: 0.78, bottom: 0 },
     });
     state.smaSeries = state.chart.addLineSeries({ color: "#f0b90b", lineWidth: 1 });
+    if (window.ResizeObserver) {
+      state.resizeObserver = new ResizeObserver((entries) => {
+        const box = entries[0]?.contentRect;
+        if (box && state.chart) state.chart.resize(Math.floor(box.width), Math.floor(box.height));
+      });
+      state.resizeObserver.observe(element);
+    }
   }
 
   function sma(candles, period = 20) {
@@ -87,43 +102,78 @@
 
   async function refreshChart() {
     setupChart();
+    const requestId = ++state.chartRequestId;
+    const requestedSymbol = state.symbol;
+    const requestedTimeframe = state.timeframe;
+    const seriesKey = `${requestedSymbol}:${requestedTimeframe}`;
     try {
-      const candles = await api(`/api/market/candles?symbol=${encodeURIComponent(state.symbol)}&timeframe=${encodeURIComponent(state.timeframe)}&limit=300`);
-      const key = `${state.symbol}:${state.timeframe}:${candles.length}:${candles.at(-1)?.open_time || ""}:${candles.at(-1)?.close || ""}`;
-      if (key !== state.lastCandlesKey && candles.length) {
-        const candleData = candles.filter((item) => item.time).map((item) => ({
+      const candles = await api(`/api/market/candles?symbol=${encodeURIComponent(requestedSymbol)}&timeframe=${encodeURIComponent(requestedTimeframe)}&limit=300`);
+      if (requestId !== state.chartRequestId || requestedSymbol !== state.symbol || requestedTimeframe !== state.timeframe) return;
+
+      if (!candles.length) {
+        if (state.lastSeriesKey !== seriesKey) {
+          state.candleSeries?.setData([]);
+          state.volumeSeries?.setData([]);
+          state.smaSeries?.setData([]);
+        }
+        state.lastCandlesKey = "";
+        state.lastSeriesKey = seriesKey;
+        state.forceFit = true;
+        setText("chartStatus", `No ${requestedTimeframe} candles for ${requestedSymbol}`);
+        setClass("chartStatus", "warning");
+        return;
+      }
+
+      const candleData = candles.filter((item) => item.time !== null && item.time !== undefined).map((item) => ({
           time: item.time,
           open: Number(item.open),
           high: Number(item.high),
           low: Number(item.low),
           close: Number(item.close),
-        }));
-        const volumeData = candles.filter((item) => item.time).map((item) => ({
+        })).filter((item) => Number.isFinite(item.open) && Number.isFinite(item.high) && Number.isFinite(item.low) && Number.isFinite(item.close));
+      const volumeData = candles.filter((item) => item.time !== null && item.time !== undefined).map((item) => ({
           time: item.time,
           value: Number(item.volume || 0),
           color: Number(item.close) >= Number(item.open) ? "rgba(14, 203, 129, 0.35)" : "rgba(246, 70, 93, 0.35)",
         }));
+      if (!candleData.length) {
+        setText("chartStatus", `Invalid candle data for ${requestedSymbol}`);
+        setClass("chartStatus", "warning");
+        return;
+      }
+
+      const lastRaw = candles.at(-1);
+      const key = `${seriesKey}:${candles.length}:${candles[0]?.open_time || ""}:${lastRaw?.open_time || ""}:${lastRaw?.close || ""}:${lastRaw?.volume || ""}`;
+      const shouldRefit = state.forceFit || state.lastSeriesKey !== seriesKey;
+      const visibleRange = !shouldRefit && state.chart ? state.chart.timeScale().getVisibleLogicalRange() : null;
+      if (key !== state.lastCandlesKey || shouldRefit) {
         if (state.candleSeries) state.candleSeries.setData(candleData);
         if (state.volumeSeries) state.volumeSeries.setData(volumeData);
         const smaData = sma(candleData);
         if (state.smaSeries) state.smaSeries.setData(smaData);
-        if (state.chart) state.chart.timeScale().fitContent();
+        if (state.chart) {
+          if (shouldRefit) state.chart.timeScale().fitContent();
+          else if (visibleRange) state.chart.timeScale().setVisibleLogicalRange(visibleRange);
+        }
         state.lastCandlesKey = key;
-        const last = candles.at(-1);
-        const first = candles[0];
+        state.lastSeriesKey = seriesKey;
+        state.forceFit = false;
+        const last = candleData.at(-1);
+        const first = candleData[0];
         const change = first && first.close ? (Number(last.close) - Number(first.close)) / Number(first.close) : 0;
         setText("latestPrice", money(last.close, 2));
         setText("priceChange", pct(change, 2));
         setClass("priceChange", cls(change));
-        setText(`railPrice${state.symbol}`, money(last.close, 2));
-        setText(`railChange${state.symbol}`, pct(change, 2));
-        setClass(`railChange${state.symbol}`, cls(change));
+        setText(`railPrice${requestedSymbol}`, money(last.close, 2));
+        setText(`railChange${requestedSymbol}`, pct(change, 2));
+        setClass(`railChange${requestedSymbol}`, cls(change));
         updateBook(last.close);
-        setText("volumeMetric", number(last.volume, 2));
+        setText("volumeMetric", number(lastRaw?.volume, 2));
         setText("smaMetric", smaData.length ? money(smaData.at(-1).value, 2) : "-");
-        setText("chartStatus", `${candles.length} candles`);
-      } else if (!candles.length) {
-        setText("chartStatus", `No ${state.timeframe} candles for ${state.symbol}`);
+        const source = lastRaw?.source_name || "";
+        const suffix = source === "aggregated_from_1m" ? " · built from 1m" : (source === "1m_live_fallback" ? " · 1m live fallback" : "");
+        setText("chartStatus", `${candles.length} ${requestedTimeframe} candles${suffix}`);
+        setClass("chartStatus", source === "1m_live_fallback" ? "warning" : "");
       }
     } catch (error) {
       setText("chartStatus", `Chart error: ${error.message}`);
@@ -277,11 +327,19 @@
   }
 
   function wireEvents() {
+    function requestChartReload(message) {
+      state.forceFit = true;
+      state.lastCandlesKey = "";
+      state.lastSeriesKey = "";
+      setText("chartStatus", message);
+      setClass("chartStatus", "");
+    }
+
     $("symbolSelect")?.addEventListener("change", (event) => {
       state.symbol = event.target.value;
       $("signalSymbol").value = state.symbol;
       document.querySelectorAll("[data-market-symbol]").forEach((item) => item.classList.toggle("active", item.dataset.marketSymbol === state.symbol));
-      state.lastCandlesKey = "";
+      requestChartReload(`Loading ${state.symbol} ${state.timeframe}`);
       refreshChart();
     });
     document.querySelectorAll("[data-market-symbol]").forEach((button) => {
@@ -290,7 +348,7 @@
         $("symbolSelect").value = state.symbol;
         $("signalSymbol").value = state.symbol;
         document.querySelectorAll("[data-market-symbol]").forEach((item) => item.classList.toggle("active", item === button));
-        state.lastCandlesKey = "";
+        requestChartReload(`Loading ${state.symbol} ${state.timeframe}`);
         refreshChart();
       });
     });
@@ -309,7 +367,7 @@
       button.addEventListener("click", () => {
         document.querySelectorAll("[data-timeframe]").forEach((item) => item.classList.toggle("active", item === button));
         state.timeframe = button.dataset.timeframe;
-        state.lastCandlesKey = "";
+        requestChartReload(`Loading ${state.symbol} ${state.timeframe}`);
         refreshChart();
       });
     });
