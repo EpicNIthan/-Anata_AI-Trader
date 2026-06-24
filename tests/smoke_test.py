@@ -38,6 +38,8 @@ os.environ["GDELT_ENABLED"] = "false"
 os.environ["NEWSAPI_ENABLED"] = "false"
 os.environ["NEWS_API_KEY"] = ""
 os.environ["PAPER_START_BALANCE"] = "10000"
+os.environ["DASHBOARD_USERNAME"] = "admin"
+os.environ["DASHBOARD_PASSWORD"] = "secret"
 sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient
@@ -51,6 +53,7 @@ from app.main import app
 
 def main() -> None:
     db_path = Path("_smoke_trading_lab.db")
+    exported_path: Path | None = None
     if db_path.exists():
         db_path.unlink()
 
@@ -71,13 +74,30 @@ def main() -> None:
     }
 
     with TestClient(app) as client:
+        auth = ("admin", "secret")
         health = client.get("/health")
         assert health.status_code == 200, health.text
         assert health.json()["status"] == "ok", health.text
 
-        dashboard = client.get("/dashboard")
+        blocked_dashboard = client.get("/dashboard")
+        assert blocked_dashboard.status_code == 401, blocked_dashboard.text
+        dashboard = client.get("/dashboard", auth=auth)
         assert dashboard.status_code == 200, dashboard.text[:500]
         assert "Anata AI Trading Lab" in dashboard.text
+
+        blocked_trade = client.post(
+            "/api/signal",
+            json={
+                "symbol": "BTCUSDT",
+                "action": "BUY",
+                "confidence": 0.90,
+                "price": 50000,
+                "notional": 250,
+                "reason": "smoke test",
+                "source": "smoke-test",
+            },
+        )
+        assert blocked_trade.status_code == 401, blocked_trade.text
 
         trade = client.post(
             "/api/signal",
@@ -90,6 +110,7 @@ def main() -> None:
                 "reason": "smoke test",
                 "source": "smoke-test",
             },
+            auth=auth,
         )
         assert trade.status_code == 200, trade.text
         assert trade.json()["status"] == "FILLED", trade.text
@@ -99,7 +120,7 @@ def main() -> None:
         assert experiences.status_code == 200, experiences.text
         assert len(experiences.json()) >= 1, experiences.text
 
-        news_run = client.post("/api/news/run-once")
+        news_run = client.post("/api/news/run-once", auth=auth)
         assert news_run.status_code == 200, news_run.text
         assert "providers" in news_run.json(), news_run.text
         assert news_run.json()["rows_saved"] > 0, news_run.text
@@ -114,6 +135,7 @@ def main() -> None:
                 "title": "Mock BTC macro update",
                 "body": "Bitcoin and Ethereum traders watch inflation, the Fed, and liquidity risk.",
             },
+            auth=auth,
         )
         assert mock_news.status_code == 200, mock_news.text
         assert mock_news.json()["rows_saved"] == 1, mock_news.text
@@ -126,7 +148,11 @@ def main() -> None:
         collector_status = client.get("/api/collectors/status")
         assert collector_status.status_code == 200, collector_status.text
 
-        market_backfill = client.post("/api/market/backfill", json={"symbols": ["BTCUSDT"], "limit": 100, "mock": True})
+        market_backfill = client.post(
+            "/api/market/backfill",
+            json={"symbols": ["BTCUSDT"], "limit": 100, "mock": True},
+            auth=auth,
+        )
         assert market_backfill.status_code == 200, market_backfill.text
         assert market_backfill.json()["rows_saved"] > 0, market_backfill.text
 
@@ -140,7 +166,7 @@ def main() -> None:
             candles_before = session.scalar(select(func.count(Candle.id))) or 0
         assert candles_before > 0
 
-        auto_start = client.post("/api/auto-trader/start")
+        auto_start = client.post("/api/auto-trader/start", auth=auth)
         assert auto_start.status_code == 200, auto_start.text
         assert auto_start.json()["running"] is True, auto_start.text
 
@@ -163,7 +189,12 @@ def main() -> None:
         assert (latest_feature.payload or {}).get("values", {}).get("candles_used", 0) > 0
         assert (latest_feature.payload or {}).get("values", {}).get("last_close") is not None
 
-        auto_stop = client.post("/api/auto-trader/stop")
+        export = client.post("/api/training/export", json={"use_all_data": True}, auth=auth)
+        assert export.status_code == 200, export.text
+        assert export.json()["counts"]["features"] > 0, export.text
+        exported_path = Path(export.json()["exported_path"])
+
+        auto_stop = client.post("/api/auto-trader/stop", auth=auth)
         assert auto_stop.status_code == 200, auto_stop.text
         assert auto_stop.json()["running"] is False, auto_stop.text
 
@@ -176,6 +207,8 @@ def main() -> None:
         db_path.unlink()
     if SMOKE_FEED_PATH.exists():
         SMOKE_FEED_PATH.unlink()
+    if exported_path and exported_path.exists():
+        exported_path.unlink()
     print("smoke_ok=true")
 
 

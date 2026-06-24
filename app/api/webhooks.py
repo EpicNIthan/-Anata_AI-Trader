@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.ai.experience_buffer import record_experience
 from app.db.models import AiDecision
 from app.db.session import get_session
+from app.security import require_admin
 from app.trading.paper_engine import PaperEngine
 
 router = APIRouter(prefix="/api", tags=["signals"])
@@ -38,7 +39,11 @@ class SignalRequest(BaseModel):
 
 
 @router.post("/signal")
-def receive_signal(payload: SignalRequest, session: Session = Depends(get_session)) -> dict[str, object]:
+def receive_signal(
+    payload: SignalRequest,
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, object]:
     engine = PaperEngine(session)
     result = engine.execute_signal(
         symbol=payload.symbol,

@@ -23,6 +23,7 @@ from app.db.models import (
     Position,
 )
 from app.db.session import get_session
+from app.security import ADMIN_COOKIE_NAME, admin_token_query_is_valid, require_admin
 from app.services.collector_status import market_snapshot, news_snapshot
 from app.trading.paper_engine import PaperEngine
 
@@ -34,10 +35,20 @@ def _dt(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _fmt(value: float | None, digits: int = 2) -> str:
+def _fmt(value: object | None, digits: int = 2) -> str:
     if value is None:
         return "-"
-    return f"{value:,.{digits}f}"
+    try:
+        return f"{float(value):,.{digits}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _float_value(value: object | None, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @router.get("/", include_in_schema=False)
@@ -46,7 +57,11 @@ def index() -> RedirectResponse:
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request, session: Session = Depends(get_session)) -> HTMLResponse:
+def dashboard(
+    request: Request,
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> HTMLResponse:
     account = PaperEngine(session).snapshot()
     open_positions = list(session.scalars(select(Position).where(Position.status == "OPEN").order_by(desc(Position.opened_at))))
     trades = list(session.scalars(select(PaperTrade).order_by(desc(PaperTrade.created_at)).limit(25)))
@@ -65,7 +80,7 @@ def dashboard(request: Request, session: Session = Depends(get_session)) -> HTML
         select(NewsSentiment, NewsArticle)
         .join(NewsArticle, NewsArticle.id == NewsSentiment.article_id)
         .order_by(desc(NewsSentiment.created_at))
-        .limit(8)
+        .limit(5)
     ).all()
     latest_news = [
         {
@@ -87,12 +102,36 @@ def dashboard(request: Request, session: Session = Depends(get_session)) -> HTML
     news_status = news_snapshot(session, collectors.get("news", {}))
     auto_trader_service = getattr(request.app.state, "auto_trader", None)
     auto_trader = auto_trader_service.status() if auto_trader_service else {}
-    latest_auto_decision = session.scalar(
+    latest_auto_decision_row = session.scalar(
         select(AiDecision)
         .where(AiDecision.source_name == "auto-trader-v1")
         .order_by(desc(AiDecision.created_at))
         .limit(1)
     )
+    latest_auto_decision = None
+    if latest_auto_decision_row:
+        latest_auto_decision = {
+            "strategy_name": latest_auto_decision_row.strategy_name,
+            "symbol": latest_auto_decision_row.symbol,
+            "action": latest_auto_decision_row.action,
+            "feature_schema_version": latest_auto_decision_row.feature_schema_version or "external",
+            "confidence_pct": _float_value(latest_auto_decision_row.confidence) * 100,
+            "execution_status": latest_auto_decision_row.execution_status,
+            "reward": latest_auto_decision_row.reward,
+            "reason": latest_auto_decision_row.reason or latest_auto_decision_row.execution_message,
+        }
+    latest_decision_rows = list(session.scalars(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(5)))
+    latest_decisions = [
+        {
+            "created_at": row.created_at,
+            "symbol": row.symbol,
+            "action": row.action,
+            "confidence_pct": _float_value(row.confidence) * 100,
+            "execution_status": row.execution_status,
+            "reason": row.reason or row.execution_message or "-",
+        }
+        for row in latest_decision_rows
+    ]
     data_counts = {
         "candles": session.scalar(select(func.count(Candle.id))) or 0,
         "news": session.scalar(select(func.count(NewsArticle.id))) or 0,
@@ -115,10 +154,20 @@ def dashboard(request: Request, session: Session = Depends(get_session)) -> HTML
         "news_status": news_status,
         "auto_trader": auto_trader,
         "latest_auto_decision": latest_auto_decision,
+        "latest_decisions": latest_decisions,
         "data_counts": data_counts,
         "equity_points_json": json.dumps(equity_points),
         "fmt": _fmt,
         "dt": _dt,
         "mode": settings.trading_mode,
     }
-    return templates.TemplateResponse(request, "dashboard.html", context)
+    response = templates.TemplateResponse(request, "dashboard.html", context)
+    if admin_token_query_is_valid(request):
+        response.set_cookie(
+            ADMIN_COOKIE_NAME,
+            request.query_params.get("admin_token") or request.query_params.get("token") or "",
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="lax",
+        )
+    return response

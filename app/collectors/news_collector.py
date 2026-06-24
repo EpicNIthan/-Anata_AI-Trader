@@ -124,6 +124,9 @@ class ProviderStatus:
     latest_article_at: str | None = None
     latest_title: str | None = None
     article_count: int = 0
+    query_url: str | None = None
+    response_code: int | None = None
+    rows_parsed: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -155,6 +158,18 @@ class BaseNewsProvider:
     def min_interval_seconds(self) -> int:
         return 0
 
+    @property
+    def last_query_url(self) -> str | None:
+        return None
+
+    @property
+    def last_response_code(self) -> int | None:
+        return None
+
+    @property
+    def last_rows_parsed(self) -> int:
+        return 0
+
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         raise NotImplementedError
 
@@ -165,6 +180,7 @@ class RssProvider(BaseNewsProvider):
 
     def __init__(self) -> None:
         self._last_warning: str | None = None
+        self._last_rows_parsed = 0
 
     @property
     def enabled(self) -> bool:
@@ -182,11 +198,20 @@ class RssProvider(BaseNewsProvider):
     def last_warning(self) -> str | None:
         return self._last_warning
 
+    @property
+    def last_query_url(self) -> str | None:
+        return ",".join(settings.rss_feeds)
+
+    @property
+    def last_rows_parsed(self) -> int:
+        return self._last_rows_parsed
+
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         if not self.configured:
             return []
         collector = RssNewsCollector()
         items = await collector.fetch(client, settings.rss_feeds)
+        self._last_rows_parsed = len(items)
         self._last_warning = "; ".join(
             f"{feed}: {error}" for feed, error in collector.last_errors.items()
         ) or None
@@ -211,6 +236,11 @@ class GdeltProvider(BaseNewsProvider):
     provider = "gdelt"
     role = "global macro/world risk"
 
+    def __init__(self) -> None:
+        self._last_query_url: str | None = None
+        self._last_response_code: int | None = None
+        self._last_rows_parsed = 0
+
     @property
     def enabled(self) -> bool:
         return settings.gdelt_enabled and _provider_enabled(self.provider)
@@ -218,6 +248,18 @@ class GdeltProvider(BaseNewsProvider):
     @property
     def min_interval_seconds(self) -> int:
         return settings.gdelt_poll_interval_seconds
+
+    @property
+    def last_query_url(self) -> str | None:
+        return self._last_query_url
+
+    @property
+    def last_response_code(self) -> int | None:
+        return self._last_response_code
+
+    @property
+    def last_rows_parsed(self) -> int:
+        return self._last_rows_parsed
 
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         query = (
@@ -232,7 +274,11 @@ class GdeltProvider(BaseNewsProvider):
             "sort": "HybridRel",
         }
         url = f"https://api.gdeltproject.org/api/v2/doc/doc?{urlencode(params)}"
+        self._last_query_url = url
+        self._last_response_code = None
+        self._last_rows_parsed = 0
         response = await client.get(url)
+        self._last_response_code = response.status_code
         response.raise_for_status()
         payload = response.json()
         articles: list[NormalizedArticle] = []
@@ -265,6 +311,7 @@ class GdeltProvider(BaseNewsProvider):
                     affected_symbols=_affected_symbols(raw_text),
                 )
             )
+        self._last_rows_parsed = len(articles)
         return articles
 
 
@@ -273,6 +320,10 @@ class NewsApiProvider(BaseNewsProvider):
     role = "delayed/free fallback"
     delayed = True
     fallback = True
+
+    def __init__(self) -> None:
+        self._last_response_code: int | None = None
+        self._last_rows_parsed = 0
 
     @property
     def enabled(self) -> bool:
@@ -285,6 +336,18 @@ class NewsApiProvider(BaseNewsProvider):
     @property
     def unavailable_reason(self) -> str | None:
         return None if self.configured else "NEWS_API_KEY missing or placeholder"
+
+    @property
+    def last_query_url(self) -> str | None:
+        return settings.news_provider_url
+
+    @property
+    def last_response_code(self) -> int | None:
+        return self._last_response_code
+
+    @property
+    def last_rows_parsed(self) -> int:
+        return self._last_rows_parsed
 
     async def fetch(self, client: httpx.AsyncClient) -> list[NormalizedArticle]:
         if not self.configured:
@@ -299,6 +362,7 @@ class NewsApiProvider(BaseNewsProvider):
                 "apiKey": settings.news_api_key,
             },
         )
+        self._last_response_code = response.status_code
         response.raise_for_status()
         payload = response.json()
         articles: list[NormalizedArticle] = []
@@ -321,6 +385,7 @@ class NewsApiProvider(BaseNewsProvider):
                     affected_symbols=_affected_symbols(body),
                 )
             )
+        self._last_rows_parsed = len(articles)
         return articles
 
 
@@ -376,6 +441,7 @@ class NewsCollector:
                 if state:
                     state.mark_saved(result["rows_saved"], {"providers": self.snapshot(), **result})
                     state.last_error = self._combined_errors()
+                    state.warning = self._combined_warnings()
             except Exception as exc:
                 logger.exception("News collector loop error")
                 if state:
@@ -397,15 +463,18 @@ class NewsCollector:
                 status.configured = provider.configured
                 if not provider.enabled:
                     status.last_error = None
+                    self._apply_provider_diagnostics(status, provider)
                     per_provider[provider.provider] = status.as_dict()
                     continue
                 if not provider.configured:
                     status.last_error = provider.unavailable_reason
+                    self._apply_provider_diagnostics(status, provider)
                     per_provider[provider.provider] = status.as_dict()
                     continue
                 cooldown_message = _cooldown_remaining(provider.provider)
                 if cooldown_message:
                     status.last_error = cooldown_message
+                    self._apply_provider_diagnostics(status, provider)
                     per_provider[provider.provider] = status.as_dict()
                     continue
                 status.running = True
@@ -432,6 +501,7 @@ class NewsCollector:
                         status.last_error = _sanitize_error(exc)
                 finally:
                     status.running = False
+                    self._apply_provider_diagnostics(status, provider)
                     per_provider[provider.provider] = status.as_dict()
         self.refresh_db_counts()
         return {
@@ -521,6 +591,28 @@ class NewsCollector:
                 status.latest_article_at = latest.published_at.isoformat() if latest and latest.published_at else None
                 status.latest_title = latest.title if latest else None
 
+    def _apply_provider_diagnostics(self, status: ProviderStatus, provider: BaseNewsProvider) -> None:
+        status.query_url = provider.last_query_url
+        status.response_code = provider.last_response_code
+        status.rows_parsed = provider.last_rows_parsed
+
     def _combined_errors(self) -> str | None:
-        errors = [status.last_error for status in self.statuses.values() if status.enabled and status.last_error]
+        errors = [
+            status.last_error
+            for status in self.statuses.values()
+            if status.enabled and status.last_error and not self._is_warning(status.last_error)
+        ]
         return "; ".join(errors) if errors else None
+
+    def _combined_warnings(self) -> str | None:
+        warnings = [
+            status.last_error
+            for status in self.statuses.values()
+            if status.enabled and status.last_error and self._is_warning(status.last_error)
+        ]
+        return "; ".join(warnings) if warnings else None
+
+    @staticmethod
+    def _is_warning(message: str) -> bool:
+        lowered = message.lower()
+        return "rate limit" in lowered or "429" in lowered or "cooling down" in lowered

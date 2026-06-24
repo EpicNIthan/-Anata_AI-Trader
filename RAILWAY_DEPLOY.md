@@ -30,6 +30,9 @@ AUTO_TRADER_ENABLED=false
 AUTO_TRADER_INTERVAL_SECONDS=60
 AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT
 PAPER_START_BALANCE=10000
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=choose_a_strong_password
+ADMIN_TOKEN=choose_a_long_random_token
 ```
 
 Add a Railway PostgreSQL service. Railway should provide `DATABASE_URL`; the app accepts Railway's `postgresql://...` URL and converts it for `psycopg`.

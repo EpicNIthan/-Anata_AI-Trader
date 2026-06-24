@@ -57,7 +57,7 @@
   async function collectorAction(worker, action) {
     const message = document.getElementById("collectorMessage");
     if (message) message.textContent = `${action} ${worker}...`;
-    const response = await fetch(`/api/collectors/${worker}/${action}`, { method: "POST" });
+    const response = await fetch(`/api/collectors/${worker}/${action}`, { method: "POST", credentials: "same-origin" });
     const data = await response.json();
     if (message) message.textContent = data.last_error || `${worker} ${data.running ? "running" : "stopped"}`;
   }
@@ -65,7 +65,7 @@
   async function autoTraderAction(action) {
     const message = document.getElementById("autoTraderMessage");
     if (message) message.textContent = `${action} auto trader...`;
-    const response = await fetch(`/api/auto-trader/${action}`, { method: "POST" });
+    const response = await fetch(`/api/auto-trader/${action}`, { method: "POST", credentials: "same-origin" });
     const data = await response.json();
     if (message) message.textContent = data.last_error || (data.running ? "Running" : "Stopped");
   }
@@ -84,6 +84,7 @@
     if (output) output.textContent = "Sending...";
     const response = await fetch("/api/signal", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });

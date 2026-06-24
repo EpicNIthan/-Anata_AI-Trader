@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.ai.experience_buffer import record_experience
@@ -15,15 +16,22 @@ from app.collectors.news_collector import NewsCollector
 from app.db.models import (
     AccountEquity,
     AiDecision,
+    Candle,
     ExperienceRecord,
     ExternalDataEvent,
+    Feature,
     ModelVersion,
+    NewsArticle,
+    NewsSentiment,
     PaperTrade,
     Position,
 )
 from app.db.session import get_session
 from app.features.feature_builder import FeatureBuilder
+from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION
+from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
+from app.training.export_dataset import export_dataset, parse_since_date
 from app.trading.paper_engine import PaperEngine
 
 router = APIRouter(prefix="/api", tags=["lab"])
@@ -58,12 +66,12 @@ def status(request: Request, session: Session = Depends(get_session)) -> dict[st
 
 
 @router.post("/auto-trader/start")
-async def start_auto_trader(request: Request) -> dict[str, Any]:
+async def start_auto_trader(request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
     return await _auto_trader(request).start()
 
 
 @router.post("/auto-trader/stop")
-async def stop_auto_trader(request: Request) -> dict[str, Any]:
+async def stop_auto_trader(request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
     return await _auto_trader(request).stop()
 
 
@@ -92,6 +100,7 @@ def market_latest(session: Session = Depends(get_session), limit: int = 50) -> l
 async def market_backfill(
     request: Request,
     payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
 ) -> dict[str, Any]:
     payload = payload or {}
     symbols = payload.get("symbols")
@@ -135,7 +144,10 @@ def news_latest(
 
 
 @router.post("/news/run-once")
-async def news_run_once(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+async def news_run_once(
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
     payload = payload or {}
     provider = payload.get("provider")
     if provider:
@@ -144,28 +156,35 @@ async def news_run_once(payload: dict[str, Any] | None = Body(default=None)) -> 
 
 
 @router.post("/news/mock")
-def news_mock(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+def news_mock(
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
     payload = payload or {}
     stored = NewsCollector().store_mock_article(title=payload.get("title"), body=payload.get("body"))
     return {"rows_saved": stored, "source": "mock-news"}
 
 
 @router.post("/collectors/{name}/start")
-async def start_collector(name: str, request: Request) -> dict[str, Any]:
+async def start_collector(name: str, request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
     if name not in {"market", "news"}:
         raise HTTPException(status_code=404, detail="Unknown collector")
     return await _worker_manager(request).start(name)
 
 
 @router.post("/collectors/{name}/stop")
-async def stop_collector(name: str, request: Request) -> dict[str, Any]:
+async def stop_collector(name: str, request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
     if name not in {"market", "news"}:
         raise HTTPException(status_code=404, detail="Unknown collector")
     return await _worker_manager(request).stop(name)
 
 
 @router.post("/paper-trade")
-def create_paper_trade(payload: SignalRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+def create_paper_trade(
+    payload: SignalRequest,
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
     engine = PaperEngine(session)
     result = engine.execute_signal(
         symbol=payload.symbol,
@@ -211,7 +230,11 @@ def create_paper_trade(payload: SignalRequest, session: Session = Depends(get_se
 
 
 @router.post("/strategy/{symbol}/paper")
-def run_strategy(symbol: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+def run_strategy(
+    symbol: str,
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
     feature = FeatureBuilder(session).build_for_symbol(symbol)
     decision = RuleBasedStrategy().decide(feature)
     engine_result = PaperEngine(session).execute_signal(
@@ -259,7 +282,11 @@ def run_strategy(symbol: str, session: Session = Depends(get_session)) -> dict[s
 
 
 @router.post("/data-events")
-def create_data_event(payload: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
+def create_data_event(
+    payload: dict[str, Any],
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
     source_name = str(payload.get("source_name") or "unknown")
     data_type = str(payload.get("data_type") or "generic")
     symbol = payload.get("symbol")
@@ -281,6 +308,57 @@ def create_data_event(payload: dict[str, Any], session: Session = Depends(get_se
         "data_type": event.data_type,
         "symbol": event.symbol,
         "event_time": _dt(event.event_time),
+    }
+
+
+@router.post("/training/export")
+def training_export(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    feature_schema_version = str(payload.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION)
+    since_date = parse_since_date(payload.get("since_date"))
+    use_all_data = bool(payload.get("use_all_data", True))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_path = Path("datasets") / f"features_{timestamp}.csv"
+    exported_path = export_dataset(
+        output_path,
+        feature_schema_version=feature_schema_version,
+        since_date=since_date,
+        use_all_data=use_all_data,
+    )
+    counts = {
+        "candles": session.scalar(select(func.count(Candle.id))) or 0,
+        "news_articles": session.scalar(select(func.count(NewsArticle.id))) or 0,
+        "news_sentiment": session.scalar(select(func.count(NewsSentiment.id))) or 0,
+        "features": session.scalar(select(func.count(Feature.id))) or 0,
+        "ai_decisions": session.scalar(select(func.count(AiDecision.id))) or 0,
+        "experiences": session.scalar(select(func.count(ExperienceRecord.id))) or 0,
+        "paper_trades": session.scalar(select(func.count(PaperTrade.id))) or 0,
+        "open_positions": session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0,
+    }
+    news_by_provider = {
+        provider: count
+        for provider, count in session.execute(
+            select(NewsArticle.source_name, func.count(NewsArticle.id)).group_by(NewsArticle.source_name)
+        ).all()
+    }
+    features_by_symbol = {
+        symbol: count
+        for symbol, count in session.execute(select(Feature.symbol, func.count(Feature.id)).group_by(Feature.symbol)).all()
+    }
+    latest_feature = session.scalar(select(Feature).order_by(desc(Feature.as_of)).limit(1))
+    return {
+        "exported_path": str(exported_path),
+        "feature_schema_version": feature_schema_version,
+        "since_date": since_date.isoformat() if since_date else None,
+        "use_all_data": use_all_data,
+        "counts": counts,
+        "news_by_provider": news_by_provider,
+        "features_by_symbol": features_by_symbol,
+        "latest_feature_at": _dt(latest_feature.as_of if latest_feature else None),
     }
 
 

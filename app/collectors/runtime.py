@@ -41,14 +41,15 @@ class CollectorState:
         self.details = details
 
     def mark_saved(self, rows: int = 1, details: dict[str, Any] | None = None) -> None:
+        if details is not None:
+            self.details = details
+        self.last_event_at = datetime.now(timezone.utc).isoformat()
         if rows <= 0:
             return
         now = datetime.now(timezone.utc).isoformat()
         self.rows_saved += rows
         self.last_event_at = now
         self.last_saved_at = now
-        if details is not None:
-            self.details = details
 
     def mark_event(self, details: dict[str, Any] | None = None) -> None:
         self.mark_message(details)

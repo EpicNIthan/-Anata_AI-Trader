@@ -89,6 +89,13 @@
               {% if state.last_error or state.warning %}
                 <p class="warning">{{ state.last_error or state.warning }}</p>
               {% endif %}
+              {% if name == 'news' %}
+                <p>
+                  {% for provider, item in news_status.providers.items() %}
+                    {{ provider|title }} {{ item.status }}{% if not loop.last %} | {% endif %}
+                  {% endfor %}
+                </p>
+              {% endif %}
             {% endfor %}
           </div>
         </article>
@@ -117,12 +124,18 @@
           <div class="provider-list">
             {% for provider, item in news_status.providers.items() %}
               <div class="provider-row">
-                <strong>{{ provider|title }}</strong>
+                <strong>{{ provider|title }} · {{ item.status|title }}</strong>
                 <span>{{ item.role }}</span>
                 <span>{{ 'Enabled' if item.enabled else 'Disabled' }} | {{ 'Configured' if item.configured else 'Missing config' }}</span>
                 <span>{{ 'Fallback' if item.fallback else 'Primary' }}{% if item.delayed %} | Delayed/free{% endif %}</span>
-                <span>Articles {{ item.article_count or 0 }}</span>
+                <span>Articles {{ item.article_count or 0 }} | Parsed {{ item.rows_parsed or 0 }} | Saved this run {{ item.rows_saved or 0 }}</span>
                 <span>Latest {{ item.latest_article_at or '-' }}</span>
+                {% if item.response_code %}
+                  <span>HTTP {{ item.response_code }}</span>
+                {% endif %}
+                {% if item.query_url %}
+                  <span>{{ item.query_url }}</span>
+                {% endif %}
                 {% if item.last_error %}
                   <span class="warning">{{ item.last_error }}</span>
                 {% endif %}
@@ -202,11 +215,11 @@
           <dl class="decision">
             <dt>Symbol</dt><dd>{{ latest_auto_decision.symbol }}</dd>
             <dt>Action</dt><dd>{{ latest_auto_decision.action }}</dd>
-            <dt>Schema</dt><dd>{{ latest_auto_decision.feature_schema_version or 'external' }}</dd>
-            <dt>Confidence</dt><dd>{{ fmt(latest_auto_decision.confidence * 100, 1) }}%</dd>
+            <dt>Schema</dt><dd>{{ latest_auto_decision.feature_schema_version }}</dd>
+            <dt>Confidence</dt><dd>{{ fmt(latest_auto_decision.confidence_pct, 1) }}%</dd>
             <dt>Status</dt><dd>{{ latest_auto_decision.execution_status }}</dd>
             <dt>Reward</dt><dd>{{ fmt(latest_auto_decision.reward, 4) }}</dd>
-            <dt>Reason</dt><dd>{{ latest_auto_decision.reason or latest_auto_decision.execution_message }}</dd>
+            <dt>Reason</dt><dd>{{ latest_auto_decision.reason }}</dd>
           </dl>
           {% else %}
             <p class="empty">No auto decisions yet</p>
@@ -241,6 +254,32 @@
             {% else %}
               <p class="empty">No news collected yet</p>
             {% endfor %}
+          </div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
+            <h2>Latest AI Decisions</h2>
+            <span>{{ latest_decisions|length }}</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Confidence</th><th>Status</th><th>Reason</th></tr></thead>
+              <tbody>
+                {% for decision in latest_decisions %}
+                  <tr>
+                    <td>{{ dt(decision.created_at) }}</td>
+                    <td>{{ decision.symbol }}</td>
+                    <td>{{ decision.action }}</td>
+                    <td>{{ fmt(decision.confidence_pct, 1) }}%</td>
+                    <td>{{ decision.execution_status }}</td>
+                    <td>{{ decision.reason }}</td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="6" class="empty">No AI decisions yet</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
           </div>
         </article>
 

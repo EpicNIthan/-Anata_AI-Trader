@@ -150,13 +150,31 @@ def news_snapshot(session: Session, collector_state: dict[str, Any] | None = Non
             select(func.count(NewsArticle.id)).where(NewsArticle.source_name == provider)
         ) or 0
         live = provider_details.get(provider, {})
+        last_error = live.get("last_error")
+        if last_error is None and base["enabled"]:
+            last_error = base["warning"]
+        status_label = "disabled"
+        if base["enabled"] and not base["configured"]:
+            status_label = "missing config"
+        elif base["enabled"] and last_error:
+            status_label = "warning" if _provider_warning(last_error) else "error"
+        elif base["enabled"] and (collector_state or {}).get("running"):
+            status_label = "running"
+        elif base["enabled"]:
+            status_label = "ready"
         providers[provider] = {
             **base,
             **live,
+            "status": status_label,
             "article_count": count_provider,
             "latest_article_at": _dt(latest_provider.published_at if latest_provider else None),
             "latest_title": latest_provider.title if latest_provider else None,
-            "last_error": live.get("last_error") or base["warning"],
+            "last_error": last_error,
+            "query_url": live.get("query_url"),
+            "response_code": live.get("response_code"),
+            "rows_parsed": live.get("rows_parsed", 0),
+            "rows_saved": live.get("rows_saved", 0),
+            "last_run_at": live.get("last_run_at"),
         }
     warning = "; ".join(
         provider["last_error"]
@@ -178,6 +196,11 @@ def news_snapshot(session: Session, collector_state: dict[str, Any] | None = Non
         "warning": warning,
         "mock_fallback_enabled": settings.news_mock_fallback_enabled,
     }
+
+
+def _provider_warning(message: str) -> bool:
+    lowered = message.lower()
+    return "rate limit" in lowered or "429" in lowered or "cooling down" in lowered
 
 
 def latest_news(session: Session, limit: int = 25, provider: str | None = None) -> list[dict[str, Any]]:

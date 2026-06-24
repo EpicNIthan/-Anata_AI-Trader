@@ -109,6 +109,9 @@ class Settings:
     risk_max_open_positions: int = field(default_factory=lambda: _int("RISK_MAX_OPEN_POSITIONS", 3))
     risk_min_confidence: float = field(default_factory=lambda: _float("RISK_MIN_CONFIDENCE", 0.55))
     risk_cooldown_minutes: int = field(default_factory=lambda: _int("RISK_COOLDOWN_MINUTES", 30))
+    dashboard_username: str | None = field(default_factory=lambda: _secret("DASHBOARD_USERNAME"))
+    dashboard_password: str | None = field(default_factory=lambda: _secret("DASHBOARD_PASSWORD"))
+    admin_token: str | None = field(default_factory=lambda: _secret("ADMIN_TOKEN"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
     @property
