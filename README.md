@@ -11,11 +11,11 @@ No live exchange order APIs are wired. There are no real trading keys, no withdr
 - Binance websocket kline collector for liquid USDT symbols such as `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `BNBUSDT`, `XRPUSDT`, `ADAUSDT`, `DOGEUSDT`, `AVAXUSDT`, `LINKUSDT`, and `LTCUSDT`.
 - Binance Futures public aggregate collector for long/short ratios, top-trader ratios, taker buy/sell flow, open interest, and funding rate.
 - REST news collector with a configurable provider URL and API key.
-- Placeholder news sentiment interface shaped for a future Hugging Face model.
+- News sentiment interface with a rule-based fallback and optional Hugging Face model if you install `requirements-hf.txt`.
 - Feature builder combining candle behavior and sentiment/risk scores.
 - Paper futures engine with fake balance, long/short positions, leverage, fees, PnL, trade history, and no live exchange orders.
 - Risk manager for max trade size, max daily loss, max open positions, cooldown after large loss, and low-confidence rejection.
-- Training scripts for dataset export, a first-pass linear model, and evaluation.
+- Railway-safe dataset export plus laptop/offline training scripts for stronger local models.
 - Dockerfile and Railway-compatible start command.
 - Versioned JSON feature schemas, model lineage metadata, and an experience replay buffer for continued training.
 - Autonomous paper-trading runner with API and dashboard controls.
@@ -27,6 +27,12 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
+```
+
+Optional Hugging Face sentiment dependencies are intentionally separate so Railway does not need heavy packages by default:
+
+```powershell
+python -m pip install -r requirements-hf.txt
 ```
 
 Set `DATABASE_URL` in `.env` to PostgreSQL for normal use:
@@ -52,6 +58,21 @@ Open:
 
 - `http://localhost:8000/health`
 - `http://localhost:8000/dashboard`
+
+## Security
+
+`/health` is public. The dashboard and all `/api/*` lab endpoints are private when either `ADMIN_TOKEN` or `DASHBOARD_USERNAME` plus `DASHBOARD_PASSWORD` is configured.
+
+Browser login options:
+
+- Open `/dashboard?admin_token=YOUR_TOKEN` when using `ADMIN_TOKEN`.
+- Or use browser Basic Auth with `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD`.
+
+Script/API calls can pass:
+
+```powershell
+curl -H "x-admin-token: YOUR_TOKEN" https://your-app.up.railway.app/api/dashboard/summary
+```
 
 ## Collectors
 
@@ -198,7 +219,7 @@ Safety behavior:
 
 - Paper mode only.
 - No live exchange order execution.
-- Uses the latest trained model automatically when `AUTO_TRADER_USE_TRAINED_MODEL=true`; falls back to `rule-based-v1` while no model exists.
+- Uses the active uploaded model when `AUTO_TRADER_USE_TRAINED_MODEL=true`; falls back to `rule-based-v1` when no active compatible model exists.
 - Uses the existing risk manager.
 - Uses confidence-sized paper-only leverage. With `PAPER_CONFIDENCE_LEVERAGE_ENABLED=true`, low confidence stays near `PAPER_MIN_LEVERAGE`, while very high confidence can approach `PAPER_MAX_LEVERAGE`.
 - Sizes new entries from 0% to `RISK_MAX_TRADE_SIZE_PCT` of equity as margin based on confidence. With `RISK_MAX_TRADE_SIZE_PCT=0.50`, very high-confidence paper trades can use up to 50% of equity as margin.
@@ -254,6 +275,15 @@ Features are stored as versioned JSON payloads. The current schema is `price-new
 - combined `trader_crowd_score`
 - combined `crowd_risk_score`
 
+Railway is inference-only by default:
+
+```env
+ENABLE_SERVER_TRAINING=false
+ENABLE_SERVER_INFERENCE=true
+```
+
+Railway collects data, builds/exports datasets, runs the dashboard, runs paper trading, and runs active model inference. Heavy training should happen on your laptop after downloading a dataset. If `/api/training/train-model` is called while server training is disabled, it returns: `Server training is disabled. Download dataset and train locally.`
+
 Build features through the API or internal jobs, then export:
 
 ```powershell
@@ -275,8 +305,9 @@ What it does:
 - Adds future-return labels for `5m`, `15m`, `1h`, and `4h`.
 - Adds max-upside/max-drawdown labels.
 - Adds stop-loss/take-profit-hit-first labels.
+- Adds `target_direction_15m` and `target_trade_quality_score`.
 - Creates offline replay rows in `experience_buffer` for `BUY` and `HOLD`.
-- Exports a CSV that can be used by `train_price_model.py`.
+- Exports a gzip CSV like `datasets/anata_dataset_YYYYMMDD_HHMMSS.csv.gz`.
 
 API:
 
@@ -295,38 +326,56 @@ python -m app.training.export_dataset --since-date 2026-06-24
 python -m app.training.export_dataset --use-all-data
 ```
 
-Train the first model:
+Railway export/download API:
 
 ```powershell
-python -m app.training.train_price_model --dataset datasets/features_YYYYMMDD_HHMMSS.csv
-```
-
-Or from the dashboard Training tab, click `Train Model`. It starts a background training job so the website stays responsive. Status is available at `/api/training/status`. For a synchronous local/API run, pass `wait=true`:
-
-```powershell
-curl -X POST http://localhost:8000/api/training/train-model `
+curl -X POST https://your-app.up.railway.app/api/training/export `
+  -H "x-admin-token: YOUR_ADMIN_TOKEN" `
   -H "Content-Type: application/json" `
-  -d "{\"build_dataset\":true,\"days\":14,\"max_rows_per_symbol\":5000,\"use_all_data\":true,\"wait\":true}"
+  -d "{\"use_all_data\":true}"
+
+curl -L https://your-app.up.railway.app/api/training/download/anata_dataset_YYYYMMDD_HHMMSS.csv.gz `
+  -H "x-admin-token: YOUR_ADMIN_TOKEN" `
+  -o datasets/anata_dataset_YYYYMMDD_HHMMSS.csv.gz
 ```
 
-After this succeeds, `/api/models/latest` should show `status=trained`, the dashboard model badge should show a version, and the auto trader can trade from the trained model.
-
-Continue from an existing checkpoint without starting from zero:
+Laptop workflow:
 
 ```powershell
-python -m app.training.train_price_model --from-checkpoint models/price_linear_YYYYMMDD_HHMMSS.json --since-date 2026-06-24
+python scripts/download_dataset.py --url https://your-app.up.railway.app --token YOUR_ADMIN_TOKEN
+python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type sklearn_hist_gradient_boosting
+python scripts/evaluate_local_model.py --dataset datasets/latest.csv.gz --model models/model_VERSION.joblib
+python scripts/package_model.py --model models/model_VERSION.joblib
+python scripts/upload_model.py --url https://your-app.up.railway.app --token YOUR_ADMIN_TOKEN --package model_package_VERSION.zip
 ```
 
-Evaluate:
+Supported local model types:
+
+- `sklearn_hist_gradient_boosting`
+- `random_forest`
+- `lightgbm` if installed locally
+- `xgboost` if installed locally
+
+Uploaded models are registered as `candidate` first. Activate only after checking metrics:
 
 ```powershell
-python -m app.training.evaluate_model --dataset datasets/features_YYYYMMDD_HHMMSS.csv
-python -m app.training.evaluate_model --from-checkpoint models/price_linear_YYYYMMDD_HHMMSS.json --use-all-data
+curl -X POST https://your-app.up.railway.app/api/models/activate `
+  -H "x-admin-token: YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d "{\"model_id\":\"MODEL_ID_FROM_UPLOAD\"}"
 ```
 
-Every saved model records `model_id`, `version`, `feature_schema_version`, `feature_columns`, `created_at`, metrics, and optional parent checkpoint metadata. Old models are kept in `model_versions`; new models can use a larger feature list while old models keep reading only the columns they were trained on.
+Model endpoints:
 
-The current model is a simple linear baseline saved under `MODEL_DIR`. The strategy interface is intentionally stable so PPO, SAC, transformer, or ensemble models can replace it later without rewriting execution.
+```powershell
+curl -H "x-admin-token: YOUR_ADMIN_TOKEN" https://your-app.up.railway.app/api/models
+curl -H "x-admin-token: YOUR_ADMIN_TOKEN" https://your-app.up.railway.app/api/models/latest
+curl -H "x-admin-token: YOUR_ADMIN_TOKEN" https://your-app.up.railway.app/api/models/active
+```
+
+Every saved model records `model_id`, `version`, `feature_schema_version`, `feature_columns`, `created_at`, metrics, model type, and training dataset hash. Old models are kept in `model_versions`; new models can use a larger feature list while old models keep reading only the columns they were trained on.
+
+The auto trader loads only the active model. If the active model is missing or incompatible, it falls back to the rule-based strategy and reports the fallback reason in status/diagnostics.
 
 ## Replay And Future Data
 
@@ -365,6 +414,9 @@ Set environment variables in Railway:
 
 - `DATABASE_URL`
 - `TRADING_MODE=paper`
+- `ADMIN_TOKEN=long_random_secret`
+- `ENABLE_SERVER_TRAINING=false`
+- `ENABLE_SERVER_INFERENCE=true`
 - `BINANCE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
 - `AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
 - `AUTO_TRADER_USE_TRAINED_MODEL=true`
@@ -383,7 +435,11 @@ Set environment variables in Railway:
 - `AUTO_FAST_PROFIT_EXIT_PCT=0.006`
 - `AUTO_POSITION_MAX_LOSS_PCT=0.10`
 - `AUTO_DEFAULT_STOP_LOSS_PCT=0.01`
-- `NEWS_API_KEY` if using the news collector
+- `NEWS_PROVIDER=rss,gdelt,newsapi`
+- `RSS_NEWS_ENABLED=true`
+- `GDELT_ENABLED=true`
+- `NEWSAPI_ENABLED=false`
+- `NEWS_API_KEY` only if using NewsAPI fallback
 - risk settings such as `RISK_MAX_TRADE_SIZE_PCT`
 
 ## Safety Boundaries
@@ -401,4 +457,4 @@ Set environment variables in Railway:
 python tests/smoke_test.py
 ```
 
-The smoke test verifies `/health`, dashboard rendering, paper signal execution, collector status access, and database table creation.
+The smoke test verifies `/health`, dashboard rendering, private API protection, paper signal execution, dataset export/download, candidate model upload, explicit activation, active model inference/fallback safety, collector status access, and database table creation.

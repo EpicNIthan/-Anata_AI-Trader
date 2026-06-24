@@ -66,7 +66,8 @@ def dashboard(
     open_positions = list(session.scalars(select(Position).where(Position.status == "OPEN").order_by(desc(Position.opened_at))))
     trades = list(session.scalars(select(PaperTrade).order_by(desc(PaperTrade.created_at)).limit(25)))
     latest_decision = session.scalar(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(1))
-    latest_model = session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
+    latest_model = session.scalar(select(ModelVersion).where(ModelVersion.status == "active").order_by(desc(ModelVersion.created_at)).limit(1))
+    latest_model = latest_model or session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
 
     equity_rows = list(session.scalars(select(AccountEquity).order_by(desc(AccountEquity.timestamp)).limit(100)))
     equity_rows.reverse()

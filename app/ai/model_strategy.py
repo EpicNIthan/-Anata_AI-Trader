@@ -22,30 +22,41 @@ class ModelDecision:
 
 
 class PriceModelStrategy:
-    name = "price-linear-regression"
+    name = "uploaded-model-inference"
+
+    def __init__(self) -> None:
+        self.last_fallback_reason: str | None = None
 
     def decide(self, session: Session, feature: Feature) -> ModelDecision | None:
+        self.last_fallback_reason = None
+        if not settings.enable_server_inference:
+            self.last_fallback_reason = "Server model inference is disabled."
+            return None
         model = session.scalar(
             select(ModelVersion)
-            .where(ModelVersion.status == "trained")
+            .where(ModelVersion.status == "active")
             .order_by(desc(ModelVersion.created_at))
             .limit(1)
         )
         if model is None:
+            self.last_fallback_reason = "No active model is registered."
             return None
 
         payload = self._load_model_payload(model)
         if payload is None:
+            self.last_fallback_reason = "Active model metadata or file could not be loaded."
             return None
 
         feature_columns = list(payload.get("feature_columns") or model.feature_columns or [])
-        coefficients = [float(value or 0.0) for value in payload.get("coefficients", [])]
-        if not feature_columns or len(coefficients) != len(feature_columns):
+        if not feature_columns:
+            self.last_fallback_reason = "Active model has no feature_columns metadata."
             return None
 
         vector = numeric_vector(feature, feature_columns)
-        intercept = float(payload.get("intercept", 0.0) or 0.0)
-        predicted_return = intercept + sum(value * coefficient for value, coefficient in zip(vector, coefficients))
+        predicted_return = self._predict(payload, vector)
+        if predicted_return is None:
+            self.last_fallback_reason = "Active model type is not compatible with Railway inference."
+            return None
         required_edge = settings.paper_fee_rate * 2.0 + settings.strategy_min_edge_after_fees
         confidence = self._confidence(predicted_return, required_edge)
         values = values_from_feature(feature, feature_columns)
@@ -93,12 +104,61 @@ class PriceModelStrategy:
         )
 
     def _load_model_payload(self, model: ModelVersion) -> dict[str, Any] | None:
-        if model.raw_payload:
-            return model.raw_payload
-        path = Path(model.path)
+        payload = dict(model.raw_payload or {})
+        path_value = payload.get("model_file") or model.path
+        if payload and payload.get("coefficients") is not None:
+            return payload
+        if not path_value:
+            return payload or None
+        path = Path(str(path_value))
         if not path.exists():
+            return payload or None
+        if path.suffix.lower() == ".json":
+            file_payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(file_payload, dict):
+                payload.update(file_payload)
+                payload.setdefault("model_file", str(path))
+                return payload
+        payload.setdefault("model_file", str(path))
+        return payload
+
+    def _predict(self, payload: dict[str, Any], vector: list[float]) -> float | None:
+        coefficients = payload.get("coefficients")
+        if isinstance(coefficients, list):
+            try:
+                weights = [float(value or 0.0) for value in coefficients]
+            except (TypeError, ValueError):
+                return None
+            if len(weights) != len(vector):
+                return None
+            intercept = float(payload.get("intercept", 0.0) or 0.0)
+            return intercept + sum(value * coefficient for value, coefficient in zip(vector, weights))
+
+        model_file = payload.get("model_file")
+        if not model_file:
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        model_type = str(payload.get("model_type") or "").lower()
+        if "sklearn" not in model_type and Path(str(model_file)).suffix.lower() not in {".joblib", ".pkl"}:
+            return None
+        try:
+            import joblib
+        except Exception:
+            self.last_fallback_reason = "joblib is not installed on the server, so uploaded sklearn model cannot run."
+            return None
+        try:
+            model = joblib.load(model_file)
+            prediction = model.predict([vector])
+        except Exception as exc:
+            self.last_fallback_reason = f"Model inference failed: {type(exc).__name__}: {exc}"
+            return None
+        try:
+            first = prediction[0]
+            if isinstance(first, (list, tuple)):
+                first = first[0]
+            return float(first)
+        except (TypeError, ValueError, IndexError):
+            self.last_fallback_reason = "Model prediction was not a numeric scalar."
+            return None
 
     def _confidence(self, predicted_return: float, required_edge: float) -> float:
         scale = abs(predicted_return) / max(required_edge * 4.0, 1e-9)

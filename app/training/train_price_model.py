@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,10 +19,11 @@ from app.training.export_dataset import export_dataset, parse_since_date
 def _load_dataset(path: Path, feature_columns: list[str]) -> tuple[np.ndarray, np.ndarray]:
     rows: list[list[float]] = []
     targets: list[float] = []
-    with path.open("r", newline="", encoding="utf-8") as handle:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            target = row.get("target_next_price_change")
+            target = row.get(settings.model_target) or row.get("target_next_price_change")
             if target in (None, ""):
                 continue
             rows.append([float(row.get(column) or 0.0) for column in feature_columns])
@@ -149,7 +151,7 @@ def train_price_model(
             path=str(model_path),
             parent_model_id=parent_model_id,
             checkpoint_path=str(from_checkpoint) if from_checkpoint else None,
-            status="trained",
+            status="candidate",
             metrics=payload["metrics"],
             raw_payload=payload,
         )

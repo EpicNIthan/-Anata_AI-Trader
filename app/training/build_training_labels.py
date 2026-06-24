@@ -94,6 +94,28 @@ def _build_values(
         first_exit = "stop_loss"
     else:
         first_exit = "none"
+    future_return_5m = _future_return(candles, current_index, horizons["5m"])
+    future_return_15m = _future_return(candles, current_index, horizons["15m"])
+    future_return_1h = _future_return(candles, current_index, horizons["1h"])
+    future_return_4h = _future_return(candles, current_index, horizons["4h"])
+    max_upside_1h = _safe_pct_change(max_future_high, entry_price)
+    max_drawdown_1h = _safe_pct_change(min_future_low, entry_price)
+    required_edge = settings.paper_fee_rate * 2.0 + settings.strategy_min_edge_after_fees
+    if future_return_15m > required_edge:
+        target_direction_15m = 1.0
+    elif future_return_15m < -required_edge:
+        target_direction_15m = -1.0
+    else:
+        target_direction_15m = 0.0
+    target_trade_quality_score = _clamp(
+        (future_return_15m / max(required_edge * 4.0, 1e-9)) * 0.45
+        + (max_upside_1h / max(settings.auto_default_take_profit_pct, 1e-9)) * 0.25
+        + (max_drawdown_1h / max(settings.auto_default_stop_loss_pct, 1e-9)) * 0.25
+        + (0.15 if first_exit == "take_profit" else 0.0)
+        - (0.20 if first_exit == "stop_loss" else 0.0),
+        -1.0,
+        1.0,
+    )
 
     values: dict[str, Any] = {
         "price_change": price_change,
@@ -127,14 +149,16 @@ def _build_values(
         "trader_crowd_score": 0.0,
         "crowd_risk_score": 0.0,
         "derivatives_recency_weight": 0.0,
-        "target_future_return_5m": _future_return(candles, current_index, horizons["5m"]),
-        "target_future_return_15m": _future_return(candles, current_index, horizons["15m"]),
-        "target_future_return_1h": _future_return(candles, current_index, horizons["1h"]),
-        "target_future_return_4h": _future_return(candles, current_index, horizons["4h"]),
-        "target_max_upside_1h": _safe_pct_change(max_future_high, entry_price),
-        "target_max_drawdown_1h": _safe_pct_change(min_future_low, entry_price),
+        "target_future_return_5m": future_return_5m,
+        "target_future_return_15m": future_return_15m,
+        "target_future_return_1h": future_return_1h,
+        "target_future_return_4h": future_return_4h,
+        "target_max_upside_1h": max_upside_1h,
+        "target_max_drawdown_1h": max_drawdown_1h,
         "target_stop_loss_hit_first": 1.0 if first_exit == "stop_loss" else 0.0,
         "target_take_profit_hit_first": 1.0 if first_exit == "take_profit" else 0.0,
+        "target_direction_15m": target_direction_15m,
+        "target_trade_quality_score": target_trade_quality_score,
     }
     values["final_ai_input"] = {
         "schema_version": CURRENT_FEATURE_SCHEMA_VERSION,

@@ -16,6 +16,8 @@ from app.training.dataset_accelerator import build_accelerated_dataset
 from app.training.export_dataset import parse_since_date
 from app.training.train_price_model import train_price_model
 
+SERVER_TRAINING_DISABLED_MESSAGE = "Server training is disabled. Download dataset and train locally."
+
 
 @dataclass
 class TrainingState:
@@ -40,6 +42,17 @@ class TrainingService:
         return self.state.as_dict()
 
     async def start(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not settings.enable_server_training:
+            self.state.running = False
+            self.state.status = "disabled"
+            self.state.finished_at = datetime.now(timezone.utc).isoformat()
+            self.state.last_error = None
+            self.state.last_result = {
+                "status": "disabled",
+                "message": SERVER_TRAINING_DISABLED_MESSAGE,
+                "allowed_server_actions": ["build_dataset", "export_dataset", "upload_model", "activate_model"],
+            }
+            return self.status()
         if self._task and not self._task.done():
             return self.status()
         self.state.running = True
@@ -73,6 +86,12 @@ class TrainingService:
 
 
 async def train_model_job(payload: dict[str, Any]) -> dict[str, Any]:
+    if not settings.enable_server_training:
+        return {
+            "status": "disabled",
+            "message": SERVER_TRAINING_DISABLED_MESSAGE,
+            "allowed_server_actions": ["build_dataset", "export_dataset", "upload_model", "activate_model"],
+        }
     build_dataset = bool(payload.get("build_dataset", False))
     dataset_path_value = payload.get("dataset_path")
     dataset_summary: dict[str, Any] | None = None
@@ -101,7 +120,10 @@ async def train_model_job(payload: dict[str, Any]) -> dict[str, Any]:
     if from_checkpoint_value == "latest":
         with SessionLocal() as session:
             latest = session.scalar(
-                select(ModelVersion).where(ModelVersion.status == "trained").order_by(desc(ModelVersion.created_at)).limit(1)
+                select(ModelVersion)
+                .where(ModelVersion.status.in_(["active", "candidate", "trained"]))
+                .order_by(desc(ModelVersion.created_at))
+                .limit(1)
             )
             from_checkpoint = Path(latest.path) if latest else None
     elif from_checkpoint_value:
@@ -134,7 +156,7 @@ async def train_model_job(payload: dict[str, Any]) -> dict[str, Any]:
             "feature_columns": model.feature_columns if model else None,
             "metrics": model.metrics if model else None,
             "path": model.path if model else str(model_path),
-            "status": model.status if model else "trained",
+            "status": model.status if model else "candidate",
             "created_at": model.created_at.isoformat() if model and model.created_at else None,
         }
 

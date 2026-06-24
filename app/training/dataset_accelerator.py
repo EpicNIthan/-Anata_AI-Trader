@@ -53,7 +53,7 @@ async def build_accelerated_dataset(
     )
     export_path = None
     if export:
-        output_path = Path("datasets") / f"accelerated_features_{started.strftime('%Y%m%d_%H%M%S')}.csv"
+        output_path = Path("datasets") / f"anata_dataset_{started.strftime('%Y%m%d_%H%M%S')}.csv.gz"
         export_path = export_dataset(
             output_path,
             feature_schema_version=CURRENT_FEATURE_SCHEMA_VERSION,

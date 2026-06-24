@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+import shutil
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
@@ -39,12 +43,12 @@ from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_sche
 from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
 from app.services.db_diagnostics import database_diagnostics
-from app.services.training_service import train_model_job
+from app.services.training_service import SERVER_TRAINING_DISABLED_MESSAGE, train_model_job
 from app.training.dataset_accelerator import build_accelerated_dataset
 from app.training.export_dataset import export_dataset, parse_since_date
 from app.trading.paper_engine import PaperEngine
 
-router = APIRouter(prefix="/api", tags=["lab"])
+router = APIRouter(prefix="/api", tags=["lab"], dependencies=[Depends(require_admin)])
 
 INSPECTOR_FEATURE_KEYS = [
     "sentiment_score",
@@ -274,6 +278,119 @@ def _training_service(request: Request):
     return service
 
 
+def _dataset_id_from_path(path: Path) -> str:
+    return path.name
+
+
+def _dataset_download_path(dataset_id: str) -> Path:
+    safe_name = Path(dataset_id).name
+    if safe_name != dataset_id or not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid dataset id")
+    path = Path("datasets") / safe_name
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return path
+
+
+def _model_payload(model: ModelVersion | None) -> dict[str, Any]:
+    if model is None:
+        return {"name": "none", "version": "untrained", "status": "missing"}
+    payload = model.raw_payload or {}
+    return {
+        "id": model.id,
+        "model_id": model.model_id,
+        "name": model.name,
+        "version": model.version,
+        "feature_schema_version": model.feature_schema_version,
+        "feature_columns": model.feature_columns or payload.get("feature_columns"),
+        "path": model.path,
+        "status": model.status,
+        "metrics": model.metrics or payload.get("metrics"),
+        "model_type": payload.get("model_type"),
+        "training_dataset_hash": payload.get("training_dataset_hash") or payload.get("dataset_hash"),
+        "created_at": _dt(model.created_at),
+        "raw_payload": payload,
+    }
+
+
+def _find_model_metadata(zip_file: zipfile.ZipFile) -> dict[str, Any]:
+    exact_metadata_names = [
+        name
+        for name in zip_file.namelist()
+        if Path(name).name.lower() in {"metadata.json", "model_metadata.json"}
+    ]
+    metadata_names = exact_metadata_names + [
+        name
+        for name in zip_file.namelist()
+        if name not in exact_metadata_names and Path(name).suffix.lower() == ".json"
+    ]
+    if not metadata_names:
+        raise HTTPException(status_code=400, detail="Model package must include metadata JSON")
+    for name in metadata_names:
+        try:
+            data = json.loads(zip_file.read(name).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            data["_metadata_file"] = name
+            return data
+    raise HTTPException(status_code=400, detail="Could not parse model metadata JSON")
+
+
+def _safe_zip_member_path(name: str) -> Path:
+    member = Path(name)
+    if member.is_absolute() or ".." in member.parts:
+        raise HTTPException(status_code=400, detail=f"Unsafe model package path: {name}")
+    return member
+
+
+def _save_uploaded_model_package(upload: UploadFile) -> dict[str, Any]:
+    settings.model_dir.mkdir(parents=True, exist_ok=True)
+    package_dir = settings.model_dir / "packages"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_filename = Path(upload.filename or f"model_package_{timestamp}.zip").name
+    if not safe_filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Model package must be a .zip file")
+    package_path = package_dir / f"{timestamp}_{safe_filename}"
+    with package_path.open("wb") as handle:
+        shutil.copyfileobj(upload.file, handle)
+
+    try:
+        with zipfile.ZipFile(package_path) as archive:
+            metadata = _find_model_metadata(archive)
+            model_file_hint = metadata.get("model_file") or metadata.get("model_path")
+            model_names = [
+                name
+                for name in archive.namelist()
+                if Path(name).suffix.lower() in {".joblib", ".pkl", ".json"} and name != metadata.get("_metadata_file")
+            ]
+            if model_file_hint:
+                hinted = str(model_file_hint)
+                if hinted in archive.namelist():
+                    model_names.insert(0, hinted)
+            model_member = next((name for name in model_names if Path(name).suffix.lower() in {".joblib", ".pkl"}), None)
+            model_member = model_member or next((name for name in model_names if Path(name).suffix.lower() == ".json"), None)
+            if not model_member:
+                raise HTTPException(status_code=400, detail="Model package must include a .joblib, .pkl, or .json model file")
+            member_path = _safe_zip_member_path(model_member)
+            version = str(metadata.get("version") or timestamp)
+            extract_dir = settings.model_dir / "uploaded" / version
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            output_path = extract_dir / member_path.name
+            with archive.open(model_member) as source, output_path.open("wb") as target:
+                shutil.copyfileobj(source, target)
+    except zipfile.BadZipFile as exc:
+        package_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Invalid model package zip") from exc
+
+    metadata["package_path"] = str(package_path)
+    metadata["model_file"] = str(output_path)
+    metadata.setdefault("version", timestamp)
+    metadata.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+    return metadata
+
+
 def _derivatives_snapshot(session: Session, worker_state: dict[str, Any] | None = None) -> dict[str, Any]:
     worker_state = worker_state or {}
     collector = BinanceDerivativesCollector()
@@ -368,7 +485,8 @@ def status(request: Request, session: Session = Depends(get_session)) -> dict[st
 def dashboard_summary(request: Request, session: Session = Depends(get_session)) -> dict[str, Any]:
     account = PaperEngine(session).snapshot()
     collectors = _worker_manager(request).snapshot()
-    latest_model = session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
+    active_model = session.scalar(select(ModelVersion).where(ModelVersion.status == "active").order_by(desc(ModelVersion.created_at)).limit(1))
+    latest_model = active_model or session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
     latest_training_run = session.scalar(select(TrainingRun).order_by(desc(TrainingRun.started_at)).limit(1))
     latest_decision = session.scalar(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(1))
     return {
@@ -382,12 +500,12 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
         "auto_trader": _auto_trader(request).status(),
         "trading": _trading_diagnostics(session),
         "sentiment_model": active_sentiment_model(),
-        "model": {
-            "model_id": latest_model.model_id if latest_model else None,
-            "name": latest_model.name if latest_model else "none",
-            "version": latest_model.version if latest_model else "untrained",
-            "feature_schema_version": latest_model.feature_schema_version if latest_model else CURRENT_FEATURE_SCHEMA_VERSION,
-            "status": latest_model.status if latest_model else "missing",
+        "model": _model_payload(latest_model)
+        | {
+            "server_training_enabled": settings.enable_server_training,
+            "server_inference_enabled": settings.enable_server_inference,
+            "training_disabled_message": SERVER_TRAINING_DISABLED_MESSAGE if not settings.enable_server_training else None,
+            "candidate_count": session.scalar(select(func.count(ModelVersion.id)).where(ModelVersion.status == "candidate")) or 0,
         },
         "training": {
             "last_run_at": _dt(latest_training_run.started_at if latest_training_run else None),
@@ -860,13 +978,25 @@ def training_export(
     since_date = parse_since_date(payload.get("since_date"))
     use_all_data = bool(payload.get("use_all_data", True))
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output_path = Path("datasets") / f"features_{timestamp}.csv"
+    output_path = Path("datasets") / f"anata_dataset_{timestamp}.csv.gz"
     exported_path = export_dataset(
         output_path,
         feature_schema_version=feature_schema_version,
         since_date=since_date,
         use_all_data=use_all_data,
     )
+    parquet_path: str | None = None
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("pyarrow"):
+            import pandas as pd
+
+            parquet_output = exported_path.with_suffix("").with_suffix(".parquet")
+            pd.read_csv(exported_path).to_parquet(parquet_output, index=False)
+            parquet_path = str(parquet_output)
+    except Exception:
+        parquet_path = None
     counts = {
         "candles": session.scalar(select(func.count(Candle.id))) or 0,
         "news_articles": session.scalar(select(func.count(NewsArticle.id))) or 0,
@@ -892,7 +1022,10 @@ def training_export(
     }
     latest_feature = session.scalar(select(Feature).order_by(desc(Feature.as_of)).limit(1))
     return {
+        "dataset_id": _dataset_id_from_path(exported_path),
         "exported_path": str(exported_path),
+        "download_url": f"/api/training/download/{_dataset_id_from_path(exported_path)}",
+        "parquet_path": parquet_path,
         "feature_schema_version": feature_schema_version,
         "since_date": since_date.isoformat() if since_date else None,
         "use_all_data": use_all_data,
@@ -901,6 +1034,12 @@ def training_export(
         "features_by_symbol": features_by_symbol,
         "latest_feature_at": _dt(latest_feature.as_of if latest_feature else None),
     }
+
+
+@router.get("/training/download/{dataset_id}")
+def training_download(dataset_id: str) -> FileResponse:
+    path = _dataset_download_path(dataset_id)
+    return FileResponse(path, filename=path.name, media_type="application/gzip" if path.suffix == ".gz" else "text/csv")
 
 
 @router.post("/training/build-dataset")
@@ -914,7 +1053,7 @@ async def training_build_dataset(
         symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
     if symbols is not None and not isinstance(symbols, list):
         raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
-    return await build_accelerated_dataset(
+    result = await build_accelerated_dataset(
         symbols=symbols,
         interval=str(payload.get("interval") or settings.paper_trade_timeframe),
         days=min(max(int(payload.get("days") or 14), 1), 365),
@@ -926,6 +1065,11 @@ async def training_build_dataset(
         mock=bool(payload.get("mock", False)),
         export=bool(payload.get("export", True)),
     )
+    if result.get("exported_path"):
+        dataset_path = Path(str(result["exported_path"]))
+        result["dataset_id"] = _dataset_id_from_path(dataset_path)
+        result["download_url"] = f"/api/training/download/{result['dataset_id']}"
+    return result
 
 
 @router.post("/training/train-model")
@@ -935,6 +1079,12 @@ async def training_train_model(
     _: None = Depends(require_admin),
 ) -> dict[str, Any]:
     payload = payload or {}
+    if not settings.enable_server_training:
+        return {
+            "status": "disabled",
+            "message": SERVER_TRAINING_DISABLED_MESSAGE,
+            "allowed_server_actions": ["build_dataset", "export_dataset", "upload_model", "activate_model"],
+        }
     symbols = payload.get("symbols")
     if isinstance(symbols, str):
         payload["symbols"] = [item.strip().upper() for item in symbols.split(",") if item.strip()]
@@ -1244,20 +1394,83 @@ def equity(session: Session = Depends(get_session), limit: int = 200) -> list[di
 
 @router.get("/models/latest")
 def latest_model(session: Session = Depends(get_session)) -> dict[str, Any]:
-    model = session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
-    if model is None:
-        return {"name": "none", "version": "untrained", "status": "missing"}
+    active_model = session.scalar(select(ModelVersion).where(ModelVersion.status == "active").order_by(desc(ModelVersion.created_at)).limit(1))
+    model = active_model or session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
+    return _model_payload(model)
+
+
+@router.get("/models")
+def list_models(session: Session = Depends(get_session), limit: int = 50) -> list[dict[str, Any]]:
+    rows = session.scalars(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(min(max(limit, 1), 200))).all()
+    return [_model_payload(row) for row in rows]
+
+
+@router.get("/models/active")
+def active_model(session: Session = Depends(get_session)) -> dict[str, Any]:
+    model = session.scalar(select(ModelVersion).where(ModelVersion.status == "active").order_by(desc(ModelVersion.created_at)).limit(1))
+    return _model_payload(model)
+
+
+@router.post("/models/upload")
+def upload_model(
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    metadata = _save_uploaded_model_package(file)
+    version = str(metadata.get("version") or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
+    model_id = str(metadata.get("model_id") or f"{metadata.get('model_type') or 'uploaded-model'}:{version}")
+    name = str(metadata.get("name") or metadata.get("model_type") or "uploaded-model")
+    feature_columns = metadata.get("feature_columns") or metadata.get("features") or columns_for_schema(metadata.get("feature_schema_version"))
+    if not isinstance(feature_columns, list):
+        raise HTTPException(status_code=400, detail="Model metadata feature_columns must be a list")
+    model = ModelVersion(
+        model_id=model_id,
+        name=name,
+        version=version,
+        feature_schema_version=str(metadata.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION),
+        feature_columns=[str(column) for column in feature_columns],
+        path=str(metadata.get("package_path") or metadata.get("model_file")),
+        parent_model_id=metadata.get("parent_model_id"),
+        checkpoint_path=metadata.get("checkpoint_path") or metadata.get("from_checkpoint"),
+        status="candidate",
+        metrics=metadata.get("metrics") if isinstance(metadata.get("metrics"), dict) else {},
+        raw_payload=metadata,
+    )
+    session.add(model)
+    session.commit()
+    session.refresh(model)
     return {
-        "model_id": model.model_id,
-        "name": model.name,
-        "version": model.version,
-        "feature_schema_version": model.feature_schema_version,
-        "feature_columns": model.feature_columns,
-        "path": model.path,
-        "status": model.status,
-        "metrics": model.metrics,
-        "created_at": _dt(model.created_at),
+        "status": "candidate",
+        "message": "Model uploaded and registered as candidate. Activate it explicitly after checking metrics.",
+        "model": _model_payload(model),
     }
+
+
+@router.post("/models/activate")
+def activate_model(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    payload = payload or {}
+    model: ModelVersion | None = None
+    if payload.get("id") is not None:
+        model = session.get(ModelVersion, int(payload["id"]))
+    elif payload.get("model_id"):
+        model = session.scalar(select(ModelVersion).where(ModelVersion.model_id == str(payload["model_id"])).order_by(desc(ModelVersion.created_at)).limit(1))
+    elif payload.get("version"):
+        model = session.scalar(select(ModelVersion).where(ModelVersion.version == str(payload["version"])).order_by(desc(ModelVersion.created_at)).limit(1))
+    else:
+        model = session.scalar(select(ModelVersion).where(ModelVersion.status == "candidate").order_by(desc(ModelVersion.created_at)).limit(1))
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    active_rows = session.scalars(select(ModelVersion).where(ModelVersion.status == "active", ModelVersion.id != model.id)).all()
+    for row in active_rows:
+        row.status = "inactive"
+    model.status = "active"
+    session.commit()
+    session.refresh(model)
+    return {"status": "active", "model": _model_payload(model)}
 
 
 @router.get("/models/predict")
@@ -1271,7 +1484,8 @@ def model_predict(
         return {
             "status": "missing",
             "symbol": symbol.upper(),
-            "message": "No trained model is available for prediction.",
+            "message": "No active compatible model is available for prediction; rule-based fallback will be used.",
+            "server_inference_enabled": settings.enable_server_inference,
         }
     return {
         "status": "ok",

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
+import json
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +48,10 @@ os.environ["GDELT_ENABLED"] = "false"
 os.environ["NEWSAPI_ENABLED"] = "false"
 os.environ["NEWS_API_KEY"] = ""
 os.environ["ENABLE_HF_SENTIMENT"] = "false"
+os.environ["ENABLE_SERVER_TRAINING"] = "false"
+os.environ["ENABLE_SERVER_INFERENCE"] = "true"
 os.environ["PAPER_START_BALANCE"] = "10000"
+os.environ["MODEL_DIR"] = "./_smoke_models"
 os.environ["DASHBOARD_USERNAME"] = "admin"
 os.environ["DASHBOARD_PASSWORD"] = "secret"
 sys.path.insert(0, str(ROOT))
@@ -57,6 +63,7 @@ from app.collectors.market_collector import BinanceMarketCollector
 from app.db.models import AiDecision, Candle, ExperienceRecord, ExternalDataEvent, Feature, LiveCandleUpdate, NewsArticle, NewsSentiment, TrainingFeature
 from app.db.session import engine
 from app.db.session import SessionLocal
+from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema
 from app.main import app
 
 
@@ -64,7 +71,8 @@ def main() -> None:
     db_path = Path("_smoke_trading_lab.db")
     exported_path: Path | None = None
     accelerated_exported_path: Path | None = None
-    trained_model_path: Path | None = None
+    uploaded_model_package: Path | None = None
+    uploaded_model_file: Path | None = None
     archive_paths: list[Path] = []
     if db_path.exists():
         db_path.unlink()
@@ -92,6 +100,8 @@ def main() -> None:
         health = client.get("/health")
         assert health.status_code == 200, health.text
         assert health.json()["status"] == "ok", health.text
+        blocked_api = client.get("/api/dashboard/summary")
+        assert blocked_api.status_code == 401, blocked_api.text
 
         blocked_dashboard = client.get("/dashboard")
         assert blocked_dashboard.status_code == 401, blocked_dashboard.text
@@ -160,7 +170,7 @@ def main() -> None:
         )
         assert short_trade.status_code == 200, short_trade.text
         assert short_trade.json()["status"] == "FILLED", short_trade.text
-        positions_after_short = client.get("/api/positions")
+        positions_after_short = client.get("/api/positions", auth=auth)
         assert positions_after_short.status_code == 200, positions_after_short.text
         open_short = [row for row in positions_after_short.json() if row["symbol"] == "BTCUSDT" and row["status"] == "OPEN"]
         assert open_short and open_short[0]["side"] == "SHORT", positions_after_short.text
@@ -180,7 +190,7 @@ def main() -> None:
         assert close_short.status_code == 200, close_short.text
         assert close_short.json()["status"] == "FILLED", close_short.text
 
-        experiences = client.get("/api/experiences")
+        experiences = client.get("/api/experiences", auth=auth)
         assert experiences.status_code == 200, experiences.text
         assert len(experiences.json()) >= 1, experiences.text
 
@@ -188,11 +198,11 @@ def main() -> None:
         assert news_run.status_code == 200, news_run.text
         assert "providers" in news_run.json(), news_run.text
         assert news_run.json()["rows_saved"] > 0, news_run.text
-        rss_latest = client.get("/api/news/latest?provider=rss")
+        rss_latest = client.get("/api/news/latest?provider=rss", auth=auth)
         assert rss_latest.status_code == 200, rss_latest.text
         assert rss_latest.json()[0]["provider"] == "rss", rss_latest.text
         assert "BTCUSDT" in rss_latest.json()[0]["affected_symbols"], rss_latest.text
-        sentiment_latest = client.get("/api/sentiment/latest")
+        sentiment_latest = client.get("/api/sentiment/latest", auth=auth)
         assert sentiment_latest.status_code == 200, sentiment_latest.text
         assert sentiment_latest.json()[0]["model_name"], sentiment_latest.text
         sentiment_reprocess = client.post("/api/sentiment/reprocess", json={"limit": 5, "reset_model": True}, auth=auth)
@@ -216,7 +226,7 @@ def main() -> None:
         assert news_count > 0
         assert sentiment_count > 0
 
-        collector_status = client.get("/api/collectors/status")
+        collector_status = client.get("/api/collectors/status", auth=auth)
         assert collector_status.status_code == 200, collector_status.text
         assert "derivatives" in collector_status.json(), collector_status.text
 
@@ -227,10 +237,10 @@ def main() -> None:
         )
         assert derivatives_run.status_code == 200, derivatives_run.text
         assert derivatives_run.json()["rows_saved"] >= 7, derivatives_run.text
-        derivatives_status = client.get("/api/derivatives/status")
+        derivatives_status = client.get("/api/derivatives/status", auth=auth)
         assert derivatives_status.status_code == 200, derivatives_status.text
         assert derivatives_status.json()["counts_by_type"]["funding_rate"] >= 1, derivatives_status.text
-        derivatives_latest = client.get("/api/derivatives/latest?symbol=BTCUSDT")
+        derivatives_latest = client.get("/api/derivatives/latest?symbol=BTCUSDT", auth=auth)
         assert derivatives_latest.status_code == 200, derivatives_latest.text
         assert len(derivatives_latest.json()) >= 1, derivatives_latest.text
 
@@ -262,13 +272,54 @@ def main() -> None:
             auth=auth,
         )
         assert train_model.status_code == 200, train_model.text
-        assert train_model.json()["status"] == "trained", train_model.text
-        assert train_model.json()["model"]["version"], train_model.text
-        trained_model_path = Path(train_model.json()["model_path"])
-        latest_model = client.get("/api/models/latest")
+        assert train_model.json()["status"] == "disabled", train_model.text
+        assert "Download dataset and train locally" in train_model.json()["message"], train_model.text
+
+        feature_columns = columns_for_schema(CURRENT_FEATURE_SCHEMA_VERSION)
+        uploaded_model_file = Path("_smoke_mock_model.json")
+        uploaded_model_package = Path("_smoke_model_package.zip")
+        uploaded_model_file.write_text(
+            json.dumps(
+                {
+                    "intercept": 0.01,
+                    "coefficients": [0.0 for _ in feature_columns],
+                    "feature_columns": feature_columns,
+                    "feature_schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
+                }
+            ),
+            encoding="utf-8",
+        )
+        metadata = {
+            "model_id": "smoke-linear:1",
+            "name": "smoke-linear",
+            "version": "smoke-1",
+            "model_type": "linear_json",
+            "model_file": uploaded_model_file.name,
+            "feature_schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
+            "feature_columns": feature_columns,
+            "metrics": {"directional_accuracy": 0.60, "net_return_after_fees": 0.01},
+            "training_dataset_hash": "smoke",
+        }
+        with zipfile.ZipFile(uploaded_model_package, "w") as package:
+            package.write(uploaded_model_file, uploaded_model_file.name)
+            package.writestr("metadata.json", json.dumps(metadata))
+        with uploaded_model_package.open("rb") as handle:
+            upload_model = client.post("/api/models/upload", files={"file": (uploaded_model_package.name, handle, "application/zip")}, auth=auth)
+        assert upload_model.status_code == 200, upload_model.text
+        assert upload_model.json()["model"]["status"] == "candidate", upload_model.text
+        models = client.get("/api/models", auth=auth)
+        assert models.status_code == 200, models.text
+        assert any(row["status"] == "candidate" for row in models.json()), models.text
+        activate = client.post("/api/models/activate", json={"model_id": "smoke-linear:1"}, auth=auth)
+        assert activate.status_code == 200, activate.text
+        assert activate.json()["model"]["status"] == "active", activate.text
+        active_model = client.get("/api/models/active", auth=auth)
+        assert active_model.status_code == 200, active_model.text
+        assert active_model.json()["status"] == "active", active_model.text
+        latest_model = client.get("/api/models/latest", auth=auth)
         assert latest_model.status_code == 200, latest_model.text
-        assert latest_model.json()["status"] == "trained", latest_model.text
-        model_prediction = client.get("/api/models/predict?symbol=BTCUSDT")
+        assert latest_model.json()["status"] == "active", latest_model.text
+        model_prediction = client.get("/api/models/predict?symbol=BTCUSDT", auth=auth)
         assert model_prediction.status_code == 200, model_prediction.text
         assert model_prediction.json()["status"] == "ok", model_prediction.text
         assert "predicted_return" in model_prediction.json()["prediction"], model_prediction.text
@@ -311,26 +362,26 @@ def main() -> None:
             assert len(live_rows) == 1
             assert live_rows[0].update_count == 2
 
-        market_status = client.get("/api/market/status")
+        market_status = client.get("/api/market/status", auth=auth)
         assert market_status.status_code == 200, market_status.text
         assert market_status.json()["candle_count"] > 0, market_status.text
-        db_diagnostics = client.get("/api/db/diagnostics")
+        db_diagnostics = client.get("/api/db/diagnostics", auth=auth)
         assert db_diagnostics.status_code == 200, db_diagnostics.text
         assert db_diagnostics.json()["candles"]["closed_training_rows"] > 0, db_diagnostics.text
         assert db_diagnostics.json()["candles"]["live_update_rows"] == 1, db_diagnostics.text
         assert db_diagnostics.json()["candles"]["duplicate_group_count"] == 0, db_diagnostics.text
-        candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5")
+        candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5", auth=auth)
         assert candles.status_code == 200, candles.text
         assert len(candles.json()) > 0, candles.text
-        candles_5m = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=5m&limit=5")
+        candles_5m = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=5m&limit=5", auth=auth)
         assert candles_5m.status_code == 200, candles_5m.text
         assert len(candles_5m.json()) > 0, candles_5m.text
         assert candles_5m.json()[-1]["source_name"] == "aggregated_from_1m", candles_5m.text
-        candles_1s = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1s&limit=5")
+        candles_1s = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1s&limit=5", auth=auth)
         assert candles_1s.status_code == 200, candles_1s.text
         assert len(candles_1s.json()) > 0, candles_1s.text
         assert candles_1s.json()[-1]["source_name"] in {"1m_live_fallback", "binance_kline_live"}, candles_1s.text
-        summary = client.get("/api/dashboard/summary")
+        summary = client.get("/api/dashboard/summary", auth=auth)
         assert summary.status_code == 200, summary.text
         assert summary.json()["sentiment_model"]["active_model"], summary.text
 
@@ -346,7 +397,7 @@ def main() -> None:
 
         auto_status = {}
         for _ in range(20):
-            auto_status = client.get("/api/auto-trader/status").json()
+            auto_status = client.get("/api/auto-trader/status", auth=auth).json()
             if auto_status.get("cycles", 0) >= 1:
                 break
             time.sleep(0.25)
@@ -354,10 +405,10 @@ def main() -> None:
         assert auto_status.get("last_run_at"), auto_status
         assert auto_status.get("exploration_enabled") is True, auto_status
         assert auto_status.get("position_management", {}).get("min_hold_seconds", 0) > 0, auto_status
-        decisions = client.get("/api/ai-decisions")
+        decisions = client.get("/api/ai-decisions", auth=auth)
         assert decisions.status_code == 200, decisions.text
         assert decisions.json()[0]["decision_source"] in {"exploration", "model", "position-management", "risk-exit", "strategy"}, decisions.text
-        summary_after_auto = client.get("/api/dashboard/summary")
+        summary_after_auto = client.get("/api/dashboard/summary", auth=auth)
         assert summary_after_auto.status_code == 200, summary_after_auto.text
         trading_counts = summary_after_auto.json()["trading"]
         assert (
@@ -376,7 +427,7 @@ def main() -> None:
         assert latest_feature is not None
         assert (latest_feature.payload or {}).get("values", {}).get("candles_used", 0) > 0
         assert (latest_feature.payload or {}).get("values", {}).get("last_close") is not None
-        feature_latest = client.get("/api/features/latest?symbol=BTCUSDT")
+        feature_latest = client.get("/api/features/latest?symbol=BTCUSDT", auth=auth)
         assert feature_latest.status_code == 200, feature_latest.text
         feature_payload = feature_latest.json()
         assert feature_payload["symbol"] == "BTCUSDT", feature_latest.text
@@ -410,7 +461,11 @@ def main() -> None:
         export = client.post("/api/training/export", json={"use_all_data": True}, auth=auth)
         assert export.status_code == 200, export.text
         assert export.json()["counts"]["features"] > 0, export.text
+        assert export.json()["dataset_id"].endswith(".csv.gz"), export.text
         exported_path = Path(export.json()["exported_path"])
+        download = client.get(export.json()["download_url"], auth=auth)
+        assert download.status_code == 200, download.text
+        assert len(download.content) > 0, export.text
 
         auto_stop = client.post("/api/auto-trader/stop", auth=auth)
         assert auto_stop.status_code == 200, auto_stop.text
@@ -429,8 +484,13 @@ def main() -> None:
         exported_path.unlink()
     if accelerated_exported_path and accelerated_exported_path.exists():
         accelerated_exported_path.unlink()
-    if trained_model_path and trained_model_path.exists():
-        trained_model_path.unlink()
+    if uploaded_model_file and uploaded_model_file.exists():
+        uploaded_model_file.unlink()
+    if uploaded_model_package and uploaded_model_package.exists():
+        uploaded_model_package.unlink()
+    smoke_model_dir = Path("_smoke_models")
+    if smoke_model_dir.exists():
+        shutil.rmtree(smoke_model_dir)
     for archive_path in archive_paths:
         if archive_path.exists():
             archive_path.unlink()

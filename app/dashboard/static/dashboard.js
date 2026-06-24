@@ -234,7 +234,10 @@
       setText("trainingNewsCount", number(data.counts?.news, 0));
       setText("trainingExperienceCount", number(data.counts?.experiences, 0));
       setText("trainingModelVersion", data.model?.version || "untrained");
+      setText("trainingModelStatus", data.model?.status || "missing");
+      setText("candidateModelCount", number(data.model?.candidate_count, 0));
       setText("featureSchema", data.model?.feature_schema_version || "-");
+      setText("modelFallbackReason", data.auto_trader?.model_fallback_reason || "-");
       const trainingWorker = data.training?.worker || {};
       if (trainingWorker.running) {
         setText("lastTrainingRun", `running since ${when(trainingWorker.started_at)}`);

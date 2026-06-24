@@ -12,10 +12,14 @@ logger = logging.getLogger(__name__)
 
 POSITIVE_WORDS = {
     "adoption",
+    "approved",
     "approval",
     "beat",
     "bull",
     "bullish",
+    "clarity",
+    "cuts",
+    "denies",
     "growth",
     "inflow",
     "partnership",
@@ -28,15 +32,21 @@ NEGATIVE_WORDS = {
     "ban",
     "bear",
     "bearish",
+    "bankruptcy",
     "crash",
     "decline",
+    "depeg",
+    "delayed",
     "drop",
     "exploit",
     "hack",
+    "halts",
     "lawsuit",
+    "liquidation",
     "outflow",
     "probe",
     "selloff",
+    "sues",
 }
 RISK_WORDS = {
     "bankruptcy",
@@ -58,7 +68,33 @@ RISK_WORDS = {
     "war",
 }
 RISK_PHRASES = {
+    "bridge drained",
+    "etf delayed",
+    "fed hikes",
+    "liquidation cascade",
+    "sec lawsuit",
+    "stablecoin depeg",
     "withdrawal halt",
+    "withdrawals halted",
+}
+POSITIVE_PHRASES = {
+    "etf approved",
+    "fed cuts",
+    "regulatory clarity",
+    "spot etf approved",
+}
+NEGATIVE_PHRASES = {
+    "bankruptcy filing",
+    "bridge exploit",
+    "exchange hack",
+    "sec sues",
+}
+RISK_REDUCING_PHRASES = {
+    "denies hack",
+    "false rumor",
+    "hack rumor denied",
+    "no hack",
+    "not hacked",
 }
 TOPIC_KEYWORDS = {
     "regulation": {"sec", "etf", "regulation", "lawsuit", "court", "ban"},
@@ -110,7 +146,14 @@ def _keyword_analysis(text: str) -> tuple[float, float, list[str], list[str]]:
     negative = len(tokens & NEGATIVE_WORDS)
     risk_hits = len(tokens & RISK_WORDS)
     lowered = text.lower()
+    positive += sum(2 for phrase in POSITIVE_PHRASES if phrase in lowered)
+    negative += sum(2 for phrase in NEGATIVE_PHRASES if phrase in lowered)
     risk_hits += sum(1 for phrase in RISK_PHRASES if phrase in lowered)
+    risk_reducers = sum(1 for phrase in RISK_REDUCING_PHRASES if phrase in lowered)
+    if risk_reducers:
+        negative = max(0, negative - risk_reducers * 2)
+        risk_hits = max(0, risk_hits - risk_reducers * 2)
+        positive += risk_reducers
 
     sentiment_score = _clamp((positive - negative) / max(positive + negative, 1), -1.0, 1.0)
     risk_score = _clamp(risk_hits / 4.0, 0.0, 1.0)
@@ -193,6 +236,9 @@ def analyze_news(text: str) -> SentimentResult:
             **raw_model,
             "risk_overlay_words": sorted(_tokens(text) & RISK_WORDS),
             "risk_overlay_phrases": [phrase for phrase in RISK_PHRASES if phrase in text.lower()],
+            "positive_phrases": [phrase for phrase in POSITIVE_PHRASES if phrase in text.lower()],
+            "negative_phrases": [phrase for phrase in NEGATIVE_PHRASES if phrase in text.lower()],
+            "risk_reducing_phrases": [phrase for phrase in RISK_REDUCING_PHRASES if phrase in text.lower()],
             "active_model": active_sentiment_model(),
         },
     )

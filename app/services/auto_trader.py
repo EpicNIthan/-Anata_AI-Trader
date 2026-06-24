@@ -39,6 +39,7 @@ class AutoTraderState:
     last_skip_reason: str | None = None
     last_decision: dict[str, Any] | None = None
     model_strategy_enabled: bool = False
+    model_fallback_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -170,7 +171,12 @@ class AutoTraderService:
             store=True,
         )
         fallback_decision = RuleBasedStrategy().decide(feature)
-        model_decision = PriceModelStrategy().decide(session, feature) if settings.auto_trader_use_trained_model else None
+        model_strategy = PriceModelStrategy()
+        model_decision = model_strategy.decide(session, feature) if settings.auto_trader_use_trained_model else None
+        if settings.auto_trader_use_trained_model and model_decision is None:
+            self.state.model_fallback_reason = model_strategy.last_fallback_reason
+        elif model_decision:
+            self.state.model_fallback_reason = None
         base_decision = model_decision.decision if model_decision else fallback_decision
         base_source = "model" if model_decision else "strategy"
         decision, decision_source = self._maybe_explore(session, symbol, base_decision, base_source)
@@ -225,6 +231,7 @@ class AutoTraderService:
             "strategy_action": fallback_decision.action,
             "model_action": model_decision.decision.action if model_decision else None,
             "model_version_id": model_decision.model.id if model_decision else None,
+            "model_fallback_reason": self.state.model_fallback_reason,
             **execution,
         }
 
@@ -307,6 +314,7 @@ class AutoTraderService:
                 "base_decision": base_decision.model_dump(),
                 "strategy_decision": strategy_decision.model_dump(),
                 "model_prediction": model_decision.prediction if model_decision else None,
+                "model_fallback_reason": self.state.model_fallback_reason if model_decision is None else None,
                 "exploration": {
                     "enabled": settings.exploration_mode,
                     "rate": settings.exploration_rate,

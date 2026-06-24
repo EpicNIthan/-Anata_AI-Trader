@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +24,8 @@ TARGET_COLUMNS = [
     "target_max_drawdown_1h",
     "target_stop_loss_hit_first",
     "target_take_profit_hit_first",
+    "target_direction_15m",
+    "target_trade_quality_score",
 ]
 
 
@@ -81,12 +85,14 @@ def export_dataset(
                 "feature_schema_version": feature.schema_version or feature_schema_version,
                 "trend": values.get("trend") or "sideways",
                 "target_next_price_change": target,
+                "final_ai_input": json.dumps(payload_values.get("final_ai_input") or {}, separators=(",", ":")),
                 **{column: values.get(column, 0.0) for column in feature_columns},
                 **{column: payload_values.get(column, "") for column in TARGET_COLUMNS},
             }
         )
 
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
+    opener = gzip.open if output_path.suffix == ".gz" else open
+    with opener(output_path, "wt", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
@@ -96,6 +102,7 @@ def export_dataset(
                 "as_of",
                 "feature_schema_version",
                 "trend",
+                "final_ai_input",
                 *feature_columns,
                 "target_next_price_change",
                 *TARGET_COLUMNS,
@@ -114,7 +121,7 @@ def main() -> None:
     parser.add_argument("--use-all-data", action="store_true")
     args = parser.parse_args()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output = args.output or Path("datasets") / f"features_{timestamp}.csv"
+    output = args.output or Path("datasets") / f"anata_dataset_{timestamp}.csv.gz"
     path = export_dataset(
         output,
         feature_schema_version=args.feature_schema_version,
