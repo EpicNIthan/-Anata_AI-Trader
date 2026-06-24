@@ -413,6 +413,63 @@ td a {
   padding: 10px;
 }
 
+.feature-inspector {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 8px;
+}
+
+.feature-card {
+  min-width: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  padding: 10px;
+}
+
+.feature-json-card {
+  grid-column: 1 / -1;
+}
+
+.feature-table td:first-child {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.feature-table td:last-child {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.news-context-list {
+  display: grid;
+  gap: 8px;
+}
+
+.news-context-item {
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 8px;
+}
+
+.news-context-item strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.news-context-item p {
+  margin: 0 0 6px;
+  color: #b7c0ca;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+.news-context-item span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .diagnostics-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -434,8 +491,13 @@ td a {
 @media (max-width: 1100px) {
   .metrics-strip,
   .training-grid,
+  .feature-inspector,
   .diagnostics-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .feature-json-card {
+    grid-column: 1 / -1;
   }
 
   .trading-grid {
@@ -451,6 +513,7 @@ td a {
 
   .metrics-strip,
   .training-grid,
+  .feature-inspector,
   .diagnostics-grid {
     grid-template-columns: 1fr;
   }

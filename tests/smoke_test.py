@@ -208,6 +208,15 @@ def main() -> None:
         assert latest_feature is not None
         assert (latest_feature.payload or {}).get("values", {}).get("candles_used", 0) > 0
         assert (latest_feature.payload or {}).get("values", {}).get("last_close") is not None
+        feature_latest = client.get("/api/features/latest?symbol=BTCUSDT")
+        assert feature_latest.status_code == 200, feature_latest.text
+        feature_payload = feature_latest.json()
+        assert feature_payload["symbol"] == "BTCUSDT", feature_latest.text
+        assert feature_payload["schema_version"] == "price-news-v2", feature_latest.text
+        assert "sentiment_confidence" in feature_payload["vector"], feature_latest.text
+        assert "candle_return_1m" in feature_payload["vector"], feature_latest.text
+        assert "final_ai_input" in feature_payload, feature_latest.text
+        assert "strategy_input" in feature_payload["final_ai_input"], feature_latest.text
 
         export = client.post("/api/training/export", json={"use_all_data": True}, auth=auth)
         assert export.status_code == 200, export.text

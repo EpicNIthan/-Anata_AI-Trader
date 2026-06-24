@@ -31,13 +31,29 @@ from app.db.models import (
 )
 from app.db.session import get_session
 from app.features.feature_builder import FeatureBuilder
-from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION
+from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, values_from_feature
 from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
 from app.training.export_dataset import export_dataset, parse_since_date
 from app.trading.paper_engine import PaperEngine
 
 router = APIRouter(prefix="/api", tags=["lab"])
+
+INSPECTOR_FEATURE_KEYS = [
+    "sentiment_score",
+    "sentiment_confidence",
+    "risk_score",
+    "impact_score",
+    "recency_weight",
+    "btc_related",
+    "eth_related",
+    "macro_related",
+    "candle_return_1m",
+    "candle_return_5m",
+    "volatility",
+    "volume_change",
+    "trend_score",
+]
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -653,6 +669,78 @@ def data_events(session: Session = Depends(get_session), limit: int = 50) -> lis
         }
         for row in rows
     ]
+
+
+@router.get("/features/latest")
+def latest_feature(
+    session: Session = Depends(get_session),
+    symbol: str = "BTCUSDT",
+    refresh_if_missing: bool = True,
+) -> dict[str, Any]:
+    normalized_symbol = symbol.upper()
+    feature = session.scalar(
+        select(Feature)
+        .where(Feature.symbol == normalized_symbol)
+        .order_by(desc(Feature.as_of))
+        .limit(1)
+    )
+    values = (feature.payload or {}).get("values", {}) if feature else {}
+    persisted = feature is not None
+    if refresh_if_missing and (feature is None or any(key not in values for key in INSPECTOR_FEATURE_KEYS)):
+        feature = FeatureBuilder(session).build_for_symbol(normalized_symbol, store=False)
+        values = (feature.payload or {}).get("values", {})
+        persisted = False
+    if feature is None:
+        return {
+            "symbol": normalized_symbol,
+            "status": "missing",
+            "message": "No feature rows found for this symbol.",
+            "vector": {key: 0.0 for key in INSPECTOR_FEATURE_KEYS},
+            "final_ai_input": {},
+            "news_context": [],
+        }
+
+    payload = feature.payload or {}
+    metadata = payload.get("metadata", {})
+    vector = {key: values.get(key, 0.0) for key in INSPECTOR_FEATURE_KEYS}
+    strategy_columns = ["price_change", "sentiment_score", "risk_score", "volatility"]
+    strategy_values = values_from_feature(feature, strategy_columns)
+    final_ai_input = values.get("final_ai_input") or {
+        "schema_version": feature.schema_version or payload.get("schema_version") or CURRENT_FEATURE_SCHEMA_VERSION,
+        "symbol": normalized_symbol,
+        "timeframe": metadata.get("interval"),
+        "feature_columns": columns_for_schema(feature.schema_version),
+        "vector": vector,
+        "strategy_input": {key: strategy_values.get(key, 0.0) for key in strategy_columns} | {
+            "trend": strategy_values.get("trend")
+        },
+    }
+    return {
+        "id": feature.id,
+        "persisted": persisted,
+        "status": "ok",
+        "symbol": feature.symbol,
+        "schema_version": feature.schema_version,
+        "as_of": _dt(feature.as_of),
+        "timeframe": metadata.get("interval"),
+        "vector": vector,
+        "sentiment_score": vector["sentiment_score"],
+        "sentiment_confidence": vector["sentiment_confidence"],
+        "risk_score": vector["risk_score"],
+        "impact_score": vector["impact_score"],
+        "recency_weight": vector["recency_weight"],
+        "btc_related": vector["btc_related"],
+        "eth_related": vector["eth_related"],
+        "macro_related": vector["macro_related"],
+        "candle_return_1m": vector["candle_return_1m"],
+        "candle_return_5m": vector["candle_return_5m"],
+        "volatility": vector["volatility"],
+        "volume_change": vector["volume_change"],
+        "trend_score": vector["trend_score"],
+        "final_ai_input": final_ai_input,
+        "news_context": metadata.get("news_context", []),
+        "raw_payload": payload,
+    }
 
 
 @router.get("/experiences")

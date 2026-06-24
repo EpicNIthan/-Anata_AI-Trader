@@ -5,7 +5,7 @@ from typing import Any
 
 from app.db.models import Feature
 
-CURRENT_FEATURE_SCHEMA_VERSION = "price-news-v1"
+CURRENT_FEATURE_SCHEMA_VERSION = "price-news-v2"
 
 FEATURE_COLUMNS_BY_SCHEMA: dict[str, list[str]] = {
     "price-news-v1": [
@@ -15,6 +15,21 @@ FEATURE_COLUMNS_BY_SCHEMA: dict[str, list[str]] = {
         "sentiment_score",
         "risk_score",
     ],
+    "price-news-v2": [
+        "sentiment_score",
+        "sentiment_confidence",
+        "risk_score",
+        "impact_score",
+        "recency_weight",
+        "btc_related",
+        "eth_related",
+        "macro_related",
+        "candle_return_1m",
+        "candle_return_5m",
+        "volatility",
+        "volume_change",
+        "trend_score",
+    ],
 }
 
 DEFAULT_FEATURE_VALUES: dict[str, float | None] = {
@@ -22,7 +37,16 @@ DEFAULT_FEATURE_VALUES: dict[str, float | None] = {
     "volume_change": 0.0,
     "volatility": 0.0,
     "sentiment_score": 0.0,
+    "sentiment_confidence": 0.0,
     "risk_score": 0.0,
+    "impact_score": 0.0,
+    "recency_weight": 0.0,
+    "btc_related": 0.0,
+    "eth_related": 0.0,
+    "macro_related": 0.0,
+    "candle_return_1m": 0.0,
+    "candle_return_5m": 0.0,
+    "trend_score": 0.0,
     "last_close": None,
     "candles_used": 0.0,
     "sentiment_articles_used": 0.0,
@@ -82,7 +106,14 @@ def values_from_feature(feature: Feature | dict[str, Any], feature_columns: list
     output: dict[str, Any] = {}
     for column in columns:
         output[column] = values.get(column, DEFAULT_FEATURE_VALUES.get(column, 0.0))
-    for optional_key in ("trend", "last_close", "candles_used", "sentiment_articles_used"):
+    for optional_key in (
+        "trend",
+        "last_close",
+        "candles_used",
+        "sentiment_articles_used",
+        "price_change",
+        "final_ai_input",
+    ):
         output.setdefault(optional_key, values.get(optional_key, DEFAULT_FEATURE_VALUES.get(optional_key)))
     output["schema_version"] = schema_version
     return output
@@ -95,4 +126,3 @@ def numeric_vector(feature: Feature | dict[str, Any], feature_columns: list[str]
         value = values.get(column, DEFAULT_FEATURE_VALUES.get(column, 0.0))
         vector.append(float(value or 0.0))
     return vector
-

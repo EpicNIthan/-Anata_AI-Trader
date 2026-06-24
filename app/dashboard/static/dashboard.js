@@ -13,6 +13,21 @@
     chartRequestId: 0,
     resizeObserver: null,
   };
+  const featureFields = [
+    ["sentiment_score", "sentiment_score"],
+    ["sentiment_confidence", "sentiment_confidence"],
+    ["risk_score", "risk_score"],
+    ["impact_score", "impact_score"],
+    ["recency_weight", "recency_weight"],
+    ["btc_related", "btc_related"],
+    ["eth_related", "eth_related"],
+    ["macro_related", "macro_related"],
+    ["candle_return_1m", "candle_return_1m"],
+    ["candle_return_5m", "candle_return_5m"],
+    ["volatility", "volatility"],
+    ["volume_change", "volume_change"],
+    ["trend_score", "trend_score"],
+  ];
 
   const $ = (id) => document.getElementById(id);
   const money = (value, digits = 2) => Number.isFinite(Number(value)) ? `$${Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}` : "-";
@@ -20,6 +35,7 @@
   const pct = (value, digits = 2) => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(digits)}%` : "-";
   const when = (value) => value ? new Date(value).toLocaleString() : "-";
   const cls = (value) => Number(value) >= 0 ? "positive" : "negative";
+  const featureValue = (value) => Number.isFinite(Number(value)) ? Number(value).toFixed(6) : escapeHtml(value ?? "-");
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
     "<": "&lt;",
@@ -270,9 +286,44 @@
     `).join("") || `<tr><td colspan="8" class="empty">No sentiment</td></tr>`;
   }
 
+  async function refreshFeatures() {
+    const body = $("featureVectorBody");
+    if (!body) return;
+    try {
+      const data = await api(`/api/features/latest?symbol=${encodeURIComponent(state.symbol)}`);
+      const vector = data.vector || {};
+      setText("featureInspectorTitle", `AI Feature Inspector · ${data.symbol || state.symbol}`);
+      setText("featureInspectorStatus", `${data.schema_version || "-"} · ${data.persisted ? "stored" : "preview"}`);
+      setClass("featureInspectorStatus", "");
+      body.innerHTML = featureFields.map(([key, label]) => `
+        <tr><td>${escapeHtml(label)}</td><td>${featureValue(vector[key])}</td></tr>
+      `).join("");
+
+      const finalInput = data.final_ai_input || {};
+      const json = $("featureJson");
+      if (json) json.textContent = JSON.stringify(finalInput, null, 2);
+
+      const context = data.news_context || [];
+      const newsBox = $("featureNewsContext");
+      if (newsBox) {
+        newsBox.innerHTML = context.length ? context.map((item) => `
+          <div class="news-context-item">
+            <strong>${escapeHtml(item.title || "-")}</strong>
+            <p>${escapeHtml(item.text || "")}</p>
+            <span>${escapeHtml(item.provider || "-")} / ${escapeHtml(item.source || "-")} / ${when(item.published_at)}</span>
+            <span>sentiment ${featureValue(item.sentiment_score)} · confidence ${featureValue(item.sentiment_confidence)} · risk ${featureValue(item.risk_score)}</span>
+          </div>
+        `).join("") : `<div class="empty">No recent news context used for this symbol</div>`;
+      }
+    } catch (error) {
+      setText("featureInspectorStatus", `Error: ${error.message}`);
+      setClass("featureInspectorStatus", "warning");
+    }
+  }
+
   async function refreshHeavy() {
     try {
-      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment()]);
+      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures()]);
     } catch (error) {
       console.warn("table refresh failed", error);
     }
@@ -341,6 +392,7 @@
       document.querySelectorAll("[data-market-symbol]").forEach((item) => item.classList.toggle("active", item.dataset.marketSymbol === state.symbol));
       requestChartReload(`Loading ${state.symbol} ${state.timeframe}`);
       refreshChart();
+      refreshFeatures();
     });
     document.querySelectorAll("[data-market-symbol]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -350,6 +402,7 @@
         document.querySelectorAll("[data-market-symbol]").forEach((item) => item.classList.toggle("active", item === button));
         requestChartReload(`Loading ${state.symbol} ${state.timeframe}`);
         refreshChart();
+        refreshFeatures();
       });
     });
     $("newsProviderFilter")?.addEventListener("change", refreshNews);

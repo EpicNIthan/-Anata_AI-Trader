@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Anata AI Trader</title>
-    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v3">
+    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v4">
     <script defer src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
       window.DASHBOARD_CONFIG = {
@@ -134,6 +134,7 @@
           <button data-tab="trades">Trade History</button>
           <button data-tab="decisions">AI Decisions</button>
           <button data-tab="news">News</button>
+          <button data-tab="features">AI Features</button>
           <button data-tab="sentiment">Sentiment</button>
           <button data-tab="training">Training</button>
           <button data-tab="diagnostics">Logs / Diagnostics</button>
@@ -175,6 +176,34 @@
           </table>
         </section>
 
+        <section id="tab-features" class="tab-panel">
+          <div class="feature-inspector">
+            <div class="feature-card">
+              <div class="panel-head">
+                <h2 id="featureInspectorTitle">AI Feature Inspector</h2>
+                <span id="featureInspectorStatus">Loading</span>
+              </div>
+              <table class="feature-table">
+                <tbody id="featureVectorBody"><tr><td class="empty">Loading</td></tr></tbody>
+              </table>
+            </div>
+            <div class="feature-card">
+              <div class="panel-head">
+                <h2>Human News Context</h2>
+                <span>latest used by features</span>
+              </div>
+              <div id="featureNewsContext" class="news-context-list"></div>
+            </div>
+            <div class="feature-card feature-json-card">
+              <div class="panel-head">
+                <h2>final_ai_input JSON</h2>
+                <span>model-ready payload</span>
+              </div>
+              <pre id="featureJson" class="log-box"></pre>
+            </div>
+          </div>
+        </section>
+
         <section id="tab-sentiment" class="tab-panel">
           <table>
             <thead><tr><th>Time</th><th>Model</th><th>Label</th><th>Confidence</th><th>Sentiment</th><th>Risk</th><th>Topics</th><th>Title</th></tr></thead>
@@ -206,6 +235,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v3"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v4"></script>
   </body>
 </html>
