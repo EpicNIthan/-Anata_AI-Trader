@@ -8,7 +8,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db.models import Candle, Feature, NewsArticle, NewsSentiment
+from app.db.models import Candle, Feature, NewsArticle, NewsSentiment, TrainingFeature
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, feature_payload
 
 
@@ -198,6 +198,18 @@ class FeatureBuilder:
         )
         if store:
             self.session.add(feature)
+            self.session.flush()
+            self.session.add(
+                TrainingFeature(
+                    source_feature_id=feature.id,
+                    symbol=feature.symbol,
+                    schema_version=feature.schema_version,
+                    source_name=feature.source_name,
+                    as_of=feature.as_of,
+                    feature_values=payload.get("values", {}),
+                    payload=payload,
+                )
+            )
             self.session.commit()
             self.session.refresh(feature)
         return feature

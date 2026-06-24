@@ -336,7 +336,8 @@
     if (!output) return;
     try {
       const data = await api("/api/db/diagnostics");
-      output.textContent = JSON.stringify(data, null, 2);
+      const lifecycle = await api("/api/db/lifecycle/status");
+      output.textContent = JSON.stringify({ ...data, lifecycle }, null, 2);
     } catch (error) {
       output.textContent = `DB diagnostics error: ${error.message}`;
     }
@@ -383,8 +384,8 @@
     sendSignal(payload).catch((error) => setText("signalResult", `Error: ${error.message}`));
   }
 
-  async function exportDataset() {
-    const output = $("exportResult");
+  async function exportDataset(outputId = "exportResult") {
+    const output = $(outputId) || $("exportResult") || $("dbActionResult");
     if (output) output.textContent = "Exporting...";
     try {
       const data = await api("/api/training/export", {
@@ -395,6 +396,35 @@
       if (output) output.textContent = JSON.stringify(data, null, 2);
     } catch (error) {
       if (output) output.textContent = `Export failed: ${error.message}`;
+    }
+  }
+
+  async function runCleanup() {
+    const output = $("dbActionResult");
+    if (output) output.textContent = "Cleaning...";
+    try {
+      const data = await api("/api/db/cleanup", { method: "POST" });
+      if (output) output.textContent = `Cleanup done: ${JSON.stringify(data.last_cleanup?.deleted || {})}`;
+      await refreshDbDiagnostics();
+      await refreshSummary();
+    } catch (error) {
+      if (output) output.textContent = `Cleanup failed: ${error.message}`;
+    }
+  }
+
+  async function archiveData() {
+    const output = $("dbActionResult");
+    if (output) output.textContent = "Archiving...";
+    try {
+      const data = await api("/api/db/archive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tables: ["candles", "training_features", "experience_buffer"], delete_after_archive: false }),
+      });
+      if (output) output.textContent = `Archive done: ${(data.exports || []).map((item) => item.path).join(", ") || "no rows"}`;
+      await refreshDbDiagnostics();
+    } catch (error) {
+      if (output) output.textContent = `Archive failed: ${error.message}`;
     }
   }
 
@@ -428,7 +458,10 @@
     });
     $("newsProviderFilter")?.addEventListener("change", refreshNews);
     $("signalForm")?.addEventListener("submit", submitSignal);
-    $("exportDatasetButton")?.addEventListener("click", exportDataset);
+    $("exportDatasetButton")?.addEventListener("click", () => exportDataset("exportResult"));
+    $("exportDatasetDiagnosticsButton")?.addEventListener("click", () => exportDataset("dbActionResult"));
+    $("runCleanupButton")?.addEventListener("click", runCleanup);
+    $("archiveDataButton")?.addEventListener("click", archiveData);
     document.querySelectorAll("[data-worker]").forEach((button) => button.addEventListener("click", () => collectorAction(button.dataset.worker, button.dataset.action)));
     document.querySelectorAll("[data-auto-trader]").forEach((button) => button.addEventListener("click", () => autoTraderAction(button.dataset.autoTrader)));
     document.querySelectorAll("[data-tab]").forEach((button) => {

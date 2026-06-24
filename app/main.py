@@ -14,6 +14,7 @@ from app.dashboard.routes import router as dashboard_router
 from app.db.session import create_db_and_tables, ping_database
 from app.logging_config import setup_logging
 from app.services.auto_trader import AutoTraderService
+from app.services.data_lifecycle import DataLifecycleService
 
 setup_logging()
 
@@ -24,8 +25,11 @@ async def lifespan(app: FastAPI):
     settings.model_dir.mkdir(parents=True, exist_ok=True)
     manager = WorkerManager()
     auto_trader = AutoTraderService()
+    data_lifecycle = DataLifecycleService()
     app.state.worker_manager = manager
     app.state.auto_trader = auto_trader
+    app.state.data_lifecycle = data_lifecycle
+    await data_lifecycle.start()
     if settings.enable_market_collector:
         await manager.start("market")
     if settings.enable_news_collector:
@@ -35,6 +39,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await data_lifecycle.stop()
         await auto_trader.stop()
         await manager.stop_all()
 

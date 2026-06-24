@@ -34,6 +34,7 @@ os.environ["AUTO_TRADER_SYMBOLS"] = "BTCUSDT"
 os.environ["EXPLORATION_MODE"] = "true"
 os.environ["EXPLORATION_RATE"] = "1.0"
 os.environ["MIN_PAPER_TRADE_NOTIONAL"] = "50"
+os.environ["ARCHIVE_DIR"] = "./_smoke_archives"
 os.environ["NEWS_PROVIDER"] = "rss,gdelt,newsapi"
 os.environ["RSS_NEWS_ENABLED"] = "true"
 os.environ["RSS_FEEDS"] = f"file://{SMOKE_FEED_PATH}"
@@ -49,7 +50,8 @@ sys.path.insert(0, str(ROOT))
 from fastapi.testclient import TestClient
 from sqlalchemy import func, inspect, select
 
-from app.db.models import AiDecision, Candle, ExperienceRecord, Feature, NewsArticle, NewsSentiment
+from app.collectors.market_collector import BinanceMarketCollector
+from app.db.models import AiDecision, Candle, ExperienceRecord, Feature, LiveCandleUpdate, NewsArticle, NewsSentiment, TrainingFeature
 from app.db.session import engine
 from app.db.session import SessionLocal
 from app.main import app
@@ -58,11 +60,13 @@ from app.main import app
 def main() -> None:
     db_path = Path("_smoke_trading_lab.db")
     exported_path: Path | None = None
+    archive_paths: list[Path] = []
     if db_path.exists():
         db_path.unlink()
 
     required_tables = {
         "candles",
+        "live_candle_updates",
         "news_articles",
         "news_sentiment",
         "features",
@@ -70,6 +74,7 @@ def main() -> None:
         "positions",
         "model_versions",
         "training_runs",
+        "training_features",
         "ai_decisions",
         "account_equity",
         "experience_buffer",
@@ -162,6 +167,36 @@ def main() -> None:
         )
         assert market_backfill.status_code == 200, market_backfill.text
         assert market_backfill.json()["rows_saved"] > 0, market_backfill.text
+        now_ms = int(time.time() // 60 * 60 * 1000)
+        live_payload = {
+            "data": {
+                "E": now_ms + 10_000,
+                "k": {
+                    "s": "BTCUSDT",
+                    "i": "1m",
+                    "t": now_ms,
+                    "T": now_ms + 59_999,
+                    "o": "65000.0",
+                    "h": "65100.0",
+                    "l": "64900.0",
+                    "c": "65050.0",
+                    "v": "12.0",
+                    "q": "780600.0",
+                    "n": 42,
+                    "x": False,
+                },
+            }
+        }
+        collector = BinanceMarketCollector(symbols=["BTCUSDT"], interval="1m")
+        first_live = collector.store_message(live_payload)
+        live_payload["data"]["k"]["c"] = "65075.0"
+        second_live = collector.store_message(live_payload)
+        assert first_live["live_update_created"] is True, first_live
+        assert second_live["live_update_updated"] is True, second_live
+        with SessionLocal() as session:
+            live_rows = session.scalars(select(LiveCandleUpdate).where(LiveCandleUpdate.symbol == "BTCUSDT")).all()
+            assert len(live_rows) == 1
+            assert live_rows[0].update_count == 2
 
         market_status = client.get("/api/market/status")
         assert market_status.status_code == 200, market_status.text
@@ -169,6 +204,7 @@ def main() -> None:
         db_diagnostics = client.get("/api/db/diagnostics")
         assert db_diagnostics.status_code == 200, db_diagnostics.text
         assert db_diagnostics.json()["candles"]["closed_training_rows"] > 0, db_diagnostics.text
+        assert db_diagnostics.json()["candles"]["live_update_rows"] == 1, db_diagnostics.text
         assert db_diagnostics.json()["candles"]["duplicate_group_count"] == 0, db_diagnostics.text
         candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5")
         assert candles.status_code == 200, candles.text
@@ -180,7 +216,7 @@ def main() -> None:
         candles_1s = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1s&limit=5")
         assert candles_1s.status_code == 200, candles_1s.text
         assert len(candles_1s.json()) > 0, candles_1s.text
-        assert candles_1s.json()[-1]["source_name"] == "1m_live_fallback", candles_1s.text
+        assert candles_1s.json()[-1]["source_name"] in {"1m_live_fallback", "binance_kline_live"}, candles_1s.text
         summary = client.get("/api/dashboard/summary")
         assert summary.status_code == 200, summary.text
         assert summary.json()["sentiment_model"]["active_model"], summary.text
@@ -229,6 +265,22 @@ def main() -> None:
         assert "candle_return_1m" in feature_payload["vector"], feature_latest.text
         assert "final_ai_input" in feature_payload, feature_latest.text
         assert "strategy_input" in feature_payload["final_ai_input"], feature_latest.text
+        with SessionLocal() as session:
+            training_feature_count = session.scalar(select(func.count(TrainingFeature.id))) or 0
+        assert training_feature_count > 0
+
+        cleanup = client.post("/api/db/cleanup", auth=auth)
+        assert cleanup.status_code == 200, cleanup.text
+        assert "retention" in cleanup.json(), cleanup.text
+
+        archive = client.post(
+            "/api/db/archive",
+            json={"before_date": "2999-01-01T00:00:00+00:00", "tables": ["candles", "training_features", "experience_buffer"]},
+            auth=auth,
+        )
+        assert archive.status_code == 200, archive.text
+        assert len(archive.json()["exports"]) >= 1, archive.text
+        archive_paths = [Path(item["path"]) for item in archive.json()["exports"]]
 
         export = client.post("/api/training/export", json={"use_all_data": True}, auth=auth)
         assert export.status_code == 200, export.text
@@ -250,6 +302,12 @@ def main() -> None:
         SMOKE_FEED_PATH.unlink()
     if exported_path and exported_path.exists():
         exported_path.unlink()
+    for archive_path in archive_paths:
+        if archive_path.exists():
+            archive_path.unlink()
+    archive_dir = Path("_smoke_archives")
+    if archive_dir.exists():
+        archive_dir.rmdir()
     print("smoke_ok=true")
 
 

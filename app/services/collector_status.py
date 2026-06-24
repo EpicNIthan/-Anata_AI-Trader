@@ -7,7 +7,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db.models import Candle, ExperienceRecord, NewsArticle, NewsSentiment
+from app.db.models import Candle, ExperienceRecord, LiveCandleUpdate, NewsArticle, NewsSentiment
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -44,21 +44,36 @@ def market_snapshot(session: Session, collector_state: dict[str, Any] | None = N
     for symbol in symbols:
         candle = session.scalar(
             select(Candle)
-            .where(Candle.symbol == symbol.upper())
+            .where(Candle.symbol == symbol.upper(), Candle.is_closed.is_(True))
             .order_by(desc(Candle.open_time))
             .limit(1)
         )
+        live_update = session.scalar(
+            select(LiveCandleUpdate)
+            .where(LiveCandleUpdate.symbol == symbol.upper())
+            .order_by(desc(LiveCandleUpdate.open_time))
+            .limit(1)
+        )
+        display_price = candle.close if candle else None
+        display_time = candle.open_time if candle else None
+        display_source = candle.source_name if candle else None
+        display_closed = candle.is_closed if candle else None
+        if live_update and (display_time is None or live_update.open_time >= display_time):
+            display_price = live_update.close
+            display_time = live_update.open_time
+            display_source = live_update.source_name
+            display_closed = False
         if candle:
             candle_time = _aware(candle.open_time)
             latest_time = max(latest_time, candle_time) if latest_time and candle_time else candle_time
         latest_by_symbol.append(
             {
                 "symbol": symbol.upper(),
-                "price": candle.close if candle else None,
-                "open_time": _dt(candle.open_time if candle else None),
+                "price": display_price,
+                "open_time": _dt(display_time),
                 "close_time": _dt(candle.close_time if candle else None),
-                "is_closed": candle.is_closed if candle else None,
-                "source_name": candle.source_name if candle else None,
+                "is_closed": display_closed,
+                "source_name": display_source,
             }
         )
 
@@ -77,12 +92,14 @@ def market_snapshot(session: Session, collector_state: dict[str, Any] | None = N
         "age_seconds": age_seconds,
         "stale_after_seconds": stale_after,
         "store_live_candle_updates": settings.store_live_candle_updates,
-        "closed_candles_only": not settings.store_live_candle_updates,
+        "closed_candles_only": True,
+        "live_updates_table": "live_candle_updates",
+        "training_candles_table": "candles",
     }
 
 
 def latest_candles(session: Session, limit: int = 50) -> list[dict[str, Any]]:
-    rows = session.scalars(select(Candle).order_by(desc(Candle.open_time)).limit(limit)).all()
+    rows = session.scalars(select(Candle).where(Candle.is_closed.is_(True)).order_by(desc(Candle.open_time)).limit(limit)).all()
     return [
         {
             "id": row.id,

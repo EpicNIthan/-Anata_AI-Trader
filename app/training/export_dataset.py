@@ -7,7 +7,7 @@ from pathlib import Path
 
 from sqlalchemy import or_, select
 
-from app.db.models import Feature
+from app.db.models import Feature, TrainingFeature
 from app.db.session import SessionLocal, create_db_and_tables
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, values_from_feature
 
@@ -36,12 +36,19 @@ def export_dataset(
     feature_columns = feature_columns or columns_for_schema(feature_schema_version)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with SessionLocal() as session:
-        query = select(Feature).where(
-            or_(Feature.schema_version == feature_schema_version, Feature.schema_version.is_(None))
+        query = select(TrainingFeature).where(
+            or_(TrainingFeature.schema_version == feature_schema_version, TrainingFeature.schema_version.is_(None))
         )
         if since_date and not use_all_data:
-            query = query.where(Feature.as_of >= since_date)
-        features = list(session.scalars(query.order_by(Feature.symbol, Feature.as_of)))
+            query = query.where(TrainingFeature.as_of >= since_date)
+        features = list(session.scalars(query.order_by(TrainingFeature.symbol, TrainingFeature.as_of)))
+        if not features:
+            fallback_query = select(Feature).where(
+                or_(Feature.schema_version == feature_schema_version, Feature.schema_version.is_(None))
+            )
+            if since_date and not use_all_data:
+                fallback_query = fallback_query.where(Feature.as_of >= since_date)
+            features = list(session.scalars(fallback_query.order_by(Feature.symbol, Feature.as_of)))
 
     rows: list[dict[str, object]] = []
     for index, feature in enumerate(features):
@@ -49,11 +56,13 @@ def export_dataset(
         if next_feature is None or next_feature.symbol != feature.symbol:
             target = ""
         else:
-            target = values_from_feature(next_feature, ["price_change"])["price_change"]
-        values = values_from_feature(feature, feature_columns)
+            target_payload = next_feature.payload if isinstance(next_feature, TrainingFeature) else next_feature
+            target = values_from_feature(target_payload, ["price_change"])["price_change"]
+        values = values_from_feature(feature.payload if isinstance(feature, TrainingFeature) else feature, feature_columns)
         rows.append(
             {
-                "feature_id": feature.id,
+                "feature_id": feature.source_feature_id if isinstance(feature, TrainingFeature) else feature.id,
+                "training_feature_id": feature.id if isinstance(feature, TrainingFeature) else "",
                 "symbol": feature.symbol,
                 "as_of": feature.as_of.isoformat(),
                 "feature_schema_version": feature.schema_version or feature_schema_version,
@@ -68,6 +77,7 @@ def export_dataset(
             handle,
             fieldnames=[
                 "feature_id",
+                "training_feature_id",
                 "symbol",
                 "as_of",
                 "feature_schema_version",

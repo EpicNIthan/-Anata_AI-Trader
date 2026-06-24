@@ -97,7 +97,7 @@ class WorkerManager:
         if name == "market":
             market_collector = BinanceMarketCollector()
             state.set_subscription(streams=market_collector.subscribed_streams, websocket_url=market_collector.stream_url)
-            state.closed_candles_only = not market_collector.store_live_updates
+            state.closed_candles_only = True
         elif name == "news":
             news_collector = NewsCollector()
             if not news_collector.can_collect:

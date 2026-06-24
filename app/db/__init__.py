@@ -6,6 +6,7 @@ from app.db.models import (
     ExperienceRecord,
     ExternalDataEvent,
     Feature,
+    LiveCandleUpdate,
     MarketTick,
     ModelVersion,
     NewsArticle,
@@ -13,6 +14,7 @@ from app.db.models import (
     PaperTrade,
     Position,
     TrainingRun,
+    TrainingFeature,
 )
 from app.db.session import SessionLocal, create_db_and_tables, get_session
 
@@ -24,6 +26,7 @@ __all__ = [
     "ExperienceRecord",
     "ExternalDataEvent",
     "Feature",
+    "LiveCandleUpdate",
     "MarketTick",
     "ModelVersion",
     "NewsArticle",
@@ -31,6 +34,7 @@ __all__ = [
     "PaperTrade",
     "Position",
     "TrainingRun",
+    "TrainingFeature",
     "SessionLocal",
     "create_db_and_tables",
     "get_session",

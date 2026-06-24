@@ -22,11 +22,13 @@ from app.db.models import (
     ExperienceRecord,
     ExternalDataEvent,
     Feature,
+    LiveCandleUpdate,
     ModelVersion,
     NewsArticle,
     NewsSentiment,
     PaperTrade,
     Position,
+    TrainingFeature,
     TrainingRun,
 )
 from app.db.session import get_session
@@ -136,6 +138,33 @@ def _serialize_stored_candle(row: Candle, requested_timeframe: str | None = None
     )
 
 
+def _serialize_live_candle_update(row: LiveCandleUpdate, requested_timeframe: str | None = None) -> dict[str, Any]:
+    return _serialize_candle(
+        candle_id=row.id,
+        symbol=row.symbol,
+        timeframe=requested_timeframe or row.interval,
+        open_time=row.open_time,
+        close_time=row.close_time,
+        open_price=row.open,
+        high=row.high,
+        low=row.low,
+        close=row.close,
+        volume=row.volume,
+        is_closed=False,
+        source_name=row.source_name or "live_candle_updates",
+        base_interval=row.interval,
+    ) | {"update_count": row.update_count, "event_time": _dt(row.event_time)}
+
+
+def _latest_live_update(session: Session, symbol: str, interval: str) -> LiveCandleUpdate | None:
+    return session.scalar(
+        select(LiveCandleUpdate)
+        .where(LiveCandleUpdate.symbol == symbol, LiveCandleUpdate.interval == interval)
+        .order_by(desc(LiveCandleUpdate.open_time))
+        .limit(1)
+    )
+
+
 def _aggregate_from_base_candles(
     rows: list[Candle],
     *,
@@ -166,7 +195,7 @@ def _aggregate_from_base_candles(
                 "low": row.low,
                 "close": row.close,
                 "volume": row.volume or 0.0,
-                "is_closed": bool(row.is_closed),
+                "is_closed": bool(getattr(row, "is_closed", False)),
             }
             continue
 
@@ -175,7 +204,7 @@ def _aggregate_from_base_candles(
         current["low"] = min(_float(current["low"]), row.low)
         current["close"] = row.close
         current["volume"] = _float(current["volume"]) + _float(row.volume)
-        current["is_closed"] = bool(current["is_closed"]) and bool(row.is_closed)
+        current["is_closed"] = bool(current["is_closed"]) and bool(getattr(row, "is_closed", False))
 
     if current is not None:
         buckets.append(current)
@@ -211,6 +240,13 @@ def _auto_trader(request: Request):
     service = getattr(request.app.state, "auto_trader", None)
     if service is None:
         raise HTTPException(status_code=503, detail="Auto trader is not initialized")
+    return service
+
+
+def _data_lifecycle(request: Request):
+    service = getattr(request.app.state, "data_lifecycle", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Data lifecycle service is not initialized")
     return service
 
 
@@ -320,6 +356,7 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
             "news": session.scalar(select(func.count(NewsArticle.id))) or 0,
             "sentiment": session.scalar(select(func.count(NewsSentiment.id))) or 0,
             "features": session.scalar(select(func.count(Feature.id))) or 0,
+            "training_features": session.scalar(select(func.count(TrainingFeature.id))) or 0,
             "experiences": session.scalar(select(func.count(ExperienceRecord.id))) or 0,
             "trades": session.scalar(select(func.count(PaperTrade.id))) or 0,
             "open_positions": session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0,
@@ -362,6 +399,37 @@ def db_diagnostics(session: Session = Depends(get_session)) -> dict[str, Any]:
     return database_diagnostics(session)
 
 
+@router.get("/db/lifecycle/status")
+def db_lifecycle_status(request: Request) -> dict[str, Any]:
+    return _data_lifecycle(request).status()
+
+
+@router.post("/db/cleanup")
+def db_cleanup(request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
+    return _data_lifecycle(request).run_cleanup_once()
+
+
+@router.post("/db/archive")
+def db_archive(
+    request: Request,
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    tables = payload.get("tables")
+    if isinstance(tables, str):
+        tables = [item.strip() for item in tables.split(",") if item.strip()]
+    if tables is not None and not isinstance(tables, list):
+        raise HTTPException(status_code=400, detail="tables must be a list or comma-separated string")
+    before = parse_since_date(payload.get("before_date") or payload.get("before"))
+    delete_after_archive = bool(payload.get("delete_after_archive", False))
+    return _data_lifecycle(request).archive_once(
+        before=before,
+        tables=tables,
+        delete_after_archive=delete_after_archive,
+    )
+
+
 @router.get("/market/status")
 def market_status(request: Request, session: Session = Depends(get_session)) -> dict[str, Any]:
     state = _worker_manager(request).snapshot().get("market", {})
@@ -375,14 +443,18 @@ def market_latest(
     symbol: str | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     if symbol:
+        normalized_symbol = symbol.upper()
         candle = session.scalar(
             select(Candle)
-            .where(Candle.symbol == symbol.upper())
+            .where(Candle.symbol == normalized_symbol, Candle.is_closed.is_(True))
             .order_by(desc(Candle.open_time))
             .limit(1)
         )
-        if candle is None:
+        live_update = _latest_live_update(session, normalized_symbol, settings.binance_interval)
+        if candle is None and live_update is None:
             return {}
+        if live_update and (candle is None or live_update.open_time >= candle.open_time):
+            return _serialize_live_candle_update(live_update)
         return {
             "id": candle.id,
             "symbol": candle.symbol,
@@ -416,14 +488,18 @@ def market_candles(
     rows = list(
         session.scalars(
             select(Candle)
-            .where(Candle.symbol == symbol, Candle.interval == timeframe)
+            .where(Candle.symbol == symbol, Candle.interval == timeframe, Candle.is_closed.is_(True))
             .order_by(desc(Candle.open_time))
             .limit(safe_limit)
         )
     )
     rows.reverse()
     if rows:
-        return [_serialize_stored_candle(row) for row in rows]
+        output = [_serialize_stored_candle(row) for row in rows]
+        live_update = _latest_live_update(session, symbol, timeframe)
+        if live_update and (not rows or live_update.open_time > rows[-1].open_time):
+            output.append(_serialize_live_candle_update(live_update))
+        return output[-safe_limit:]
 
     base_interval = "1m"
     base_seconds = 60
@@ -432,21 +508,27 @@ def market_candles(
     base_rows = list(
         session.scalars(
             select(Candle)
-            .where(Candle.symbol == symbol, Candle.interval == base_interval)
+            .where(Candle.symbol == symbol, Candle.interval == base_interval, Candle.is_closed.is_(True))
             .order_by(desc(Candle.open_time))
             .limit(base_limit)
         )
     )
     base_rows.reverse()
+    live_base = _latest_live_update(session, symbol, base_interval)
+    if live_base and (not base_rows or live_base.open_time > base_rows[-1].open_time):
+        base_rows.append(live_base)  # type: ignore[arg-type]
     if not base_rows:
         return []
 
     if target_seconds < base_seconds:
         fallback_rows = base_rows[-safe_limit:]
-        return [
-            _serialize_stored_candle(row, requested_timeframe=timeframe, source_name="1m_live_fallback")
-            for row in fallback_rows
-        ]
+        output = []
+        for row in fallback_rows:
+            if isinstance(row, LiveCandleUpdate):
+                output.append(_serialize_live_candle_update(row, requested_timeframe=timeframe))
+            else:
+                output.append(_serialize_stored_candle(row, requested_timeframe=timeframe, source_name="1m_live_fallback"))
+        return output
 
     return _aggregate_from_base_candles(
         base_rows,
@@ -476,14 +558,14 @@ async def market_backfill(
         result = await collector.backfill_all(limit=limit, mock=mock)
         if state:
             state.set_subscription(streams=collector.subscribed_streams, websocket_url=collector.stream_url)
-            state.closed_candles_only = not collector.store_live_updates
+            state.closed_candles_only = True
             state.mark_saved(result["rows_saved"], {"backfill": result, "rows_saved": result["rows_saved"]})
             state.last_error = None
     except Exception as exc:
         message = format_collector_error(exc)
         if state:
             state.set_subscription(streams=collector.subscribed_streams, websocket_url=collector.stream_url)
-            state.closed_candles_only = not collector.store_live_updates
+            state.closed_candles_only = True
             state.mark_error(f"Backfill failed: {message}")
         raise HTTPException(status_code=502, detail=f"Market backfill failed: {message}") from exc
     return result
@@ -695,6 +777,7 @@ def training_export(
         "news_articles": session.scalar(select(func.count(NewsArticle.id))) or 0,
         "news_sentiment": session.scalar(select(func.count(NewsSentiment.id))) or 0,
         "features": session.scalar(select(func.count(Feature.id))) or 0,
+        "training_features": session.scalar(select(func.count(TrainingFeature.id))) or 0,
         "ai_decisions": session.scalar(select(func.count(AiDecision.id))) or 0,
         "experiences": session.scalar(select(func.count(ExperienceRecord.id))) or 0,
         "paper_trades": session.scalar(select(func.count(PaperTrade.id))) or 0,
@@ -708,7 +791,9 @@ def training_export(
     }
     features_by_symbol = {
         symbol: count
-        for symbol, count in session.execute(select(Feature.symbol, func.count(Feature.id)).group_by(Feature.symbol)).all()
+        for symbol, count in session.execute(
+            select(TrainingFeature.symbol, func.count(TrainingFeature.id)).group_by(TrainingFeature.symbol)
+        ).all()
     }
     latest_feature = session.scalar(select(Feature).order_by(desc(Feature.as_of)).limit(1))
     return {

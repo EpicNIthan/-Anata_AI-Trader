@@ -134,6 +134,12 @@ PAPER_TRADE_TIMEFRAME=1m
 EXPLORATION_MODE=true
 EXPLORATION_RATE=0.05
 MIN_PAPER_TRADE_NOTIONAL=50
+LIVE_UPDATE_RETENTION_HOURS=48
+RAW_NEWS_RETENTION_DAYS=30
+RAW_TICK_RETENTION_DAYS=7
+DIAGNOSTIC_RETENTION_DAYS=7
+EXPERIENCE_RETENTION_DAYS=365
+CLOSED_CANDLE_RETENTION_DAYS=1095
 ```
 
 Controls:
@@ -158,7 +164,17 @@ Diagnostics:
 
 ```powershell
 curl http://localhost:8000/api/db/diagnostics
+curl -X POST http://localhost:8000/api/db/cleanup
+curl -X POST http://localhost:8000/api/db/archive
 ```
+
+Data lifecycle rules:
+
+- `live_candle_updates` is short-term chart data and is upserted by symbol/timeframe/open time.
+- `candles` stores closed candles for long-term training.
+- `training_features` stores compact numeric feature rows for model training/export.
+- Raw ticks, live updates, old diagnostic rows, and raw news payloads are cleaned or compacted by the daily lifecycle job.
+- Training exports read compact features first, so raw logs can be compacted after features are built and archived.
 
 ## Training Workflow
 

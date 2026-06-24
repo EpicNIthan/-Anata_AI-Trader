@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Anata AI Trader</title>
-    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v5">
+    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v6">
     <script defer src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
       window.DASHBOARD_CONFIG = {
@@ -241,6 +241,12 @@
         </section>
 
         <section id="tab-diagnostics" class="tab-panel">
+          <div class="panel-tools">
+            <button id="runCleanupButton" class="primary">Run Cleanup</button>
+            <button id="archiveDataButton" class="secondary">Archive Data</button>
+            <button id="exportDatasetDiagnosticsButton" class="secondary">Export Dataset</button>
+            <output id="dbActionResult"></output>
+          </div>
           <div class="diagnostics-grid">
             <pre id="marketDiagnostics" class="log-box"></pre>
             <pre id="newsDiagnostics" class="log-box"></pre>
@@ -251,6 +257,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v5"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v6"></script>
   </body>
 </html>

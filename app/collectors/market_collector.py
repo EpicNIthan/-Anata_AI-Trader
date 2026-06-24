@@ -10,7 +10,7 @@ import httpx
 from sqlalchemy import select
 
 from app.config import settings
-from app.db.models import Candle, MarketTick
+from app.db.models import Candle, LiveCandleUpdate, MarketTick
 from app.db.session import SessionLocal
 
 try:
@@ -57,7 +57,7 @@ class BinanceMarketCollector:
 
         if state:
             state.set_subscription(streams=self.subscribed_streams, websocket_url=self.stream_url)
-            state.closed_candles_only = not self.store_live_updates
+            state.closed_candles_only = True
 
         try:
             result = await self.backfill_all(limit=100)
@@ -115,10 +115,56 @@ class BinanceMarketCollector:
         candle_saved = False
         candle_created = False
         candle_updated = False
-        candle_source_name = "binance_kline_closed" if is_closed else "binance_kline_live"
+        live_update_saved = False
+        live_update_created = False
+        live_update_updated = False
 
         with SessionLocal() as session:
-            if self.store_live_updates or is_closed:
+            if self.store_live_updates and not is_closed:
+                live_update_saved = True
+                live_update = session.scalar(
+                    select(LiveCandleUpdate).where(
+                        LiveCandleUpdate.exchange == "binance",
+                        LiveCandleUpdate.symbol == symbol,
+                        LiveCandleUpdate.interval == interval,
+                        LiveCandleUpdate.open_time == open_time,
+                    )
+                )
+                if live_update is None:
+                    live_update_created = True
+                    live_update = LiveCandleUpdate(
+                        exchange="binance",
+                        source_name="binance_kline_live",
+                        symbol=symbol,
+                        interval=interval,
+                        event_time=event_time,
+                        open_time=open_time,
+                        close_time=close_time,
+                        open=float(kline["o"]),
+                        high=float(kline["h"]),
+                        low=float(kline["l"]),
+                        close=close_price,
+                        volume=float(kline["v"]),
+                        quote_volume=float(kline.get("q", 0.0)),
+                        trades=int(kline.get("n", 0)),
+                        update_count=1,
+                        raw_payload=payload,
+                    )
+                    session.add(live_update)
+                else:
+                    live_update_updated = True
+                    live_update.event_time = event_time
+                    live_update.close_time = close_time
+                    live_update.high = float(kline["h"])
+                    live_update.low = float(kline["l"])
+                    live_update.close = close_price
+                    live_update.volume = float(kline["v"])
+                    live_update.quote_volume = float(kline.get("q", 0.0))
+                    live_update.trades = int(kline.get("n", 0))
+                    live_update.update_count += 1
+                    live_update.raw_payload = payload
+
+            if is_closed:
                 candle_saved = True
                 candle = session.scalar(
                     select(Candle).where(
@@ -132,7 +178,7 @@ class BinanceMarketCollector:
                     candle_created = True
                     candle = Candle(
                         exchange="binance",
-                        source_name=candle_source_name,
+                        source_name="binance_kline_closed",
                         symbol=symbol,
                         interval=interval,
                         open_time=open_time,
@@ -151,6 +197,7 @@ class BinanceMarketCollector:
                     session.add(candle)
                 else:
                     candle_updated = True
+                    candle.open = float(kline["o"])
                     candle.close_time = close_time
                     candle.high = float(kline["h"])
                     candle.low = float(kline["l"])
@@ -158,10 +205,20 @@ class BinanceMarketCollector:
                     candle.volume = float(kline["v"])
                     candle.quote_volume = float(kline.get("q", 0.0))
                     candle.trades = int(kline.get("n", 0))
-                    candle.is_closed = candle.is_closed or is_closed
-                    candle.source_name = "binance_kline_closed" if candle.is_closed else candle_source_name
+                    candle.is_closed = True
+                    candle.source_name = "binance_kline_closed"
                     candle.raw = payload
                     candle.raw_payload = payload
+                live_update = session.scalar(
+                    select(LiveCandleUpdate).where(
+                        LiveCandleUpdate.exchange == "binance",
+                        LiveCandleUpdate.symbol == symbol,
+                        LiveCandleUpdate.interval == interval,
+                        LiveCandleUpdate.open_time == open_time,
+                    )
+                )
+                if live_update:
+                    session.delete(live_update)
 
             session.add(
                 MarketTick(
@@ -185,11 +242,16 @@ class BinanceMarketCollector:
             "candle_saved": candle_saved,
             "candle_created": candle_created,
             "candle_updated": candle_updated,
-            "live_update_upserted": candle_saved and not is_closed,
+            "live_update_saved": live_update_saved,
+            "live_update_created": live_update_created,
+            "live_update_updated": live_update_updated,
+            "live_update_upserted": live_update_saved,
             "training_quality_closed_candle": candle_saved and is_closed,
-            "rows_saved": 2 if candle_saved else 1,
+            "rows_saved": int(candle_saved) + int(live_update_saved) + 1,
             "store_live_candle_updates": self.store_live_updates,
-            "closed_candles_only": not self.store_live_updates,
+            "closed_candles_only": True,
+            "live_updates_table": "live_candle_updates",
+            "training_candles_table": "candles",
         }
 
     async def backfill_all(self, limit: int = 100, mock: bool = False) -> dict[str, Any]:
@@ -218,7 +280,9 @@ class BinanceMarketCollector:
             "rows_saved": total_rows,
             "per_symbol": per_symbol,
             "store_live_candle_updates": self.store_live_updates,
-            "closed_candles_only": not self.store_live_updates,
+            "closed_candles_only": True,
+            "live_updates_table": "live_candle_updates",
+            "training_candles_table": "candles",
         }
 
     def store_rest_klines(self, symbol: str, klines: list[list[Any]]) -> int:

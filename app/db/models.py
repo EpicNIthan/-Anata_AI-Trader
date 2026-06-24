@@ -43,6 +43,34 @@ class Candle(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
+class LiveCandleUpdate(Base):
+    __tablename__ = "live_candle_updates"
+    __table_args__ = (
+        UniqueConstraint("exchange", "symbol", "interval", "open_time", name="uq_live_candle_update_identity"),
+        Index("ix_live_candle_updates_symbol_time", "symbol", "open_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    exchange: Mapped[str] = mapped_column(String(32), default="binance", index=True)
+    source_name: Mapped[str | None] = mapped_column(String(128), default="binance_kline_live", nullable=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    interval: Mapped[str] = mapped_column(String(16), default="1m")
+    event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float] = mapped_column(Float, default=0.0)
+    quote_volume: Mapped[float] = mapped_column(Float, default=0.0)
+    trades: Mapped[int] = mapped_column(Integer, default=0)
+    update_count: Mapped[int] = mapped_column(Integer, default=1)
+    raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
 class MarketTick(Base):
     __tablename__ = "market_ticks"
     __table_args__ = (Index("ix_market_ticks_symbol_time", "symbol", "event_time"),)
@@ -116,6 +144,25 @@ class Feature(Base):
     risk_score: Mapped[float] = mapped_column(Float, default=0.0)
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TrainingFeature(Base):
+    __tablename__ = "training_features"
+    __table_args__ = (
+        UniqueConstraint("source_feature_id", name="uq_training_features_source_feature_id"),
+        Index("ix_training_features_symbol_time", "symbol", "as_of"),
+        Index("ix_training_features_schema_time", "schema_version", "as_of"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_feature_id: Mapped[int | None] = mapped_column(ForeignKey("features.id"), nullable=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    schema_version: Mapped[str] = mapped_column(String(64), default="price-news-v2", index=True)
+    source_name: Mapped[str | None] = mapped_column(String(128), default="feature_builder", nullable=True, index=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    feature_values: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
