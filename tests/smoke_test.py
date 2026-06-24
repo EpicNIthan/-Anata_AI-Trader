@@ -108,6 +108,7 @@ def main() -> None:
         dashboard = client.get("/dashboard", auth=auth)
         assert dashboard.status_code == 200, dashboard.text[:500]
         assert "Anata AI Trader" in dashboard.text
+        assert "modelsBody" in dashboard.text
 
         blocked_trade = client.post(
             "/api/signal",

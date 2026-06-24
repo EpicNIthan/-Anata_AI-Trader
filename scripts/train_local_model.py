@@ -5,6 +5,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 NON_FEATURE_COLUMNS = {
@@ -60,14 +61,43 @@ def _make_model(model_type: str):
 
         return RandomForestRegressor(n_estimators=300, max_depth=10, min_samples_leaf=5, random_state=42, n_jobs=-1)
     if model_type == "lightgbm":
-        from lightgbm import LGBMRegressor
-
+        try:
+            from lightgbm import LGBMRegressor
+        except Exception as exc:
+            raise SystemExit(
+                "LightGBM is not installed or failed to import. Install it locally with "
+                "`pip install lightgbm`, or use `--model-type sklearn_hist_gradient_boosting`."
+            ) from exc
         return LGBMRegressor(n_estimators=500, learning_rate=0.03, max_depth=-1, random_state=42)
     if model_type == "xgboost":
-        from xgboost import XGBRegressor
-
+        try:
+            from xgboost import XGBRegressor
+        except Exception as exc:
+            raise SystemExit(
+                "XGBoost is not installed or failed to import. Install it locally with "
+                "`pip install xgboost`, or use `--model-type sklearn_hist_gradient_boosting`."
+            ) from exc
         return XGBRegressor(n_estimators=500, learning_rate=0.03, max_depth=5, random_state=42, objective="reg:squarederror")
     raise ValueError(f"Unsupported model type: {model_type}")
+
+
+def _metrics(predictions, actual) -> dict[str, float]:
+    import numpy as np
+
+    errors = predictions - actual
+    return {
+        "directional_accuracy": float(((predictions > 0) == (actual > 0)).mean()),
+        "mse": float(np.mean(errors**2)),
+        "mae": float(np.mean(np.abs(errors))),
+    }
+
+
+def _feature_importance(model: Any, feature_columns: list[str]) -> dict[str, float]:
+    values = getattr(model, "feature_importances_", None)
+    if values is None:
+        return {}
+    pairs = sorted(zip(feature_columns, values), key=lambda item: float(item[1]), reverse=True)
+    return {name: float(value) for name, value in pairs}
 
 
 def main() -> None:
@@ -76,49 +106,85 @@ def main() -> None:
     parser.add_argument("--model-type", default="sklearn_hist_gradient_boosting", choices=["sklearn_hist_gradient_boosting", "random_forest", "lightgbm", "xgboost"])
     parser.add_argument("--target", default="target_trade_quality_score")
     parser.add_argument("--out-dir", type=Path, default=Path("models"))
+    parser.add_argument("--validation-size", type=float, default=0.25)
     args = parser.parse_args()
 
     import joblib
     import pandas as pd
 
-    frame = pd.read_csv(args.dataset).sort_values(["symbol", "as_of"])
+    frame = pd.read_csv(args.dataset)
+    if "as_of" not in frame.columns:
+        raise SystemExit("Dataset is missing as_of column")
+    frame["as_of"] = pd.to_datetime(frame["as_of"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["as_of"]).sort_values("as_of")
     if args.target not in frame.columns:
         raise SystemExit(f"Dataset is missing target column {args.target}")
-    feature_columns = _feature_columns(frame, args.target)
+
+    train_frame = frame.dropna(subset=[args.target]).copy()
+    if len(train_frame) < 1000:
+        print(f"WARNING: dataset has only {len(train_frame)} labeled rows. Wait for more data if possible.")
+    date_span = train_frame["as_of"].max() - train_frame["as_of"].min()
+    if date_span.total_seconds() < 2 * 24 * 3600:
+        print(f"WARNING: dataset covers only {date_span}. Two or more days is recommended before training.")
+
+    feature_columns = _feature_columns(train_frame, args.target)
     if not feature_columns:
         raise SystemExit("No numeric feature columns found")
-    train_frame = frame.dropna(subset=[args.target]).copy()
-    x = train_frame[feature_columns].fillna(0.0).astype(float)
-    y = train_frame[args.target].astype(float)
-    model = _make_model(args.model_type)
-    model.fit(x, y)
 
-    predictions = model.predict(x)
-    directional_accuracy = float(((predictions > 0) == (y.to_numpy() > 0)).mean())
+    split = max(1, int(len(train_frame) * (1.0 - min(max(args.validation_size, 0.05), 0.50))))
+    if split >= len(train_frame):
+        raise SystemExit("Not enough rows for validation split")
+    training_slice = train_frame.iloc[:split].copy()
+    validation_slice = train_frame.iloc[split:].copy()
+
+    x_train = training_slice[feature_columns].fillna(0.0).astype(float)
+    y_train = training_slice[args.target].astype(float)
+    x_validation = validation_slice[feature_columns].fillna(0.0).astype(float)
+    y_validation = validation_slice[args.target].astype(float)
+
+    validation_model = _make_model(args.model_type)
+    validation_model.fit(x_train, y_train)
+    validation_predictions = validation_model.predict(x_validation)
+    validation_metrics = _metrics(validation_predictions, y_validation.to_numpy())
+
+    final_model = _make_model(args.model_type)
+    x_all = train_frame[feature_columns].fillna(0.0).astype(float)
+    y_all = train_frame[args.target].astype(float)
+    final_model.fit(x_all, y_all)
+
     version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model_path = args.out_dir / f"model_{version}.joblib"
     metadata_path = args.out_dir / f"model_{version}.json"
-    joblib.dump(model, model_path)
+    joblib.dump(final_model, model_path)
+    metrics = {
+        "train_rows": int(len(training_slice)),
+        "validation_rows": int(len(validation_slice)),
+        "total_labeled_rows": int(len(train_frame)),
+        "validation_directional_accuracy": validation_metrics["directional_accuracy"],
+        "validation_mse": validation_metrics["mse"],
+        "validation_mae": validation_metrics["mae"],
+        "dataset_days": float(date_span.total_seconds() / 86400.0),
+    }
     metadata = {
         "model_id": f"{args.model_type}:{version}",
         "name": args.model_type,
         "version": version,
         "model_type": args.model_type,
         "model_file": model_path.name,
+        "status": "candidate",
+        "activation_mode": "manual",
         "feature_schema_version": str(train_frame["feature_schema_version"].iloc[-1]) if "feature_schema_version" in train_frame else "price-news-v3",
         "feature_columns": feature_columns,
         "target": args.target,
         "training_dataset_path": str(args.dataset),
         "training_dataset_hash": _dataset_hash(args.dataset),
-        "metrics": {
-            "train_rows": int(len(train_frame)),
-            "directional_accuracy_in_sample": directional_accuracy,
-        },
+        "metrics": metrics,
+        "feature_importance": _feature_importance(final_model, feature_columns),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    print(json.dumps({"model": str(model_path), "metadata": str(metadata_path), "metrics": metadata["metrics"]}, indent=2))
+    print(json.dumps({"model": str(model_path), "metadata": str(metadata_path), "metrics": metrics}, indent=2))
 
 
 if __name__ == "__main__":

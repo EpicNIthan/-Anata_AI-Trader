@@ -249,6 +249,14 @@
             <div><span>Last Training Run</span><strong id="lastTrainingRun">-</strong></div>
             <div><span>Fallback</span><strong id="modelFallbackReason">-</strong></div>
           </div>
+          <div class="panel-tools">
+            <button id="refreshModelsButton" class="secondary">Refresh Models</button>
+            <output id="modelActionResult"></output>
+          </div>
+          <table>
+            <thead><tr><th>Status</th><th>Model ID</th><th>Version</th><th>Type</th><th>Schema</th><th>Metrics</th><th>Created</th><th>Action</th></tr></thead>
+            <tbody id="modelsBody"><tr><td colspan="8" class="empty">Loading models</td></tr></tbody>
+          </table>
           <button id="buildDatasetButton" class="primary">Build Training Dataset</button>
           <button id="trainModelButton" class="primary">Train Model</button>
           <button id="exportDatasetButton" class="primary">Export Dataset</button>
@@ -273,6 +281,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v8"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v9"></script>
   </body>
 </html>

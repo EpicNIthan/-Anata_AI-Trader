@@ -382,9 +382,60 @@
     }
   }
 
+  async function refreshModels() {
+    const body = $("modelsBody");
+    if (!body) return;
+    try {
+      const rows = await api("/api/models?limit=50");
+      body.innerHTML = rows.length ? rows.map((row) => {
+        const metrics = row.metrics || {};
+        const metricText = Object.entries(metrics).slice(0, 5).map(([key, value]) => {
+          const safeValue = typeof value === "object" ? JSON.stringify(value) : value;
+          return `${key}: ${Number.isFinite(Number(safeValue)) ? number(safeValue, 4) : escapeHtml(safeValue)}`;
+        }).join(" / ");
+        const action = row.status === "candidate"
+          ? `<button data-activate-model="${escapeHtml(row.model_id)}" class="primary">Activate</button>`
+          : "-";
+        return `
+          <tr>
+            <td>${escapeHtml(row.status || "-")}</td>
+            <td>${escapeHtml(row.model_id || "-")}</td>
+            <td>${escapeHtml(row.version || "-")}</td>
+            <td>${escapeHtml(row.model_type || row.name || "-")}</td>
+            <td>${escapeHtml(row.feature_schema_version || "-")}</td>
+            <td>${metricText || "-"}</td>
+            <td>${when(row.created_at)}</td>
+            <td>${action}</td>
+          </tr>`;
+      }).join("") : `<tr><td colspan="8" class="empty">No uploaded models yet</td></tr>`;
+      body.querySelectorAll("[data-activate-model]").forEach((button) => {
+        button.addEventListener("click", () => activateModel(button.dataset.activateModel));
+      });
+    } catch (error) {
+      body.innerHTML = `<tr><td colspan="8" class="empty">Model load failed: ${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
+  async function activateModel(modelId) {
+    const output = $("modelActionResult") || $("exportResult");
+    if (output) output.textContent = `Activating ${modelId}...`;
+    try {
+      const data = await api("/api/models/activate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: modelId }),
+      });
+      if (output) output.textContent = `Activated ${data.model?.model_id || modelId}`;
+      await refreshModels();
+      await refreshSummary();
+    } catch (error) {
+      if (output) output.textContent = `Activate failed: ${error.message}`;
+    }
+  }
+
   async function refreshHeavy() {
     try {
-      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures(), refreshDbDiagnostics()]);
+      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures(), refreshDbDiagnostics(), refreshModels()]);
     } catch (error) {
       console.warn("table refresh failed", error);
     }
@@ -572,6 +623,7 @@
     $("buildDatasetButton")?.addEventListener("click", buildTrainingDataset);
     $("trainModelButton")?.addEventListener("click", trainModel);
     $("exportDatasetButton")?.addEventListener("click", () => exportDataset("exportResult"));
+    $("refreshModelsButton")?.addEventListener("click", refreshModels);
     $("exportDatasetDiagnosticsButton")?.addEventListener("click", () => exportDataset("dbActionResult"));
     $("runCleanupButton")?.addEventListener("click", runCleanup);
     $("archiveDataButton")?.addEventListener("click", archiveData);

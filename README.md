@@ -25,7 +25,7 @@ No live exchange order APIs are wired. There are no real trading keys, no withdr
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
@@ -33,6 +33,12 @@ Optional Hugging Face sentiment dependencies are intentionally separate so Railw
 
 ```powershell
 python -m pip install -r requirements-hf.txt
+```
+
+Powerful local training dependencies are also separate. Install them on your laptop, not Railway:
+
+```powershell
+pip install -r requirements-local-training.txt
 ```
 
 Set `DATABASE_URL` in `.env` to PostgreSQL for normal use:
@@ -339,14 +345,25 @@ curl -L https://your-app.up.railway.app/api/training/download/anata_dataset_YYYY
   -o datasets/anata_dataset_YYYYMMDD_HHMMSS.csv.gz
 ```
 
-Laptop workflow:
+Laptop workflow for your Railway app:
 
 ```powershell
-python scripts/download_dataset.py --url https://your-app.up.railway.app --token YOUR_ADMIN_TOKEN
-python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type sklearn_hist_gradient_boosting
-python scripts/evaluate_local_model.py --dataset datasets/latest.csv.gz --model models/model_VERSION.joblib
-python scripts/package_model.py --model models/model_VERSION.joblib
-python scripts/upload_model.py --url https://your-app.up.railway.app --token YOUR_ADMIN_TOKEN --package model_package_VERSION.zip
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install -r requirements-local-training.txt
+
+python scripts/download_dataset.py --url https://anataai-trader-production.up.railway.app --token YOUR_ADMIN_TOKEN
+
+python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type sklearn_hist_gradient_boosting --target target_trade_quality_score
+
+python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type lightgbm --target target_trade_quality_score
+
+python scripts/evaluate_local_model.py --dataset datasets/latest.csv.gz --model models/YOUR_MODEL.joblib
+
+python scripts/package_model.py --model models/YOUR_MODEL.joblib
+
+python scripts/upload_model.py --url https://anataai-trader-production.up.railway.app --token YOUR_ADMIN_TOKEN --package model_package_VERSION.zip
 ```
 
 Supported local model types:
@@ -356,6 +373,8 @@ Supported local model types:
 - `lightgbm` if installed locally
 - `xgboost` if installed locally
 
+If LightGBM or XGBoost fails to install/import on Windows, use `--model-type sklearn_hist_gradient_boosting`; the local scripts will print a clear message and keep the sklearn path available.
+
 Uploaded models are registered as `candidate` first. Activate only after checking metrics:
 
 ```powershell
@@ -363,6 +382,8 @@ curl -X POST https://your-app.up.railway.app/api/models/activate `
   -H "x-admin-token: YOUR_ADMIN_TOKEN" `
   -H "Content-Type: application/json" `
   -d "{\"model_id\":\"MODEL_ID_FROM_UPLOAD\"}"
+
+python scripts/activate_model.py --url https://anataai-trader-production.up.railway.app --token YOUR_ADMIN_TOKEN --model-id MODEL_ID
 ```
 
 Model endpoints:
