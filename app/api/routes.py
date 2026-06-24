@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.ai.experience_buffer import record_experience
+from app.ai.model_strategy import PriceModelStrategy
 from app.ai.news_sentiment import active_sentiment_model, analyze_news, reset_sentiment_model_cache
 from app.ai.strategy import RuleBasedStrategy
 from app.api.webhooks import SignalRequest
@@ -40,6 +42,7 @@ from app.services.collector_status import latest_candles, latest_news, market_sn
 from app.services.db_diagnostics import database_diagnostics
 from app.training.dataset_accelerator import build_accelerated_dataset
 from app.training.export_dataset import export_dataset, parse_since_date
+from app.training.train_price_model import train_price_model
 from app.trading.paper_engine import PaperEngine
 
 router = APIRouter(prefix="/api", tags=["lab"])
@@ -286,6 +289,8 @@ def _decision_source(row: AiDecision) -> str:
     source = raw.get("decision_source") if isinstance(raw, dict) else None
     if source:
         return str(source)
+    if row.model_version_id or (row.source_name and "model" in row.source_name):
+        return "model"
     if row.source_name and "exploration" in row.source_name:
         return "exploration"
     return "strategy"
@@ -916,6 +921,85 @@ async def training_build_dataset(
     )
 
 
+@router.post("/training/train-model")
+async def training_train_model(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    build_dataset = bool(payload.get("build_dataset", False))
+    dataset_path_value = payload.get("dataset_path")
+    dataset_summary: dict[str, Any] | None = None
+
+    if build_dataset:
+        symbols = payload.get("symbols")
+        if isinstance(symbols, str):
+            symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        if symbols is not None and not isinstance(symbols, list):
+            raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
+        dataset_summary = await build_accelerated_dataset(
+            symbols=symbols,
+            interval=str(payload.get("interval") or settings.paper_trade_timeframe),
+            days=min(max(int(payload.get("days") or 14), 1), 365),
+            max_rows_per_symbol=min(max(int(payload.get("max_rows_per_symbol") or 5000), 100), 250_000),
+            lookback=min(max(int(payload.get("lookback") or 60), 10), 500),
+            stride=min(max(int(payload.get("stride") or 5), 1), 500),
+            replay_limit=min(max(int(payload.get("replay_limit") or 20_000), 100), 500_000),
+            backfill=bool(payload.get("backfill", True)),
+            mock=bool(payload.get("mock", False)),
+            export=True,
+        )
+        dataset_path_value = dataset_summary.get("exported_path")
+
+    dataset_path = Path(dataset_path_value) if dataset_path_value else None
+    from_checkpoint_value = payload.get("from_checkpoint")
+    from_checkpoint: Path | None = None
+    if from_checkpoint_value == "latest":
+        latest = session.scalar(select(ModelVersion).where(ModelVersion.status == "trained").order_by(desc(ModelVersion.created_at)).limit(1))
+        from_checkpoint = Path(latest.path) if latest else None
+    elif from_checkpoint_value:
+        from_checkpoint = Path(str(from_checkpoint_value))
+
+    feature_schema_version = str(payload.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION)
+    since_date = parse_since_date(payload.get("since_date"))
+    use_all_data = bool(payload.get("use_all_data", True))
+    epochs = min(max(int(payload.get("epochs") or 500), 1), 20_000)
+    learning_rate = float(payload.get("learning_rate") or 0.05)
+
+    model_path = await asyncio.to_thread(
+        train_price_model,
+        dataset_path,
+        from_checkpoint=from_checkpoint,
+        since_date=since_date,
+        use_all_data=use_all_data,
+        feature_schema_version=feature_schema_version,
+        epochs=epochs,
+        learning_rate=learning_rate,
+    )
+    session.expire_all()
+    model = session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
+    return {
+        "status": "trained",
+        "model_path": str(model_path),
+        "dataset_path": str(dataset_path) if dataset_path else None,
+        "dataset_summary": dataset_summary,
+        "model": {
+            "id": model.id if model else None,
+            "model_id": model.model_id if model else None,
+            "name": model.name if model else None,
+            "version": model.version if model else None,
+            "feature_schema_version": model.feature_schema_version if model else feature_schema_version,
+            "feature_columns": model.feature_columns if model else None,
+            "metrics": model.metrics if model else None,
+            "path": model.path if model else str(model_path),
+            "status": model.status if model else "trained",
+            "created_at": _dt(model.created_at if model else None),
+        },
+        "auto_trader_use_trained_model": settings.auto_trader_use_trained_model,
+    }
+
+
 @router.get("/data-events")
 def data_events(
     session: Session = Depends(get_session),
@@ -1061,6 +1145,7 @@ def ai_decisions(session: Session = Depends(get_session), limit: int = 50) -> li
             "action": row.action,
             "confidence": row.confidence,
             "decision_source": _decision_source(row),
+            "model_version_id": row.model_version_id,
             "execution_status": row.execution_status,
             "sentiment_score": features.get(row.feature_id).sentiment_score if row.feature_id in features else None,
             "risk_score": features.get(row.feature_id).risk_score if row.feature_id in features else None,
@@ -1148,6 +1233,7 @@ def trades(session: Session = Depends(get_session), limit: int = 50) -> list[dic
             "id": row.id,
             "symbol": row.symbol,
             "action": row.action,
+            "side": row.side,
             "quantity": row.quantity,
             "price": row.price,
             "notional": row.notional,
@@ -1220,4 +1306,33 @@ def latest_model(session: Session = Depends(get_session)) -> dict[str, Any]:
         "status": model.status,
         "metrics": model.metrics,
         "created_at": _dt(model.created_at),
+    }
+
+
+@router.get("/models/predict")
+def model_predict(
+    session: Session = Depends(get_session),
+    symbol: str = "BTCUSDT",
+) -> dict[str, Any]:
+    feature = FeatureBuilder(session).build_for_symbol(symbol.upper(), store=False)
+    model_decision = PriceModelStrategy().decide(session, feature)
+    if model_decision is None:
+        return {
+            "status": "missing",
+            "symbol": symbol.upper(),
+            "message": "No trained model is available for prediction.",
+        }
+    return {
+        "status": "ok",
+        "symbol": symbol.upper(),
+        "decision": model_decision.decision.model_dump(),
+        "prediction": model_decision.prediction,
+        "model": {
+            "id": model_decision.model.id,
+            "model_id": model_decision.model.model_id,
+            "name": model_decision.model.name,
+            "version": model_decision.model.version,
+            "feature_schema_version": model_decision.model.feature_schema_version,
+            "metrics": model_decision.model.metrics,
+        },
     }

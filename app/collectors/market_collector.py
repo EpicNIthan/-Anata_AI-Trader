@@ -37,6 +37,7 @@ class BinanceMarketCollector:
         self.symbols = symbols or settings.binance_symbols
         self.interval = interval or settings.binance_interval
         self.store_live_updates = settings.store_live_candle_updates
+        self.store_market_ticks = settings.store_market_ticks
 
     @property
     def subscribed_streams(self) -> list[str]:
@@ -220,18 +221,21 @@ class BinanceMarketCollector:
                 if live_update:
                     session.delete(live_update)
 
-            session.add(
-                MarketTick(
-                    exchange="binance",
-                    source_name="binance_tick",
-                    symbol=symbol,
-                    event_time=event_time,
-                    price=close_price,
-                    quantity=float(kline.get("v", 0.0)),
-                    raw=payload,
-                    raw_payload=payload,
+            tick_saved = False
+            if self.store_market_ticks:
+                tick_saved = True
+                session.add(
+                    MarketTick(
+                        exchange="binance",
+                        source_name="binance_tick",
+                        symbol=symbol,
+                        event_time=event_time,
+                        price=close_price,
+                        quantity=float(kline.get("v", 0.0)),
+                        raw=payload,
+                        raw_payload=payload,
+                    )
                 )
-            )
             session.commit()
 
         return {
@@ -247,8 +251,10 @@ class BinanceMarketCollector:
             "live_update_updated": live_update_updated,
             "live_update_upserted": live_update_saved,
             "training_quality_closed_candle": candle_saved and is_closed,
-            "rows_saved": int(candle_saved) + int(live_update_saved) + 1,
+            "tick_saved": tick_saved,
+            "rows_saved": int(candle_saved) + int(live_update_saved) + int(tick_saved),
             "store_live_candle_updates": self.store_live_updates,
+            "store_market_ticks": self.store_market_ticks,
             "closed_candles_only": True,
             "live_updates_table": "live_candle_updates",
             "training_candles_table": "candles",

@@ -286,8 +286,8 @@
   async function refreshTrades() {
     const rows = await api("/api/trades?limit=50");
     $("tradesBody").innerHTML = rows.map((row) => `
-      <tr><td>${when(row.created_at)}</td><td>${escapeHtml(row.symbol)}</td><td>${escapeHtml(row.action)}</td><td>${number(row.quantity, 6)}</td><td>${money(row.price)}</td><td>${money(row.fee, 4)}</td><td class="${cls(row.realized_pnl)}">${money(row.realized_pnl)}</td><td>${escapeHtml(row.reason || "-")}</td></tr>
-    `).join("") || `<tr><td colspan="8" class="empty">No trades</td></tr>`;
+      <tr><td>${when(row.created_at)}</td><td>${escapeHtml(row.symbol)}</td><td>${escapeHtml(row.action)}</td><td>${escapeHtml(row.side || "-")}</td><td>${number(row.quantity, 6)}</td><td>${money(row.price)}</td><td>${money(row.fee, 4)}</td><td class="${cls(row.realized_pnl)}">${money(row.realized_pnl)}</td><td>${escapeHtml(row.reason || "-")}</td></tr>
+    `).join("") || `<tr><td colspan="9" class="empty">No trades</td></tr>`;
   }
 
   async function refreshDecisions() {
@@ -454,6 +454,33 @@
     }
   }
 
+  async function trainModel() {
+    const output = $("exportResult") || $("dbActionResult");
+    if (output) output.textContent = "Training model from compact features. This can take a little while...";
+    try {
+      const data = await api("/api/training/train-model", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          build_dataset: true,
+          days: 14,
+          max_rows_per_symbol: 5000,
+          lookback: 60,
+          stride: 5,
+          replay_limit: 20000,
+          backfill: true,
+          use_all_data: true,
+        }),
+      });
+      if (output) output.textContent = JSON.stringify(data, null, 2);
+      await refreshSummary();
+      await refreshFeatures();
+      await refreshDbDiagnostics();
+    } catch (error) {
+      if (output) output.textContent = `Train model failed: ${error.message}`;
+    }
+  }
+
   async function runCleanup() {
     const output = $("dbActionResult");
     if (output) output.textContent = "Cleaning...";
@@ -533,6 +560,7 @@
     $("newsProviderFilter")?.addEventListener("change", refreshNews);
     $("signalForm")?.addEventListener("submit", submitSignal);
     $("buildDatasetButton")?.addEventListener("click", buildTrainingDataset);
+    $("trainModelButton")?.addEventListener("click", trainModel);
     $("exportDatasetButton")?.addEventListener("click", () => exportDataset("exportResult"));
     $("exportDatasetDiagnosticsButton")?.addEventListener("click", () => exportDataset("dbActionResult"));
     $("runCleanupButton")?.addEventListener("click", runCleanup);

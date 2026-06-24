@@ -13,7 +13,7 @@ No live exchange order APIs are wired. There are no real trading keys, no withdr
 - REST news collector with a configurable provider URL and API key.
 - Placeholder news sentiment interface shaped for a future Hugging Face model.
 - Feature builder combining candle behavior and sentiment/risk scores.
-- Paper engine with fake balance, fees, PnL, trade history, and long-only positions.
+- Paper futures engine with fake balance, long/short positions, leverage, fees, PnL, trade history, and no live exchange orders.
 - Risk manager for max trade size, max daily loss, max open positions, cooldown after large loss, and low-confidence rejection.
 - Training scripts for dataset export, a first-pass linear model, and evaluation.
 - Dockerfile and Railway-compatible start command.
@@ -69,7 +69,7 @@ ENABLE_MARKET_COLLECTOR=true
 ENABLE_NEWS_COLLECTOR=true
 ```
 
-The Binance collector writes candles and market ticks. The news collector writes articles and sentiment rows from free-first providers:
+The Binance collector writes closed candles for training and upserted live candle rows for charts. Raw market ticks are optional and off by default. The news collector writes articles and sentiment rows from free-first providers:
 
 - RSS: crypto-specific news from configured feeds such as CoinDesk, Cointelegraph, and Decrypt.
 - GDELT: global/world/macroeconomic news, no API key required.
@@ -105,7 +105,10 @@ Use this to see live candle changes before candle close:
 
 ```env
 STORE_LIVE_CANDLE_UPDATES=true
+STORE_MARKET_TICKS=false
 ```
+
+`STORE_MARKET_TICKS=false` is the recommended Railway default. Closed candles and compact training features are useful long-term; raw tick rows grow very quickly.
 
 If one provider fails or is missing a token, the other providers continue. For UI/sentiment testing without a provider:
 
@@ -131,6 +134,13 @@ Supported actions:
 - `CLOSE`
 
 `SELL` and `CLOSE` only close existing long paper positions. Short selling is disabled.
+Paper futures semantics:
+
+- `BUY` opens/increases a long when no short is open.
+- `BUY` closes an open short.
+- `SELL` opens/increases a short when no long is open.
+- `SELL` closes an open long.
+- `CLOSE` closes the current open long or short.
 
 ## Autonomous Paper Trader
 
@@ -140,6 +150,7 @@ Environment:
 
 ```env
 AUTO_TRADER_ENABLED=false
+AUTO_TRADER_USE_TRAINED_MODEL=true
 AUTO_TRADER_INTERVAL_SECONDS=60
 AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT
 PAPER_TRADE_TIMEFRAME=1m
@@ -184,6 +195,7 @@ Safety behavior:
 
 - Paper mode only.
 - No live exchange order execution.
+- Uses the latest trained model automatically when `AUTO_TRADER_USE_TRAINED_MODEL=true`; falls back to `rule-based-v1` while no model exists.
 - Uses the existing risk manager.
 - Uses explicit paper-only leverage. `PAPER_LEVERAGE=10` means a $500 margin allocation creates up to $5,000 fake notional exposure. Fees are still charged on notional.
 - Sizes new entries from 0% to `RISK_MAX_TRADE_SIZE_PCT` of equity as margin based on confidence. With `RISK_MAX_TRADE_SIZE_PCT=0.50`, very high-confidence paper trades can use up to 50% of equity as margin.
@@ -194,8 +206,8 @@ Safety behavior:
 - Closes immediately when a stop loss or max-position-loss rule is hit, even if that means taking a small loss now.
 - Avoids closing tiny green positions when the closing fee would eat the profit, unless the bot is cutting a loss.
 - Adds default paper stop loss / take profit levels to new entries when the strategy did not provide them.
-- Blocks rapid duplicate long entries for the same symbol.
-- Blocks new auto-trader buys during cooldown after a recent realized loss.
+- Blocks rapid duplicate same-direction entries for the same symbol.
+- Blocks new auto-trader entries during cooldown after a meaningful recent realized loss.
 - Optional exploration mode only runs in paper mode and uses tiny fake notionals while still passing through risk checks.
 - Records whether each decision came from `strategy` or `exploration`, then updates 5m/15m/1h reward diagnostics when future candles exist.
 
@@ -285,6 +297,16 @@ Train the first model:
 python -m app.training.train_price_model --dataset datasets/features_YYYYMMDD_HHMMSS.csv
 ```
 
+Or from the dashboard Training tab, click `Train Model`. This calls:
+
+```powershell
+curl -X POST http://localhost:8000/api/training/train-model `
+  -H "Content-Type: application/json" `
+  -d "{\"build_dataset\":true,\"days\":14,\"max_rows_per_symbol\":5000,\"use_all_data\":true}"
+```
+
+After this succeeds, `/api/models/latest` should show `status=trained`, the dashboard model badge should show a version, and the auto trader can trade from the trained model.
+
 Continue from an existing checkpoint without starting from zero:
 
 ```powershell
@@ -341,10 +363,12 @@ Set environment variables in Railway:
 - `TRADING_MODE=paper`
 - `BINANCE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
 - `AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
+- `AUTO_TRADER_USE_TRAINED_MODEL=true`
 - `DERIVATIVES_ENABLED=true`
 - `ENABLE_DERIVATIVES_COLLECTOR=true` if you want trader-flow data to run automatically
 - `PAPER_LEVERAGE=10`
 - `RISK_MAX_TRADE_SIZE_PCT=0.50`
+- `STORE_MARKET_TICKS=false`
 - `STRATEGY_MIN_EDGE_AFTER_FEES=0.001`
 - `AUTO_MIN_HOLD_SECONDS=900`
 - `AUTO_TAKE_PROFIT_MIN_HOLD_SECONDS=0`

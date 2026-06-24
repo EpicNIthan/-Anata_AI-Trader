@@ -18,6 +18,8 @@ class RiskResult:
     margin_required: float = 0.0
     leverage: float = 1.0
     allocation_pct: float = 0.0
+    intent: str = "none"
+    side: str | None = None
 
 
 class RiskManager:
@@ -35,45 +37,49 @@ class RiskManager:
         existing_position: Position | None,
     ) -> RiskResult:
         normalized_action = action.upper()
-        if normalized_action == "HOLD":
-            return RiskResult(True, "Hold action does not create market exposure.", 0.0)
+        intent, side = self._intent(normalized_action, existing_position)
 
-        if normalized_action in {"SELL", "CLOSE"}:
-            if existing_position is None:
-                return RiskResult(False, "No open long position exists to close; shorting is disabled.", 0.0)
+        if intent == "hold":
+            return RiskResult(True, "Hold action does not create market exposure.", 0.0, intent=intent)
+
+        if intent == "unsupported":
+            return RiskResult(False, f"Unsupported action: {normalized_action}", 0.0, intent=intent)
+
+        if intent == "missing_position":
+            return RiskResult(False, "No open paper futures position exists to close.", 0.0, intent=intent)
+
+        if intent == "close":
+            assert existing_position is not None
             return RiskResult(
                 True,
-                "Close action reduces existing long exposure; shorting is disabled.",
+                f"{normalized_action} reduces existing {existing_position.side.upper()} paper futures exposure.",
                 existing_position.quantity * existing_position.current_price,
                 margin_required=0.0,
                 leverage=existing_position.leverage or self._paper_leverage(),
                 allocation_pct=0.0,
+                intent=intent,
+                side=existing_position.side.upper(),
             )
 
-        if normalized_action != "BUY":
-            return RiskResult(False, f"Unsupported action: {normalized_action}", 0.0)
-
         if confidence < settings.risk_min_confidence:
-            return RiskResult(False, "Signal confidence is below the configured minimum.", 0.0)
+            return RiskResult(False, "Signal confidence is below the configured minimum.", 0.0, intent=intent, side=side)
 
         daily_pnl = self._daily_realized_pnl()
         max_daily_loss = settings.paper_start_balance * settings.risk_max_daily_loss_pct
         if daily_pnl <= -max_daily_loss:
-            return RiskResult(False, "Max daily loss limit reached.", 0.0)
+            return RiskResult(False, "Max daily loss limit reached.", 0.0, intent=intent, side=side)
 
         if self._cooldown_active(equity):
-            return RiskResult(False, "Cooldown is active after a large recent loss.", 0.0)
+            return RiskResult(False, "Cooldown is active after a large recent loss.", 0.0, intent=intent, side=side)
 
-        open_positions = self.session.scalar(
-            select(func.count(Position.id)).where(Position.status == "OPEN")
-        ) or 0
+        open_positions = self.session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0
         if existing_position is None and open_positions >= settings.risk_max_open_positions:
-            return RiskResult(False, "Max open position limit reached.", 0.0)
+            return RiskResult(False, "Max open position limit reached.", 0.0, intent=intent, side=side)
 
         leverage = self._paper_leverage()
         allocation_pct = self._confidence_allocation(confidence)
         if allocation_pct <= 0:
-            return RiskResult(False, "Signal confidence did not earn a positive position size.", 0.0)
+            return RiskResult(False, "Signal confidence did not earn a positive position size.", 0.0, intent=intent, side=side)
 
         max_margin = min(
             cash_balance / (1.0 + settings.paper_fee_rate * leverage),
@@ -84,16 +90,38 @@ class RiskManager:
             max_notional = min(max_notional, requested_notional)
             max_margin = max_notional / leverage
         if max_notional <= 0:
-            return RiskResult(False, "No cash is available for a new paper trade.", 0.0)
+            return RiskResult(False, "No cash is available for a new paper futures trade.", 0.0, intent=intent, side=side)
 
         return RiskResult(
             True,
-            f"Risk checks passed. Paper leverage {leverage:g}x, margin allocation {allocation_pct:.1%}.",
+            (
+                f"Risk checks passed for {side} paper futures. "
+                f"Leverage {leverage:g}x, margin allocation {allocation_pct:.1%}."
+            ),
             max_notional,
             margin_required=max_margin,
             leverage=leverage,
             allocation_pct=allocation_pct,
+            intent=intent,
+            side=side,
         )
+
+    def _intent(self, action: str, existing_position: Position | None) -> tuple[str, str | None]:
+        if action == "HOLD":
+            return "hold", None
+        if action not in {"BUY", "SELL", "CLOSE"}:
+            return "unsupported", None
+        if action == "CLOSE":
+            return ("close", existing_position.side.upper()) if existing_position else ("missing_position", None)
+
+        requested_side = "LONG" if action == "BUY" else "SHORT"
+        if existing_position is None:
+            return "open", requested_side
+
+        current_side = existing_position.side.upper()
+        if requested_side == current_side:
+            return "increase", requested_side
+        return "close", current_side
 
     def _paper_leverage(self) -> float:
         requested = max(settings.paper_leverage, 1.0)

@@ -163,7 +163,7 @@
 
         <section id="tab-trades" class="tab-panel">
           <table>
-            <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Price</th><th>Fee</th><th>Realized PnL</th><th>Reason</th></tr></thead>
+            <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Realized PnL</th><th>Reason</th></tr></thead>
             <tbody id="tradesBody"></tbody>
           </table>
         </section>
@@ -247,6 +247,7 @@
             <div><span>Last Training Run</span><strong id="lastTrainingRun">-</strong></div>
           </div>
           <button id="buildDatasetButton" class="primary">Build Training Dataset</button>
+          <button id="trainModelButton" class="primary">Train Model</button>
           <button id="exportDatasetButton" class="primary">Export Dataset</button>
           <pre id="exportResult" class="log-box"></pre>
         </section>

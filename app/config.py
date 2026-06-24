@@ -70,6 +70,7 @@ class Settings:
     )
     binance_interval: str = os.getenv("BINANCE_INTERVAL", "1m")
     store_live_candle_updates: bool = field(default_factory=lambda: _bool("STORE_LIVE_CANDLE_UPDATES", True))
+    store_market_ticks: bool = field(default_factory=lambda: _bool("STORE_MARKET_TICKS", False))
     binance_rest_base_url: str = os.getenv("BINANCE_REST_BASE_URL", "https://data-api.binance.vision")
     binance_ws_base_url: str = os.getenv("BINANCE_WS_BASE_URL", "wss://data-stream.binance.vision")
     binance_futures_rest_base_url: str = os.getenv("BINANCE_FUTURES_REST_BASE_URL", "https://fapi.binance.com")
@@ -113,6 +114,7 @@ class Settings:
     enable_market_collector: bool = field(default_factory=lambda: _bool("ENABLE_MARKET_COLLECTOR"))
     enable_news_collector: bool = field(default_factory=lambda: _bool("ENABLE_NEWS_COLLECTOR"))
     auto_trader_enabled: bool = field(default_factory=lambda: _bool("AUTO_TRADER_ENABLED"))
+    auto_trader_use_trained_model: bool = field(default_factory=lambda: _bool("AUTO_TRADER_USE_TRAINED_MODEL", True))
     auto_trader_interval_seconds: int = field(default_factory=lambda: _int("AUTO_TRADER_INTERVAL_SECONDS", 60))
     auto_trader_symbols: list[str] = field(
         default_factory=lambda: _csv(os.getenv("AUTO_TRADER_SYMBOLS"), DEFAULT_SYMBOLS)

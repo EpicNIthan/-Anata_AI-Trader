@@ -10,9 +10,10 @@ from typing import Any
 from sqlalchemy import desc, select
 
 from app.ai.experience_buffer import record_experience, update_experience_rewards
+from app.ai.model_strategy import ModelDecision, PriceModelStrategy
 from app.ai.strategy import RuleBasedStrategy, StrategyDecision
 from app.config import settings
-from app.db.models import AiDecision, Candle, Feature, LiveCandleUpdate, PaperTrade, Position
+from app.db.models import AiDecision, Candle, Feature, LiveCandleUpdate, ModelVersion, PaperTrade, Position
 from app.db.session import SessionLocal
 from app.features.feature_builder import FeatureBuilder
 from app.trading.paper_engine import ExecutionResult, PaperEngine
@@ -37,6 +38,7 @@ class AutoTraderState:
     last_error: str | None = None
     last_skip_reason: str | None = None
     last_decision: dict[str, Any] | None = None
+    model_strategy_enabled: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -59,6 +61,7 @@ class AutoTraderService:
             symbols=self.symbols,
             exploration_enabled=settings.exploration_mode and settings.is_paper_mode,
             exploration_rate=settings.exploration_rate,
+            model_strategy_enabled=settings.auto_trader_use_trained_model,
         )
         self._rng = random.Random()
         self._task: asyncio.Task[None] | None = None
@@ -161,8 +164,11 @@ class AutoTraderService:
             interval=settings.paper_trade_timeframe,
             store=True,
         )
-        strategy_decision = RuleBasedStrategy().decide(feature)
-        decision, decision_source = self._maybe_explore(session, symbol, strategy_decision)
+        fallback_decision = RuleBasedStrategy().decide(feature)
+        model_decision = PriceModelStrategy().decide(session, feature) if settings.auto_trader_use_trained_model else None
+        base_decision = model_decision.decision if model_decision else fallback_decision
+        base_source = "model" if model_decision else "strategy"
+        decision, decision_source = self._maybe_explore(session, symbol, base_decision, base_source)
         managed_decision = self._position_management_decision(session, symbol, decision)
         if managed_decision:
             decision, decision_source = managed_decision
@@ -178,7 +184,7 @@ class AutoTraderService:
                 reason=decision.reason,
                 stop_loss=decision.stop_loss,
                 take_profit=decision.take_profit,
-                notional=settings.min_paper_trade_notional if decision_source == "exploration" and decision.action == "BUY" else None,
+                notional=settings.min_paper_trade_notional if decision_source == "exploration" and decision.action in {"BUY", "SELL"} else None,
             )
 
         execution = {
@@ -189,7 +195,7 @@ class AutoTraderService:
             "equity": execution_result.equity,
         }
         execution["decision_source"] = decision_source
-        execution["strategy_action"] = strategy_decision.action
+        execution["strategy_action"] = fallback_decision.action
         ai_decision = self._record_decision(
             session,
             symbol,
@@ -198,7 +204,9 @@ class AutoTraderService:
             execution_result,
             execution,
             decision_source=decision_source,
-            strategy_decision=strategy_decision,
+            strategy_decision=fallback_decision,
+            base_decision=base_decision,
+            model_decision=model_decision,
         )
         return {
             "decision_id": ai_decision.id,
@@ -209,7 +217,9 @@ class AutoTraderService:
             "confidence": decision.confidence,
             "reason": decision.reason,
             "decision_source": decision_source,
-            "strategy_action": strategy_decision.action,
+            "strategy_action": fallback_decision.action,
+            "model_action": model_decision.decision.action if model_decision else None,
+            "model_version_id": model_decision.model.id if model_decision else None,
             **execution,
         }
 
@@ -217,12 +227,13 @@ class AutoTraderService:
         self,
         session,
         symbol: str,
-        strategy_decision: StrategyDecision,
+        base_decision: StrategyDecision,
+        base_source: str,
     ) -> tuple[StrategyDecision, str]:
         if not settings.is_paper_mode or not settings.exploration_mode or settings.exploration_rate <= 0:
-            return strategy_decision, "strategy"
+            return base_decision, base_source
         if self._rng.random() >= min(max(settings.exploration_rate, 0.0), 1.0):
-            return strategy_decision, "strategy"
+            return base_decision, base_source
 
         existing_position = session.scalar(
             select(Position)
@@ -233,11 +244,11 @@ class AutoTraderService:
         if existing_position:
             action = self._rng.choice(["BUY", "SELL", "CLOSE"])
         else:
-            action = "BUY"
-        confidence = max(settings.risk_min_confidence, min(max(strategy_decision.confidence, 0.0), 0.75))
+            action = self._rng.choice(["BUY", "SELL"])
+        confidence = max(settings.risk_min_confidence, min(max(base_decision.confidence, 0.0), 0.75))
         reason = (
             f"Exploration paper action selected to collect action-result experience. "
-            f"Original strategy wanted {strategy_decision.action}: {strategy_decision.reason}"
+            f"Original {base_source} wanted {base_decision.action}: {base_decision.reason}"
         )
         return StrategyDecision(action=action, confidence=confidence, reason=reason), "exploration"
 
@@ -251,12 +262,19 @@ class AutoTraderService:
         execution: dict[str, Any],
         decision_source: str,
         strategy_decision: StrategyDecision,
+        base_decision: StrategyDecision,
+        model_decision: ModelDecision | None,
     ) -> AiDecision:
         strategy_name = RuleBasedStrategy.name
         source_name = self.name
+        model_version: ModelVersion | None = None
         if decision_source == "exploration":
             strategy_name = "exploration-v1"
             source_name = "auto-trader-exploration-v1"
+        elif decision_source == "model":
+            model_version = model_decision.model if model_decision else None
+            strategy_name = model_version.name if model_version else PriceModelStrategy.name
+            source_name = "auto-trader-model-v1"
         elif decision_source == "risk-exit":
             strategy_name = "position-risk-manager-v1"
             source_name = "auto-trader-risk-exit-v1"
@@ -268,6 +286,7 @@ class AutoTraderService:
             strategy_name=strategy_name,
             source_name=source_name,
             feature_id=feature.id,
+            model_version_id=model_version.id if model_version else None,
             feature_schema_version=feature.schema_version,
             action=decision.action,
             confidence=decision.confidence,
@@ -280,7 +299,9 @@ class AutoTraderService:
             raw={
                 **decision.model_dump(),
                 "decision_source": decision_source,
-                "strategy_decision": decision.model_dump() if decision_source == "strategy" else strategy_decision.model_dump(),
+                "base_decision": base_decision.model_dump(),
+                "strategy_decision": strategy_decision.model_dump(),
+                "model_prediction": model_decision.prediction if model_decision else None,
                 "exploration": {
                     "enabled": settings.exploration_mode,
                     "rate": settings.exploration_rate,
@@ -321,7 +342,7 @@ class AutoTraderService:
             return None
         mark_price = self._latest_price(session, symbol) or position.current_price or position.entry_price
         position.current_price = mark_price
-        gross_pnl = (mark_price - position.entry_price) * position.quantity
+        gross_pnl = self._position_gross_pnl(position, mark_price)
         close_notional = position.quantity * mark_price
         close_fee = close_notional * settings.paper_fee_rate
         net_pnl = gross_pnl - close_fee
@@ -334,9 +355,9 @@ class AutoTraderService:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
         age_seconds = max((now - opened_at).total_seconds(), 0.0)
 
-        stop_loss = position.stop_loss or self._default_stop_loss(position.entry_price)
-        take_profit = position.take_profit or self._default_take_profit(position.entry_price)
-        if stop_loss and mark_price <= stop_loss:
+        stop_loss = position.stop_loss or self._default_stop_loss(position.entry_price, position.side)
+        take_profit = position.take_profit or self._default_take_profit(position.entry_price, position.side)
+        if stop_loss and self._stop_loss_hit(position.side, mark_price, stop_loss):
             return (
                 StrategyDecision(
                     action="CLOSE",
@@ -357,7 +378,7 @@ class AutoTraderService:
                 ),
                 "risk-exit",
             )
-        if take_profit and mark_price >= take_profit:
+        if take_profit and self._take_profit_hit(position.side, mark_price, take_profit):
             if age_seconds >= settings.auto_take_profit_min_hold_seconds:
                 return (
                     StrategyDecision(
@@ -407,7 +428,7 @@ class AutoTraderService:
         if existing_position is None:
             return decision
         mark_price = self._latest_price(session, symbol) or existing_position.current_price or existing_position.entry_price
-        gross_pnl = (mark_price - existing_position.entry_price) * existing_position.quantity
+        gross_pnl = self._position_gross_pnl(existing_position, mark_price)
         close_notional = existing_position.quantity * mark_price
         close_fee = close_notional * settings.paper_fee_rate
         min_net_profit = close_notional * settings.auto_close_min_net_profit_pct
@@ -459,15 +480,17 @@ class AutoTraderService:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
         return max((datetime.now(timezone.utc) - opened_at).total_seconds(), 0.0)
 
-    def _default_stop_loss(self, price: float) -> float | None:
+    def _default_stop_loss(self, price: float, side: str) -> float | None:
         if settings.auto_default_stop_loss_pct <= 0:
             return None
-        return price * (1.0 - settings.auto_default_stop_loss_pct)
+        multiplier = 1.0 - settings.auto_default_stop_loss_pct if side.upper() == "LONG" else 1.0 + settings.auto_default_stop_loss_pct
+        return price * multiplier
 
-    def _default_take_profit(self, price: float) -> float | None:
+    def _default_take_profit(self, price: float, side: str) -> float | None:
         if settings.auto_default_take_profit_pct <= 0:
             return None
-        return price * (1.0 + settings.auto_default_take_profit_pct)
+        multiplier = 1.0 + settings.auto_default_take_profit_pct if side.upper() == "LONG" else 1.0 - settings.auto_default_take_profit_pct
+        return price * multiplier
 
     def _duplicate_or_loss_cooldown(
         self,
@@ -475,28 +498,37 @@ class AutoTraderService:
         symbol: str,
         decision: StrategyDecision,
     ) -> ExecutionResult | None:
-        if decision.action.upper() != "BUY":
+        action = decision.action.upper()
+        if action not in {"BUY", "SELL"}:
+            return None
+        existing_position = session.scalar(
+            select(Position)
+            .where(Position.symbol == symbol, Position.status == "OPEN")
+            .order_by(desc(Position.opened_at))
+            .limit(1)
+        )
+        target_side = "LONG" if action == "BUY" else "SHORT"
+        if existing_position and existing_position.side.upper() != target_side:
             return None
 
         now = datetime.now(timezone.utc)
         duplicate_since = now - timedelta(seconds=max(settings.auto_trader_interval_seconds, 60))
-        existing_long = session.scalar(
-            select(Position)
-            .where(Position.symbol == symbol, Position.status == "OPEN", Position.side == "LONG")
-            .order_by(desc(Position.opened_at))
-            .limit(1)
-        )
         recent_buy = session.scalar(
             select(PaperTrade)
-            .where(PaperTrade.symbol == symbol, PaperTrade.action == "BUY", PaperTrade.created_at >= duplicate_since)
+            .where(
+                PaperTrade.symbol == symbol,
+                PaperTrade.action == action,
+                PaperTrade.side == target_side,
+                PaperTrade.created_at >= duplicate_since,
+            )
             .order_by(desc(PaperTrade.created_at))
             .limit(1)
         )
-        if existing_long and recent_buy:
+        if existing_position and recent_buy:
             snapshot = PaperEngine(session).snapshot()
             return ExecutionResult(
                 status="REJECTED",
-                message="Duplicate long entry cooldown is active for this symbol.",
+                message=f"Duplicate {target_side.lower()} entry cooldown is active for this symbol.",
                 balance=snapshot["cash_balance"],
                 equity=snapshot["equity"],
             )
@@ -510,12 +542,28 @@ class AutoTraderService:
                 .limit(1)
             )
             if recent_loss:
-                snapshot = PaperEngine(session).snapshot()
-                return ExecutionResult(
-                    status="REJECTED",
-                    message="Auto trader cooldown is active after a recent loss.",
-                    balance=snapshot["cash_balance"],
-                    equity=snapshot["equity"],
-                )
+                loss_threshold = max(settings.min_paper_trade_notional * 0.02, 1.0)
+                if abs(float(recent_loss.realized_pnl or 0.0)) >= loss_threshold:
+                    snapshot = PaperEngine(session).snapshot()
+                    return ExecutionResult(
+                        status="REJECTED",
+                        message=(
+                            "Auto trader cooldown is active after a meaningful recent loss "
+                            f"(${recent_loss.realized_pnl:.4f})."
+                        ),
+                        balance=snapshot["cash_balance"],
+                        equity=snapshot["equity"],
+                    )
 
         return None
+
+    def _position_gross_pnl(self, position: Position, mark_price: float) -> float:
+        if position.side.upper() == "SHORT":
+            return (position.entry_price - mark_price) * position.quantity
+        return (mark_price - position.entry_price) * position.quantity
+
+    def _stop_loss_hit(self, side: str, mark_price: float, stop_loss: float) -> bool:
+        return mark_price <= stop_loss if side.upper() == "LONG" else mark_price >= stop_loss
+
+    def _take_profit_hit(self, side: str, mark_price: float, take_profit: float) -> bool:
+        return mark_price >= take_profit if side.upper() == "LONG" else mark_price <= take_profit

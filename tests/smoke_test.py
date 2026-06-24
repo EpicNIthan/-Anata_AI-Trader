@@ -64,6 +64,7 @@ def main() -> None:
     db_path = Path("_smoke_trading_lab.db")
     exported_path: Path | None = None
     accelerated_exported_path: Path | None = None
+    trained_model_path: Path | None = None
     archive_paths: list[Path] = []
     if db_path.exists():
         db_path.unlink()
@@ -128,6 +129,56 @@ def main() -> None:
         assert trade.status_code == 200, trade.text
         assert trade.json()["status"] == "FILLED", trade.text
         assert trade.json()["decision_id"] > 0, trade.text
+
+        close_long = client.post(
+            "/api/signal",
+            json={
+                "symbol": "BTCUSDT",
+                "action": "CLOSE",
+                "confidence": 0.95,
+                "price": 50100,
+                "reason": "smoke close long",
+                "source": "smoke-test",
+            },
+            auth=auth,
+        )
+        assert close_long.status_code == 200, close_long.text
+        assert close_long.json()["status"] == "FILLED", close_long.text
+
+        short_trade = client.post(
+            "/api/signal",
+            json={
+                "symbol": "BTCUSDT",
+                "action": "SELL",
+                "confidence": 0.90,
+                "price": 50200,
+                "notional": 250,
+                "reason": "smoke short test",
+                "source": "smoke-test",
+            },
+            auth=auth,
+        )
+        assert short_trade.status_code == 200, short_trade.text
+        assert short_trade.json()["status"] == "FILLED", short_trade.text
+        positions_after_short = client.get("/api/positions")
+        assert positions_after_short.status_code == 200, positions_after_short.text
+        open_short = [row for row in positions_after_short.json() if row["symbol"] == "BTCUSDT" and row["status"] == "OPEN"]
+        assert open_short and open_short[0]["side"] == "SHORT", positions_after_short.text
+
+        close_short = client.post(
+            "/api/signal",
+            json={
+                "symbol": "BTCUSDT",
+                "action": "CLOSE",
+                "confidence": 0.95,
+                "price": 50100,
+                "reason": "smoke close short",
+                "source": "smoke-test",
+            },
+            auth=auth,
+        )
+        assert close_short.status_code == 200, close_short.text
+        assert close_short.json()["status"] == "FILLED", close_short.text
 
         experiences = client.get("/api/experiences")
         assert experiences.status_code == 200, experiences.text
@@ -204,6 +255,23 @@ def main() -> None:
         assert accelerated_payload["labels"]["rows_created"] > 0, accelerated.text
         assert accelerated_payload["replay"]["experiences_created"] > 0, accelerated.text
         accelerated_exported_path = Path(accelerated_payload["exported_path"])
+
+        train_model = client.post(
+            "/api/training/train-model",
+            json={"dataset_path": accelerated_payload["exported_path"], "use_all_data": True},
+            auth=auth,
+        )
+        assert train_model.status_code == 200, train_model.text
+        assert train_model.json()["status"] == "trained", train_model.text
+        assert train_model.json()["model"]["version"], train_model.text
+        trained_model_path = Path(train_model.json()["model_path"])
+        latest_model = client.get("/api/models/latest")
+        assert latest_model.status_code == 200, latest_model.text
+        assert latest_model.json()["status"] == "trained", latest_model.text
+        model_prediction = client.get("/api/models/predict?symbol=BTCUSDT")
+        assert model_prediction.status_code == 200, model_prediction.text
+        assert model_prediction.json()["status"] == "ok", model_prediction.text
+        assert "predicted_return" in model_prediction.json()["prediction"], model_prediction.text
 
         market_backfill = client.post(
             "/api/market/backfill",
@@ -288,7 +356,7 @@ def main() -> None:
         assert auto_status.get("position_management", {}).get("min_hold_seconds", 0) > 0, auto_status
         decisions = client.get("/api/ai-decisions")
         assert decisions.status_code == 200, decisions.text
-        assert decisions.json()[0]["decision_source"] in {"exploration", "position-management", "risk-exit", "strategy"}, decisions.text
+        assert decisions.json()[0]["decision_source"] in {"exploration", "model", "position-management", "risk-exit", "strategy"}, decisions.text
         summary_after_auto = client.get("/api/dashboard/summary")
         assert summary_after_auto.status_code == 200, summary_after_auto.text
         trading_counts = summary_after_auto.json()["trading"]
@@ -361,6 +429,8 @@ def main() -> None:
         exported_path.unlink()
     if accelerated_exported_path and accelerated_exported_path.exists():
         accelerated_exported_path.unlink()
+    if trained_model_path and trained_model_path.exists():
+        trained_model_path.unlink()
     for archive_path in archive_paths:
         if archive_path.exists():
             archive_path.unlink()

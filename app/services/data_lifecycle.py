@@ -82,9 +82,10 @@ def cleanup_old_data(session: Session) -> dict[str, Any]:
     deleted_legacy_live_candles = _rowcount(
         session.execute(delete(Candle).where(Candle.is_closed.is_(False), Candle.updated_at < live_cutoff))
     )
-    deleted_raw_ticks = _rowcount(
-        session.execute(delete(MarketTick).where(MarketTick.event_time < raw_tick_cutoff))
-    )
+    if settings.store_market_ticks:
+        deleted_raw_ticks = _rowcount(session.execute(delete(MarketTick).where(MarketTick.event_time < raw_tick_cutoff)))
+    else:
+        deleted_raw_ticks = _rowcount(session.execute(delete(MarketTick)))
     deleted_old_closed_candles = _rowcount(
         session.execute(delete(Candle).where(Candle.is_closed.is_(True), Candle.open_time < closed_candle_cutoff))
     )
@@ -148,6 +149,7 @@ def retention_config() -> dict[str, Any]:
         "live_update_retention_hours": settings.live_update_retention_hours,
         "raw_news_retention_days": settings.raw_news_retention_days,
         "raw_tick_retention_days": settings.raw_tick_retention_days,
+        "store_market_ticks": settings.store_market_ticks,
         "diagnostic_retention_days": settings.diagnostic_retention_days,
         "external_data_retention_days": settings.external_data_retention_days,
         "experience_retention_days": settings.experience_retention_days,
