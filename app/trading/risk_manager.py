@@ -55,7 +55,7 @@ class RiskManager:
                 f"{normalized_action} reduces existing {existing_position.side.upper()} paper futures exposure.",
                 existing_position.quantity * existing_position.current_price,
                 margin_required=0.0,
-                leverage=existing_position.leverage or self._paper_leverage(),
+                leverage=existing_position.leverage or self._paper_leverage(confidence),
                 allocation_pct=0.0,
                 intent=intent,
                 side=existing_position.side.upper(),
@@ -76,7 +76,7 @@ class RiskManager:
         if existing_position is None and open_positions >= settings.risk_max_open_positions:
             return RiskResult(False, "Max open position limit reached.", 0.0, intent=intent, side=side)
 
-        leverage = self._paper_leverage()
+        leverage = self._paper_leverage(confidence)
         allocation_pct = self._confidence_allocation(confidence)
         if allocation_pct <= 0:
             return RiskResult(False, "Signal confidence did not earn a positive position size.", 0.0, intent=intent, side=side)
@@ -89,6 +89,12 @@ class RiskManager:
         if requested_notional is not None:
             max_notional = min(max_notional, requested_notional)
             max_margin = max_notional / leverage
+        if settings.risk_max_entry_fee_pct_of_equity > 0 and settings.paper_fee_rate > 0:
+            max_entry_fee = equity * settings.risk_max_entry_fee_pct_of_equity
+            fee_capped_notional = max_entry_fee / settings.paper_fee_rate
+            if max_notional > fee_capped_notional:
+                max_notional = fee_capped_notional
+                max_margin = max_notional / leverage
         if max_notional <= 0:
             return RiskResult(False, "No cash is available for a new paper futures trade.", 0.0, intent=intent, side=side)
 
@@ -96,7 +102,7 @@ class RiskManager:
             True,
             (
                 f"Risk checks passed for {side} paper futures. "
-                f"Leverage {leverage:g}x, margin allocation {allocation_pct:.1%}."
+                f"Confidence-sized leverage {leverage:g}x, margin allocation {allocation_pct:.1%}."
             ),
             max_notional,
             margin_required=max_margin,
@@ -123,10 +129,16 @@ class RiskManager:
             return "increase", requested_side
         return "close", current_side
 
-    def _paper_leverage(self) -> float:
-        requested = max(settings.paper_leverage, 1.0)
+    def _paper_leverage(self, confidence: float) -> float:
         max_allowed = max(settings.paper_max_leverage, 1.0)
-        return min(requested, max_allowed)
+        if not settings.paper_confidence_leverage_enabled:
+            return min(max(settings.paper_leverage, 1.0), max_allowed)
+        min_allowed = min(max(settings.paper_min_leverage, 1.0), max_allowed)
+        if confidence <= settings.risk_min_confidence:
+            return min_allowed
+        span = max(1.0 - settings.risk_min_confidence, 1e-9)
+        confidence_scale = max(0.0, min(1.0, (confidence - settings.risk_min_confidence) / span))
+        return min_allowed + (max_allowed - min_allowed) * confidence_scale
 
     def _confidence_allocation(self, confidence: float) -> float:
         if confidence <= settings.risk_min_confidence:

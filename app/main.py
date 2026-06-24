@@ -15,6 +15,7 @@ from app.db.session import create_db_and_tables, ping_database
 from app.logging_config import setup_logging
 from app.services.auto_trader import AutoTraderService
 from app.services.data_lifecycle import DataLifecycleService
+from app.services.training_service import TrainingService
 
 setup_logging()
 
@@ -26,9 +27,11 @@ async def lifespan(app: FastAPI):
     manager = WorkerManager()
     auto_trader = AutoTraderService()
     data_lifecycle = DataLifecycleService()
+    training_service = TrainingService()
     app.state.worker_manager = manager
     app.state.auto_trader = auto_trader
     app.state.data_lifecycle = data_lifecycle
+    app.state.training_service = training_service
     await data_lifecycle.start()
     if settings.enable_market_collector:
         await manager.start("market")

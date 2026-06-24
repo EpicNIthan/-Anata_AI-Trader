@@ -154,9 +154,12 @@ AUTO_TRADER_USE_TRAINED_MODEL=true
 AUTO_TRADER_INTERVAL_SECONDS=60
 AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT
 PAPER_TRADE_TIMEFRAME=1m
-PAPER_LEVERAGE=10
-PAPER_MAX_LEVERAGE=20
+PAPER_FEE_RATE=0.0004
+PAPER_MIN_LEVERAGE=1
+PAPER_MAX_LEVERAGE=125
+PAPER_CONFIDENCE_LEVERAGE_ENABLED=true
 RISK_MAX_TRADE_SIZE_PCT=0.50
+RISK_MAX_ENTRY_FEE_PCT_OF_EQUITY=0.01
 STRATEGY_MIN_EDGE_AFTER_FEES=0.001
 AUTO_CLOSE_MIN_NET_PROFIT_PCT=0.001
 AUTO_MIN_HOLD_SECONDS=900
@@ -197,8 +200,9 @@ Safety behavior:
 - No live exchange order execution.
 - Uses the latest trained model automatically when `AUTO_TRADER_USE_TRAINED_MODEL=true`; falls back to `rule-based-v1` while no model exists.
 - Uses the existing risk manager.
-- Uses explicit paper-only leverage. `PAPER_LEVERAGE=10` means a $500 margin allocation creates up to $5,000 fake notional exposure. Fees are still charged on notional.
+- Uses confidence-sized paper-only leverage. With `PAPER_CONFIDENCE_LEVERAGE_ENABLED=true`, low confidence stays near `PAPER_MIN_LEVERAGE`, while very high confidence can approach `PAPER_MAX_LEVERAGE`.
 - Sizes new entries from 0% to `RISK_MAX_TRADE_SIZE_PCT` of equity as margin based on confidence. With `RISK_MAX_TRADE_SIZE_PCT=0.50`, very high-confidence paper trades can use up to 50% of equity as margin.
+- Caps entry fee exposure with `RISK_MAX_ENTRY_FEE_PCT_OF_EQUITY`, because high leverage creates large notional and fees are charged on notional, not margin.
 - Avoids weak entries when the expected edge is smaller than round-trip paper fees plus `STRATEGY_MIN_EDGE_AFTER_FEES`.
 - Keeps weak/noisy strategy exits open for at least `AUTO_MIN_HOLD_SECONDS` so the bot does not churn in and out after one minute.
 - Allows take-profit exits immediately by default with `AUTO_TAKE_PROFIT_MIN_HOLD_SECONDS=0`.
@@ -225,7 +229,7 @@ Reprocess existing news sentiment after enabling Hugging Face:
 curl -X POST http://localhost:8000/api/sentiment/reprocess -H "Content-Type: application/json" -d "{\"limit\":200,\"reset_model\":true}"
 ```
 
-`/api/dashboard/summary` and the dashboard sentiment status show whether HF really loaded. If `hf_loaded=false`, the app is still using the rule-based fallback. This can happen if Railway cannot download the model or does not have enough memory for `transformers`/`torch`.
+`/api/dashboard/summary` and the dashboard sentiment status show whether HF really loaded. If `hf_loaded=false`, the app is still using the rule-based fallback. This can happen if Railway cannot download the model, does not have enough memory for `transformers`/`torch`, or the variable is not enabled. Quoted booleans like `ENABLE_HF_SENTIMENT="true"` are accepted, but Railway variables should normally be entered without quotes.
 
 Data lifecycle rules:
 
@@ -297,12 +301,12 @@ Train the first model:
 python -m app.training.train_price_model --dataset datasets/features_YYYYMMDD_HHMMSS.csv
 ```
 
-Or from the dashboard Training tab, click `Train Model`. This calls:
+Or from the dashboard Training tab, click `Train Model`. It starts a background training job so the website stays responsive. Status is available at `/api/training/status`. For a synchronous local/API run, pass `wait=true`:
 
 ```powershell
 curl -X POST http://localhost:8000/api/training/train-model `
   -H "Content-Type: application/json" `
-  -d "{\"build_dataset\":true,\"days\":14,\"max_rows_per_symbol\":5000,\"use_all_data\":true}"
+  -d "{\"build_dataset\":true,\"days\":14,\"max_rows_per_symbol\":5000,\"use_all_data\":true,\"wait\":true}"
 ```
 
 After this succeeds, `/api/models/latest` should show `status=trained`, the dashboard model badge should show a version, and the auto trader can trade from the trained model.
@@ -366,8 +370,12 @@ Set environment variables in Railway:
 - `AUTO_TRADER_USE_TRAINED_MODEL=true`
 - `DERIVATIVES_ENABLED=true`
 - `ENABLE_DERIVATIVES_COLLECTOR=true` if you want trader-flow data to run automatically
-- `PAPER_LEVERAGE=10`
+- `PAPER_FEE_RATE=0.0004`
+- `PAPER_MIN_LEVERAGE=1`
+- `PAPER_MAX_LEVERAGE=125`
+- `PAPER_CONFIDENCE_LEVERAGE_ENABLED=true`
 - `RISK_MAX_TRADE_SIZE_PCT=0.50`
+- `RISK_MAX_ENTRY_FEE_PCT_OF_EQUITY=0.01`
 - `STORE_MARKET_TICKS=false`
 - `STRATEGY_MIN_EDGE_AFTER_FEES=0.001`
 - `AUTO_MIN_HOLD_SECONDS=900`

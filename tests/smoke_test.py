@@ -258,7 +258,7 @@ def main() -> None:
 
         train_model = client.post(
             "/api/training/train-model",
-            json={"dataset_path": accelerated_payload["exported_path"], "use_all_data": True},
+            json={"dataset_path": accelerated_payload["exported_path"], "use_all_data": True, "wait": True},
             auth=auth,
         )
         assert train_model.status_code == 200, train_model.text

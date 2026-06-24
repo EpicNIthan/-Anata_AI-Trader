@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,9 +39,9 @@ from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_sche
 from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
 from app.services.db_diagnostics import database_diagnostics
+from app.services.training_service import train_model_job
 from app.training.dataset_accelerator import build_accelerated_dataset
 from app.training.export_dataset import export_dataset, parse_since_date
-from app.training.train_price_model import train_price_model
 from app.trading.paper_engine import PaperEngine
 
 router = APIRouter(prefix="/api", tags=["lab"])
@@ -268,6 +267,13 @@ def _data_lifecycle(request: Request):
     return service
 
 
+def _training_service(request: Request):
+    service = getattr(request.app.state, "training_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Training service is not initialized")
+    return service
+
+
 def _derivatives_snapshot(session: Session, worker_state: dict[str, Any] | None = None) -> dict[str, Any]:
     worker_state = worker_state or {}
     collector = BinanceDerivativesCollector()
@@ -387,6 +393,7 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
             "last_run_at": _dt(latest_training_run.started_at if latest_training_run else None),
             "status": latest_training_run.status if latest_training_run else "none",
             "feature_schema_version": latest_training_run.feature_schema_version if latest_training_run else CURRENT_FEATURE_SCHEMA_VERSION,
+            "worker": _training_service(request).status(),
         },
         "counts": {
             "candles": session.scalar(select(func.count(Candle.id))) or 0,
@@ -923,81 +930,25 @@ async def training_build_dataset(
 
 @router.post("/training/train-model")
 async def training_train_model(
+    request: Request,
     payload: dict[str, Any] | None = Body(default=None),
-    session: Session = Depends(get_session),
     _: None = Depends(require_admin),
 ) -> dict[str, Any]:
     payload = payload or {}
-    build_dataset = bool(payload.get("build_dataset", False))
-    dataset_path_value = payload.get("dataset_path")
-    dataset_summary: dict[str, Any] | None = None
+    symbols = payload.get("symbols")
+    if isinstance(symbols, str):
+        payload["symbols"] = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+    elif symbols is not None and not isinstance(symbols, list):
+        raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
+    if bool(payload.get("wait", False)):
+        return await train_model_job(payload)
+    status = await _training_service(request).start(payload)
+    return {"status": "started", "training": status}
 
-    if build_dataset:
-        symbols = payload.get("symbols")
-        if isinstance(symbols, str):
-            symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
-        if symbols is not None and not isinstance(symbols, list):
-            raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
-        dataset_summary = await build_accelerated_dataset(
-            symbols=symbols,
-            interval=str(payload.get("interval") or settings.paper_trade_timeframe),
-            days=min(max(int(payload.get("days") or 14), 1), 365),
-            max_rows_per_symbol=min(max(int(payload.get("max_rows_per_symbol") or 5000), 100), 250_000),
-            lookback=min(max(int(payload.get("lookback") or 60), 10), 500),
-            stride=min(max(int(payload.get("stride") or 5), 1), 500),
-            replay_limit=min(max(int(payload.get("replay_limit") or 20_000), 100), 500_000),
-            backfill=bool(payload.get("backfill", True)),
-            mock=bool(payload.get("mock", False)),
-            export=True,
-        )
-        dataset_path_value = dataset_summary.get("exported_path")
 
-    dataset_path = Path(dataset_path_value) if dataset_path_value else None
-    from_checkpoint_value = payload.get("from_checkpoint")
-    from_checkpoint: Path | None = None
-    if from_checkpoint_value == "latest":
-        latest = session.scalar(select(ModelVersion).where(ModelVersion.status == "trained").order_by(desc(ModelVersion.created_at)).limit(1))
-        from_checkpoint = Path(latest.path) if latest else None
-    elif from_checkpoint_value:
-        from_checkpoint = Path(str(from_checkpoint_value))
-
-    feature_schema_version = str(payload.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION)
-    since_date = parse_since_date(payload.get("since_date"))
-    use_all_data = bool(payload.get("use_all_data", True))
-    epochs = min(max(int(payload.get("epochs") or 500), 1), 20_000)
-    learning_rate = float(payload.get("learning_rate") or 0.05)
-
-    model_path = await asyncio.to_thread(
-        train_price_model,
-        dataset_path,
-        from_checkpoint=from_checkpoint,
-        since_date=since_date,
-        use_all_data=use_all_data,
-        feature_schema_version=feature_schema_version,
-        epochs=epochs,
-        learning_rate=learning_rate,
-    )
-    session.expire_all()
-    model = session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
-    return {
-        "status": "trained",
-        "model_path": str(model_path),
-        "dataset_path": str(dataset_path) if dataset_path else None,
-        "dataset_summary": dataset_summary,
-        "model": {
-            "id": model.id if model else None,
-            "model_id": model.model_id if model else None,
-            "name": model.name if model else None,
-            "version": model.version if model else None,
-            "feature_schema_version": model.feature_schema_version if model else feature_schema_version,
-            "feature_columns": model.feature_columns if model else None,
-            "metrics": model.metrics if model else None,
-            "path": model.path if model else str(model_path),
-            "status": model.status if model else "trained",
-            "created_at": _dt(model.created_at if model else None),
-        },
-        "auto_trader_use_trained_model": settings.auto_trader_use_trained_model,
-    }
+@router.get("/training/status")
+def training_status(request: Request) -> dict[str, Any]:
+    return _training_service(request).status()
 
 
 @router.get("/data-events")

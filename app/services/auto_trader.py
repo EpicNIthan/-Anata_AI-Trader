@@ -79,6 +79,11 @@ class AutoTraderService:
                 "default_take_profit_pct": settings.auto_default_take_profit_pct,
                 "fast_profit_exit_pct": settings.auto_fast_profit_exit_pct,
                 "profit_close_min_net_pct": settings.auto_close_min_net_profit_pct,
+                "confidence_leverage_enabled": settings.paper_confidence_leverage_enabled,
+                "min_leverage": settings.paper_min_leverage,
+                "max_leverage": settings.paper_max_leverage,
+                "max_margin_allocation_pct": settings.risk_max_trade_size_pct,
+                "max_entry_fee_pct_of_equity": settings.risk_max_entry_fee_pct_of_equity,
             },
         }
 

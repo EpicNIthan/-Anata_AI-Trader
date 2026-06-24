@@ -39,7 +39,7 @@ def _bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value in (None, ""):
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return value.strip().strip('"').strip("'").lower() in {"1", "true", "yes", "on"}
 
 
 def _secret(name: str) -> str | None:
@@ -120,9 +120,12 @@ class Settings:
         default_factory=lambda: _csv(os.getenv("AUTO_TRADER_SYMBOLS"), DEFAULT_SYMBOLS)
     )
     paper_trade_timeframe: str = os.getenv("PAPER_TRADE_TIMEFRAME", "1m")
-    paper_fee_rate: float = field(default_factory=lambda: _float("PAPER_FEE_RATE", 0.001))
+    paper_fee_rate: float = field(default_factory=lambda: _float("PAPER_FEE_RATE", 0.0004))
     paper_leverage: float = field(default_factory=lambda: _float("PAPER_LEVERAGE", 10.0))
-    paper_max_leverage: float = field(default_factory=lambda: _float("PAPER_MAX_LEVERAGE", 20.0))
+    paper_min_leverage: float = field(default_factory=lambda: _float("PAPER_MIN_LEVERAGE", 1.0))
+    paper_max_leverage: float = field(default_factory=lambda: _float("PAPER_MAX_LEVERAGE", 125.0))
+    paper_confidence_leverage_enabled: bool = field(default_factory=lambda: _bool("PAPER_CONFIDENCE_LEVERAGE_ENABLED", True))
+    risk_max_entry_fee_pct_of_equity: float = field(default_factory=lambda: _float("RISK_MAX_ENTRY_FEE_PCT_OF_EQUITY", 0.01))
     risk_max_trade_size_pct: float = field(default_factory=lambda: _float("RISK_MAX_TRADE_SIZE_PCT", 0.50))
     risk_max_daily_loss_pct: float = field(default_factory=lambda: _float("RISK_MAX_DAILY_LOSS_PCT", 0.05))
     risk_max_open_positions: int = field(default_factory=lambda: _int("RISK_MAX_OPEN_POSITIONS", 3))

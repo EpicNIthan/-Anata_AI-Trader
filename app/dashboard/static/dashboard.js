@@ -235,7 +235,14 @@
       setText("trainingExperienceCount", number(data.counts?.experiences, 0));
       setText("trainingModelVersion", data.model?.version || "untrained");
       setText("featureSchema", data.model?.feature_schema_version || "-");
-      setText("lastTrainingRun", data.training?.last_run_at ? when(data.training.last_run_at) : "-");
+      const trainingWorker = data.training?.worker || {};
+      if (trainingWorker.running) {
+        setText("lastTrainingRun", `running since ${when(trainingWorker.started_at)}`);
+      } else if (trainingWorker.status && trainingWorker.status !== "idle") {
+        setText("lastTrainingRun", `${trainingWorker.status} ${trainingWorker.finished_at ? when(trainingWorker.finished_at) : ""}`);
+      } else {
+        setText("lastTrainingRun", data.training?.last_run_at ? when(data.training.last_run_at) : "-");
+      }
 
       setText("marketDiagnostics", JSON.stringify(data.market, null, 2));
       setText("newsDiagnostics", JSON.stringify(data.news?.providers || data.news, null, 2));
@@ -472,7 +479,7 @@
           use_all_data: true,
         }),
       });
-      if (output) output.textContent = JSON.stringify(data, null, 2);
+      if (output) output.textContent = data.status === "started" ? "Training started in background. You can keep using the dashboard." : JSON.stringify(data, null, 2);
       await refreshSummary();
       await refreshFeatures();
       await refreshDbDiagnostics();
