@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import csv
+import gzip
 import os
 import shutil
+import subprocess
 import sys
 import time
 import json
@@ -266,6 +269,63 @@ def main() -> None:
         assert accelerated_payload["labels"]["rows_created"] > 0, accelerated.text
         assert accelerated_payload["replay"]["experiences_created"] > 0, accelerated.text
         accelerated_exported_path = Path(accelerated_payload["exported_path"])
+        with SessionLocal() as session:
+            candles_for_label = list(
+                session.scalars(
+                    select(Candle)
+                    .where(Candle.symbol == "BTCUSDT", Candle.interval == "1m", Candle.is_closed.is_(True))
+                    .order_by(Candle.open_time)
+                )
+            )
+            assert len(candles_for_label) > 260
+            entry_candle = candles_for_label[80]
+            values = {
+                "price_change": 0.0,
+                "volume_change": 0.0,
+                "volatility": 0.0,
+                "sentiment_score": 0.0,
+                "risk_score": 0.0,
+                "last_close": entry_candle.close,
+            }
+            payload = {
+                "schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
+                "values": values,
+                "metadata": {"interval": "1m", "test": "unlabeled_feature_for_label_builder"},
+                "sources": {"candles": "smoke"},
+            }
+            feature = Feature(
+                symbol="BTCUSDT",
+                schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
+                source_name="smoke_unlabeled",
+                as_of=entry_candle.close_time or entry_candle.open_time,
+                payload=payload,
+                raw_payload=payload,
+            )
+            session.add(feature)
+            session.flush()
+            training_feature = TrainingFeature(
+                source_feature_id=feature.id,
+                symbol="BTCUSDT",
+                schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
+                source_name="smoke_unlabeled",
+                as_of=feature.as_of,
+                feature_values=values,
+                payload=payload,
+            )
+            session.add(training_feature)
+            session.commit()
+            smoke_training_feature_id = training_feature.id
+        label_status_before = client.get("/api/training/label-status", auth=auth)
+        assert label_status_before.status_code == 200, label_status_before.text
+        build_labels = client.post("/api/training/build-labels", json={"symbols": ["BTCUSDT"]}, auth=auth)
+        assert build_labels.status_code == 200, build_labels.text
+        assert build_labels.json()["labeled"] > 0, build_labels.text
+        assert build_labels.json()["label_status"]["rows_with_target_trade_quality_score"] > 0, build_labels.text
+        with SessionLocal() as session:
+            labeled_row = session.get(TrainingFeature, smoke_training_feature_id)
+            assert labeled_row is not None
+            labeled_values = dict(labeled_row.feature_values or {})
+            assert labeled_values.get("target_trade_quality_score") not in (None, "")
 
         train_model = client.post(
             "/api/training/train-model",
@@ -467,6 +527,29 @@ def main() -> None:
         download = client.get(export.json()["download_url"], auth=auth)
         assert download.status_code == 200, download.text
         assert len(download.content) > 0, export.text
+        with gzip.open(exported_path, "rt", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            labeled_export_rows = [
+                row for row in reader if row.get("target_trade_quality_score") not in (None, "")
+            ]
+        assert len(labeled_export_rows) > 0, export.text
+        dry_run = subprocess.run(
+            [
+                sys.executable,
+                "scripts/train_local_model.py",
+                "--dataset",
+                str(exported_path),
+                "--target",
+                "target_trade_quality_score",
+                "--dry-run",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert dry_run.returncode == 0, dry_run.stderr or dry_run.stdout
+        assert '"labeled_rows": 0' not in dry_run.stdout, dry_run.stdout
 
         auto_stop = client.post("/api/auto-trader/stop", auth=auth)
         assert auto_stop.status_code == 200, auto_stop.text

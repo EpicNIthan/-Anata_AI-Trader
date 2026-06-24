@@ -9,24 +9,11 @@ from pathlib import Path
 
 from sqlalchemy import or_, select
 
+from app.config import settings
 from app.db.models import Feature, TrainingFeature
 from app.db.session import SessionLocal, create_db_and_tables
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, values_from_feature
-
-
-FEATURE_COLUMNS = columns_for_schema(CURRENT_FEATURE_SCHEMA_VERSION)
-TARGET_COLUMNS = [
-    "target_future_return_5m",
-    "target_future_return_15m",
-    "target_future_return_1h",
-    "target_future_return_4h",
-    "target_max_upside_1h",
-    "target_max_drawdown_1h",
-    "target_stop_loss_hit_first",
-    "target_take_profit_hit_first",
-    "target_direction_15m",
-    "target_trade_quality_score",
-]
+from app.training.label_builder import TARGET_COLUMNS, build_labels_for_existing_features, values_for_training_feature
 
 
 def parse_since_date(value: str | None) -> datetime | None:
@@ -45,10 +32,15 @@ def export_dataset(
     feature_columns: list[str] | None = None,
     since_date: datetime | None = None,
     use_all_data: bool = False,
+    auto_build_labels: bool | None = None,
 ) -> Path:
     create_db_and_tables()
     feature_columns = feature_columns or columns_for_schema(feature_schema_version)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    should_build_labels = settings.auto_build_labels_on_export if auto_build_labels is None else auto_build_labels
+    if should_build_labels:
+        with SessionLocal() as session:
+            build_labels_for_existing_features(session, schema_version=feature_schema_version)
     with SessionLocal() as session:
         query = select(TrainingFeature).where(
             or_(TrainingFeature.schema_version == feature_schema_version, TrainingFeature.schema_version.is_(None))
@@ -72,8 +64,11 @@ def export_dataset(
         else:
             target_payload = next_feature.payload if isinstance(next_feature, TrainingFeature) else next_feature
             target = values_from_feature(target_payload, ["price_change"])["price_change"]
-        values = values_from_feature(feature.payload if isinstance(feature, TrainingFeature) else feature, feature_columns)
-        payload_values = (feature.payload or {}).get("values", {}) if isinstance(feature, TrainingFeature) else (feature.payload or {}).get("values", {})
+        payload_values = values_for_training_feature(feature) if isinstance(feature, TrainingFeature) else (feature.payload or {}).get("values", {})
+        values = values_from_feature(
+            {"schema_version": feature.schema_version or feature_schema_version, "values": payload_values},
+            feature_columns,
+        )
         if payload_values.get("target_future_return_15m") not in (None, ""):
             target = payload_values.get("target_future_return_15m")
         rows.append(

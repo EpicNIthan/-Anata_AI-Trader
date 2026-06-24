@@ -248,6 +248,9 @@
             <div><span>Feature Schema</span><strong id="featureSchema">-</strong></div>
             <div><span>Last Training Run</span><strong id="lastTrainingRun">-</strong></div>
             <div><span>Fallback</span><strong id="modelFallbackReason">-</strong></div>
+            <div><span>Label Coverage</span><strong id="labelCoverage">-</strong></div>
+            <div><span>Training Target</span><strong id="trainingTarget">-</strong></div>
+            <div><span>Label Readiness</span><strong id="labelReadiness">-</strong></div>
           </div>
           <div class="panel-tools">
             <button id="refreshModelsButton" class="secondary">Refresh Models</button>
@@ -258,8 +261,10 @@
             <tbody id="modelsBody"><tr><td colspan="8" class="empty">Loading models</td></tr></tbody>
           </table>
           <button id="buildDatasetButton" class="primary">Build Training Dataset</button>
+          <button id="buildLabelsButton" class="secondary">Build Labels</button>
           <button id="trainModelButton" class="primary">Train Model</button>
           <button id="exportDatasetButton" class="primary">Export Dataset</button>
+          <button id="exportLabeledDatasetButton" class="primary">Export Labeled Dataset</button>
           <pre id="exportResult" class="log-box"></pre>
         </section>
 
@@ -281,6 +286,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v9"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v10"></script>
   </body>
 </html>

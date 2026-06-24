@@ -46,6 +46,7 @@ from app.services.db_diagnostics import database_diagnostics
 from app.services.training_service import SERVER_TRAINING_DISABLED_MESSAGE, train_model_job
 from app.training.dataset_accelerator import build_accelerated_dataset
 from app.training.export_dataset import export_dataset, parse_since_date
+from app.training.label_builder import build_labels_for_existing_features, label_status
 from app.trading.paper_engine import PaperEngine
 
 router = APIRouter(prefix="/api", tags=["lab"], dependencies=[Depends(require_admin)])
@@ -967,6 +968,37 @@ def create_data_event(
     }
 
 
+@router.get("/training/label-status")
+def training_label_status(session: Session = Depends(get_session)) -> dict[str, Any]:
+    return label_status(session)
+
+
+@router.post("/training/build-labels")
+def training_build_labels(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    payload = payload or {}
+    symbols = payload.get("symbols")
+    if isinstance(symbols, str):
+        symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+    if symbols is not None and not isinstance(symbols, list):
+        raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
+    result = build_labels_for_existing_features(
+        session,
+        symbols=symbols,
+        interval=str(payload.get("interval")) if payload.get("interval") else None,
+        schema_version=str(payload.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION),
+        force=bool(payload.get("force", False)),
+        limit=int(payload["limit"]) if payload.get("limit") else None,
+        sync_features=bool(payload.get("sync_features", True)),
+    )
+    return {
+        **result,
+        "label_status": label_status(session, schema_version=str(payload.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION)),
+    }
+
+
 @router.post("/training/export")
 def training_export(
     payload: dict[str, Any] | None = Body(default=None),
@@ -984,6 +1016,7 @@ def training_export(
         feature_schema_version=feature_schema_version,
         since_date=since_date,
         use_all_data=use_all_data,
+        auto_build_labels=payload.get("auto_build_labels"),
     )
     parquet_path: str | None = None
     try:
@@ -1021,6 +1054,7 @@ def training_export(
         ).all()
     }
     latest_feature = session.scalar(select(Feature).order_by(desc(Feature.as_of)).limit(1))
+    label_summary = label_status(session, schema_version=feature_schema_version)
     return {
         "dataset_id": _dataset_id_from_path(exported_path),
         "exported_path": str(exported_path),
@@ -1032,6 +1066,8 @@ def training_export(
         "counts": counts,
         "news_by_provider": news_by_provider,
         "features_by_symbol": features_by_symbol,
+        "label_summary": label_summary,
+        "warning": label_summary.get("warning"),
         "latest_feature_at": _dt(latest_feature.as_of if latest_feature else None),
     }
 

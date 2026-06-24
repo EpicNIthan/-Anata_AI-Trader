@@ -416,6 +416,21 @@
     }
   }
 
+  async function refreshLabelStatus() {
+    try {
+      const data = await api("/api/training/label-status");
+      const total = Number(data.total_training_features || 0);
+      const labeled = Number(data.rows_with_target_trade_quality_score || 0);
+      setText("labelCoverage", `${number(labeled, 0)} / ${number(total, 0)} (${pct(data.label_coverage_pct || 0, 1)})`);
+      setText("trainingTarget", data.selected_training_target || "-");
+      setText("labelReadiness", data.label_readiness || "NOT READY");
+      setClass("labelReadiness", data.label_readiness === "OK" ? "positive" : "warning");
+    } catch (error) {
+      setText("labelReadiness", `Error: ${error.message}`);
+      setClass("labelReadiness", "warning");
+    }
+  }
+
   async function activateModel(modelId) {
     const output = $("modelActionResult") || $("exportResult");
     if (output) output.textContent = `Activating ${modelId}...`;
@@ -435,7 +450,7 @@
 
   async function refreshHeavy() {
     try {
-      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures(), refreshDbDiagnostics(), refreshModels()]);
+      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures(), refreshDbDiagnostics(), refreshModels(), refreshLabelStatus()]);
     } catch (error) {
       console.warn("table refresh failed", error);
     }
@@ -512,6 +527,23 @@
       await refreshDbDiagnostics();
     } catch (error) {
       if (output) output.textContent = `Build dataset failed: ${error.message}`;
+    }
+  }
+
+  async function buildLabels() {
+    const output = $("exportResult") || $("dbActionResult");
+    if (output) output.textContent = "Building labels from future closed candles...";
+    try {
+      const data = await api("/api/training/build-labels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (output) output.textContent = JSON.stringify(data, null, 2);
+      await refreshLabelStatus();
+      await refreshSummary();
+    } catch (error) {
+      if (output) output.textContent = `Build labels failed: ${error.message}`;
     }
   }
 
@@ -621,8 +653,10 @@
     $("newsProviderFilter")?.addEventListener("change", refreshNews);
     $("signalForm")?.addEventListener("submit", submitSignal);
     $("buildDatasetButton")?.addEventListener("click", buildTrainingDataset);
+    $("buildLabelsButton")?.addEventListener("click", buildLabels);
     $("trainModelButton")?.addEventListener("click", trainModel);
     $("exportDatasetButton")?.addEventListener("click", () => exportDataset("exportResult"));
+    $("exportLabeledDatasetButton")?.addEventListener("click", () => exportDataset("exportResult"));
     $("refreshModelsButton")?.addEventListener("click", refreshModels);
     $("exportDatasetDiagnosticsButton")?.addEventListener("click", () => exportDataset("dbActionResult"));
     $("runCleanupButton")?.addEventListener("click", runCleanup);

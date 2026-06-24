@@ -115,6 +115,7 @@ class Settings:
     enable_server_inference: bool = field(default_factory=lambda: _bool("ENABLE_SERVER_INFERENCE", True))
     model_type: str = os.getenv("MODEL_TYPE", "local-uploaded")
     model_target: str = os.getenv("MODEL_TARGET", "target_trade_quality_score")
+    auto_build_labels_on_export: bool = field(default_factory=lambda: _bool("AUTO_BUILD_LABELS_ON_EXPORT", True))
     model_min_rows: int = field(default_factory=lambda: _int("MODEL_MIN_ROWS", 500))
     model_activation_mode: str = os.getenv("MODEL_ACTIVATION_MODE", "manual")
     model_min_directional_accuracy: float = field(default_factory=lambda: _float("MODEL_MIN_DIRECTIONAL_ACCURACY", 0.52))

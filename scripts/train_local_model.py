@@ -107,9 +107,9 @@ def main() -> None:
     parser.add_argument("--target", default="target_trade_quality_score")
     parser.add_argument("--out-dir", type=Path, default=Path("models"))
     parser.add_argument("--validation-size", type=float, default=0.25)
+    parser.add_argument("--dry-run", action="store_true", help="Validate dataset labels/features without fitting a model.")
     args = parser.parse_args()
 
-    import joblib
     import pandas as pd
 
     frame = pd.read_csv(args.dataset)
@@ -130,6 +130,18 @@ def main() -> None:
     feature_columns = _feature_columns(train_frame, args.target)
     if not feature_columns:
         raise SystemExit("No numeric feature columns found")
+    if args.dry_run:
+        result = {
+            "status": "ok",
+            "labeled_rows": int(len(train_frame)),
+            "feature_columns": len(feature_columns),
+            "target": args.target,
+            "dataset_days": float(date_span.total_seconds() / 86400.0),
+        }
+        print(json.dumps(result, indent=2))
+        return
+
+    import joblib
 
     split = max(1, int(len(train_frame) * (1.0 - min(max(args.validation_size, 0.05), 0.50))))
     if split >= len(train_frame):

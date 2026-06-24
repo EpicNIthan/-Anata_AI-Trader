@@ -290,6 +290,19 @@ ENABLE_SERVER_INFERENCE=true
 
 Railway collects data, builds/exports datasets, runs the dashboard, runs paper trading, and runs active model inference. Heavy training should happen on your laptop after downloading a dataset. If `/api/training/train-model` is called while server training is disabled, it returns: `Server training is disabled. Download dataset and train locally.`
 
+Before training locally, check label coverage. `target_trade_quality_score` must have labeled rows:
+
+```powershell
+curl -H "x-admin-token: YOUR_ADMIN_TOKEN" https://anataai-trader-production.up.railway.app/api/training/label-status
+
+curl -X POST https://anataai-trader-production.up.railway.app/api/training/build-labels `
+  -H "x-admin-token: YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d "{}"
+```
+
+`AUTO_BUILD_LABELS_ON_EXPORT=true` makes dataset export try to build labels first. Recent rows without enough future candles are skipped until more closed candles exist.
+
 Build features through the API or internal jobs, then export:
 
 ```powershell
