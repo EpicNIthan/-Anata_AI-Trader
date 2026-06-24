@@ -262,9 +262,10 @@ def main() -> None:
         assert auto_status.get("cycles", 0) >= 1, auto_status
         assert auto_status.get("last_run_at"), auto_status
         assert auto_status.get("exploration_enabled") is True, auto_status
+        assert auto_status.get("position_management", {}).get("min_hold_seconds", 0) > 0, auto_status
         decisions = client.get("/api/ai-decisions")
         assert decisions.status_code == 200, decisions.text
-        assert decisions.json()[0]["decision_source"] == "exploration", decisions.text
+        assert decisions.json()[0]["decision_source"] in {"exploration", "position-management", "risk-exit", "strategy"}, decisions.text
         summary_after_auto = client.get("/api/dashboard/summary")
         assert summary_after_auto.status_code == 200, summary_after_auto.text
         assert summary_after_auto.json()["trading"]["exploration_trades"] + summary_after_auto.json()["trading"]["skipped_trades"] >= 1

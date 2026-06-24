@@ -129,6 +129,8 @@ class PaperEngine:
             return ExecutionResult("REJECTED", "Not enough paper cash for margin plus fee.")
 
         if existing_position is None:
+            stop_loss = stop_loss if stop_loss is not None else self._default_stop_loss(price)
+            take_profit = take_profit if take_profit is not None else self._default_take_profit(price)
             position = Position(
                 symbol=symbol,
                 side="LONG",
@@ -154,8 +156,8 @@ class PaperEngine:
             existing_position.margin_used = existing_margin + margin_required
             existing_position.notional = combined_quantity * existing_position.entry_price
             existing_position.leverage = leverage
-            existing_position.stop_loss = stop_loss or existing_position.stop_loss
-            existing_position.take_profit = take_profit or existing_position.take_profit
+            existing_position.stop_loss = stop_loss or existing_position.stop_loss or self._default_stop_loss(existing_position.entry_price)
+            existing_position.take_profit = take_profit or existing_position.take_profit or self._default_take_profit(existing_position.entry_price)
             position = existing_position
 
         cash_after = account.cash_balance - margin_required - fee
@@ -332,3 +334,13 @@ class PaperEngine:
     def _fallback_margin(self, position: Position) -> float:
         leverage = position.leverage or settings.paper_leverage or 1.0
         return (position.quantity * position.entry_price) / max(leverage, 1.0)
+
+    def _default_stop_loss(self, price: float) -> float | None:
+        if settings.auto_default_stop_loss_pct <= 0:
+            return None
+        return round(price * (1.0 - settings.auto_default_stop_loss_pct), 8)
+
+    def _default_take_profit(self, price: float) -> float | None:
+        if settings.auto_default_take_profit_pct <= 0:
+            return None
+        return round(price * (1.0 + settings.auto_default_take_profit_pct), 8)

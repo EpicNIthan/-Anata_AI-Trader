@@ -12,7 +12,7 @@ from sqlalchemy import desc, select
 from app.ai.experience_buffer import record_experience, update_experience_rewards
 from app.ai.strategy import RuleBasedStrategy, StrategyDecision
 from app.config import settings
-from app.db.models import AiDecision, Feature, PaperTrade, Position
+from app.db.models import AiDecision, Candle, Feature, LiveCandleUpdate, PaperTrade, Position
 from app.db.session import SessionLocal
 from app.features.feature_builder import FeatureBuilder
 from app.trading.paper_engine import ExecutionResult, PaperEngine
@@ -65,7 +65,18 @@ class AutoTraderService:
         self._stop_event: asyncio.Event | None = None
 
     def status(self) -> dict[str, Any]:
-        return self.state.as_dict()
+        return {
+            **self.state.as_dict(),
+            "position_management": {
+                "min_hold_seconds": settings.auto_min_hold_seconds,
+                "take_profit_min_hold_seconds": settings.auto_take_profit_min_hold_seconds,
+                "max_hold_seconds": settings.auto_max_hold_seconds,
+                "max_loss_pct_of_margin": settings.auto_position_max_loss_pct,
+                "default_stop_loss_pct": settings.auto_default_stop_loss_pct,
+                "default_take_profit_pct": settings.auto_default_take_profit_pct,
+                "profit_close_min_net_pct": settings.auto_close_min_net_profit_pct,
+            },
+        }
 
     async def start(self) -> dict[str, Any]:
         if self._task and not self._task.done():
@@ -151,6 +162,9 @@ class AutoTraderService:
         )
         strategy_decision = RuleBasedStrategy().decide(feature)
         decision, decision_source = self._maybe_explore(session, symbol, strategy_decision)
+        managed_decision = self._position_management_decision(session, symbol, decision)
+        if managed_decision:
+            decision, decision_source = managed_decision
         decision = self._fee_aware_close_decision(session, symbol, decision)
         duplicate_result = self._duplicate_or_loss_cooldown(session, symbol, decision)
         if duplicate_result:
@@ -237,10 +251,21 @@ class AutoTraderService:
         decision_source: str,
         strategy_decision: StrategyDecision,
     ) -> AiDecision:
+        strategy_name = RuleBasedStrategy.name
+        source_name = self.name
+        if decision_source == "exploration":
+            strategy_name = "exploration-v1"
+            source_name = "auto-trader-exploration-v1"
+        elif decision_source == "risk-exit":
+            strategy_name = "position-risk-manager-v1"
+            source_name = "auto-trader-risk-exit-v1"
+        elif decision_source == "position-management":
+            strategy_name = "position-manager-v1"
+            source_name = "auto-trader-position-manager-v1"
         ai_decision = AiDecision(
             symbol=symbol,
-            strategy_name=RuleBasedStrategy.name if decision_source == "strategy" else "exploration-v1",
-            source_name=self.name if decision_source == "strategy" else "auto-trader-exploration-v1",
+            strategy_name=strategy_name,
+            source_name=source_name,
             feature_id=feature.id,
             feature_schema_version=feature.schema_version,
             action=decision.action,
@@ -279,6 +304,89 @@ class AutoTraderService:
         session.refresh(ai_decision)
         return ai_decision
 
+    def _position_management_decision(
+        self,
+        session,
+        symbol: str,
+        strategy_decision: StrategyDecision,
+    ) -> tuple[StrategyDecision, str] | None:
+        position = session.scalar(
+            select(Position)
+            .where(Position.symbol == symbol, Position.status == "OPEN")
+            .order_by(desc(Position.opened_at))
+            .limit(1)
+        )
+        if position is None:
+            return None
+        mark_price = self._latest_price(session, symbol) or position.current_price or position.entry_price
+        position.current_price = mark_price
+        gross_pnl = (mark_price - position.entry_price) * position.quantity
+        close_notional = position.quantity * mark_price
+        close_fee = close_notional * settings.paper_fee_rate
+        net_pnl = gross_pnl - close_fee
+        margin = position.margin_used or ((position.quantity * position.entry_price) / max(position.leverage or settings.paper_leverage, 1.0))
+        pnl_on_margin = net_pnl / margin if margin else 0.0
+        now = datetime.now(timezone.utc)
+        opened_at = position.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        age_seconds = max((now - opened_at).total_seconds(), 0.0)
+
+        stop_loss = position.stop_loss or self._default_stop_loss(position.entry_price)
+        take_profit = position.take_profit or self._default_take_profit(position.entry_price)
+        if stop_loss and mark_price <= stop_loss:
+            return (
+                StrategyDecision(
+                    action="CLOSE",
+                    confidence=1.0,
+                    reason=f"Risk exit: stop loss hit at {mark_price:.8f} <= {stop_loss:.8f}.",
+                ),
+                "risk-exit",
+            )
+        if settings.auto_position_max_loss_pct > 0 and pnl_on_margin <= -settings.auto_position_max_loss_pct:
+            return (
+                StrategyDecision(
+                    action="CLOSE",
+                    confidence=1.0,
+                    reason=(
+                        "Risk exit: max position loss hit "
+                        f"({pnl_on_margin:.2%} of margin, net PnL ${net_pnl:.4f})."
+                    ),
+                ),
+                "risk-exit",
+            )
+        if take_profit and mark_price >= take_profit:
+            if age_seconds >= settings.auto_take_profit_min_hold_seconds:
+                return (
+                    StrategyDecision(
+                        action="CLOSE",
+                        confidence=0.95,
+                        reason=f"Take profit hit at {mark_price:.8f} >= {take_profit:.8f} after {age_seconds / 60:.1f} minutes.",
+                    ),
+                    "position-management",
+                )
+            return (
+                StrategyDecision(
+                    action="HOLD",
+                    confidence=max(strategy_decision.confidence, settings.risk_min_confidence),
+                    reason=(
+                        "Take profit is hit, but minimum profit-hold time is active "
+                        f"({age_seconds:.0f}/{settings.auto_take_profit_min_hold_seconds}s)."
+                    ),
+                ),
+                "position-management",
+            )
+        if settings.auto_max_hold_seconds > 0 and age_seconds >= settings.auto_max_hold_seconds and net_pnl >= 0:
+            return (
+                StrategyDecision(
+                    action="CLOSE",
+                    confidence=0.80,
+                    reason=f"Time exit: max hold reached with non-negative net PnL (${net_pnl:.4f}).",
+                ),
+                "position-management",
+            )
+        return None
+
     def _fee_aware_close_decision(
         self,
         session,
@@ -295,11 +403,23 @@ class AutoTraderService:
         )
         if existing_position is None:
             return decision
-        mark_price = existing_position.current_price
+        mark_price = self._latest_price(session, symbol) or existing_position.current_price or existing_position.entry_price
         gross_pnl = (mark_price - existing_position.entry_price) * existing_position.quantity
         close_notional = existing_position.quantity * mark_price
         close_fee = close_notional * settings.paper_fee_rate
         min_net_profit = close_notional * settings.auto_close_min_net_profit_pct
+        age_seconds = self._position_age_seconds(existing_position)
+        if gross_pnl > 0 and age_seconds < settings.auto_min_hold_seconds:
+            return StrategyDecision(
+                action="HOLD",
+                confidence=max(decision.confidence, settings.risk_min_confidence),
+                reason=(
+                    "Profit close skipped because minimum hold time is active "
+                    f"({age_seconds:.0f}/{settings.auto_min_hold_seconds}s)."
+                ),
+                stop_loss=decision.stop_loss,
+                take_profit=decision.take_profit,
+            )
         if gross_pnl > 0 and gross_pnl <= close_fee + min_net_profit:
             return StrategyDecision(
                 action="HOLD",
@@ -312,6 +432,33 @@ class AutoTraderService:
                 take_profit=decision.take_profit,
             )
         return decision
+
+    def _latest_price(self, session, symbol: str) -> float | None:
+        candle = session.scalar(
+            select(Candle).where(Candle.symbol == symbol).order_by(desc(Candle.open_time)).limit(1)
+        )
+        live_update = session.scalar(
+            select(LiveCandleUpdate).where(LiveCandleUpdate.symbol == symbol).order_by(desc(LiveCandleUpdate.open_time)).limit(1)
+        )
+        if live_update and (candle is None or live_update.open_time >= candle.open_time):
+            return live_update.close
+        return candle.close if candle else None
+
+    def _position_age_seconds(self, position: Position) -> float:
+        opened_at = position.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        return max((datetime.now(timezone.utc) - opened_at).total_seconds(), 0.0)
+
+    def _default_stop_loss(self, price: float) -> float | None:
+        if settings.auto_default_stop_loss_pct <= 0:
+            return None
+        return price * (1.0 - settings.auto_default_stop_loss_pct)
+
+    def _default_take_profit(self, price: float) -> float | None:
+        if settings.auto_default_take_profit_pct <= 0:
+            return None
+        return price * (1.0 + settings.auto_default_take_profit_pct)
 
     def _duplicate_or_loss_cooldown(
         self,
