@@ -13,6 +13,16 @@ from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_sche
 
 
 FEATURE_COLUMNS = columns_for_schema(CURRENT_FEATURE_SCHEMA_VERSION)
+TARGET_COLUMNS = [
+    "target_future_return_5m",
+    "target_future_return_15m",
+    "target_future_return_1h",
+    "target_future_return_4h",
+    "target_max_upside_1h",
+    "target_max_drawdown_1h",
+    "target_stop_loss_hit_first",
+    "target_take_profit_hit_first",
+]
 
 
 def parse_since_date(value: str | None) -> datetime | None:
@@ -59,6 +69,9 @@ def export_dataset(
             target_payload = next_feature.payload if isinstance(next_feature, TrainingFeature) else next_feature
             target = values_from_feature(target_payload, ["price_change"])["price_change"]
         values = values_from_feature(feature.payload if isinstance(feature, TrainingFeature) else feature, feature_columns)
+        payload_values = (feature.payload or {}).get("values", {}) if isinstance(feature, TrainingFeature) else (feature.payload or {}).get("values", {})
+        if payload_values.get("target_future_return_15m") not in (None, ""):
+            target = payload_values.get("target_future_return_15m")
         rows.append(
             {
                 "feature_id": feature.source_feature_id if isinstance(feature, TrainingFeature) else feature.id,
@@ -69,6 +82,7 @@ def export_dataset(
                 "trend": values.get("trend") or "sideways",
                 "target_next_price_change": target,
                 **{column: values.get(column, 0.0) for column in feature_columns},
+                **{column: payload_values.get(column, "") for column in TARGET_COLUMNS},
             }
         )
 
@@ -84,6 +98,7 @@ def export_dataset(
                 "trend",
                 *feature_columns,
                 "target_next_price_change",
+                *TARGET_COLUMNS,
             ],
         )
         writer.writeheader()

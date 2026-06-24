@@ -63,6 +63,7 @@ from app.main import app
 def main() -> None:
     db_path = Path("_smoke_trading_lab.db")
     exported_path: Path | None = None
+    accelerated_exported_path: Path | None = None
     archive_paths: list[Path] = []
     if db_path.exists():
         db_path.unlink()
@@ -181,6 +182,28 @@ def main() -> None:
         derivatives_latest = client.get("/api/derivatives/latest?symbol=BTCUSDT")
         assert derivatives_latest.status_code == 200, derivatives_latest.text
         assert len(derivatives_latest.json()) >= 1, derivatives_latest.text
+
+        accelerated = client.post(
+            "/api/training/build-dataset",
+            json={
+                "symbols": ["BTCUSDT"],
+                "interval": "1m",
+                "days": 1,
+                "max_rows_per_symbol": 400,
+                "lookback": 60,
+                "stride": 20,
+                "replay_limit": 1000,
+                "backfill": True,
+                "mock": True,
+                "export": True,
+            },
+            auth=auth,
+        )
+        assert accelerated.status_code == 200, accelerated.text
+        accelerated_payload = accelerated.json()
+        assert accelerated_payload["labels"]["rows_created"] > 0, accelerated.text
+        assert accelerated_payload["replay"]["experiences_created"] > 0, accelerated.text
+        accelerated_exported_path = Path(accelerated_payload["exported_path"])
 
         market_backfill = client.post(
             "/api/market/backfill",
@@ -336,6 +359,8 @@ def main() -> None:
         SMOKE_FEED_PATH.unlink()
     if exported_path and exported_path.exists():
         exported_path.unlink()
+    if accelerated_exported_path and accelerated_exported_path.exists():
+        accelerated_exported_path.unlink()
     for archive_path in archive_paths:
         if archive_path.exists():
             archive_path.unlink()

@@ -38,6 +38,7 @@ from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_sche
 from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
 from app.services.db_diagnostics import database_diagnostics
+from app.training.dataset_accelerator import build_accelerated_dataset
 from app.training.export_dataset import export_dataset, parse_since_date
 from app.trading.paper_engine import PaperEngine
 
@@ -888,6 +889,31 @@ def training_export(
         "features_by_symbol": features_by_symbol,
         "latest_feature_at": _dt(latest_feature.as_of if latest_feature else None),
     }
+
+
+@router.post("/training/build-dataset")
+async def training_build_dataset(
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    symbols = payload.get("symbols")
+    if isinstance(symbols, str):
+        symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+    if symbols is not None and not isinstance(symbols, list):
+        raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
+    return await build_accelerated_dataset(
+        symbols=symbols,
+        interval=str(payload.get("interval") or settings.paper_trade_timeframe),
+        days=min(max(int(payload.get("days") or 14), 1), 365),
+        max_rows_per_symbol=min(max(int(payload.get("max_rows_per_symbol") or 5000), 100), 250_000),
+        lookback=min(max(int(payload.get("lookback") or 60), 10), 500),
+        stride=min(max(int(payload.get("stride") or 5), 1), 500),
+        replay_limit=min(max(int(payload.get("replay_limit") or 20_000), 100), 500_000),
+        backfill=bool(payload.get("backfill", True)),
+        mock=bool(payload.get("mock", False)),
+        export=bool(payload.get("export", True)),
+    )
 
 
 @router.get("/data-events")

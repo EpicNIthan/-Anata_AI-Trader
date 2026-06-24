@@ -428,6 +428,32 @@
     }
   }
 
+  async function buildTrainingDataset() {
+    const output = $("exportResult") || $("dbActionResult");
+    if (output) output.textContent = "Building accelerated dataset. This can take a little while...";
+    try {
+      const data = await api("/api/training/build-dataset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          days: 14,
+          max_rows_per_symbol: 5000,
+          lookback: 60,
+          stride: 5,
+          replay_limit: 20000,
+          backfill: true,
+          export: true,
+        }),
+      });
+      if (output) output.textContent = JSON.stringify(data, null, 2);
+      await refreshSummary();
+      await refreshFeatures();
+      await refreshDbDiagnostics();
+    } catch (error) {
+      if (output) output.textContent = `Build dataset failed: ${error.message}`;
+    }
+  }
+
   async function runCleanup() {
     const output = $("dbActionResult");
     if (output) output.textContent = "Cleaning...";
@@ -506,6 +532,7 @@
     });
     $("newsProviderFilter")?.addEventListener("change", refreshNews);
     $("signalForm")?.addEventListener("submit", submitSignal);
+    $("buildDatasetButton")?.addEventListener("click", buildTrainingDataset);
     $("exportDatasetButton")?.addEventListener("click", () => exportDataset("exportResult"));
     $("exportDatasetDiagnosticsButton")?.addEventListener("click", () => exportDataset("dbActionResult"));
     $("runCleanupButton")?.addEventListener("click", runCleanup);

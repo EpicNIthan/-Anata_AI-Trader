@@ -244,6 +244,34 @@ Build features through the API or internal jobs, then export:
 python -m app.training.export_dataset
 ```
 
+Fast dataset accelerator:
+
+```powershell
+python -m app.training.dataset_accelerator --symbols BTCUSDT,ETHUSDT,SOLUSDT --days 30 --max-rows-per-symbol 20000 --stride 5
+```
+
+Or from the dashboard Training tab, click `Build Training Dataset`.
+
+What it does:
+
+- Backfills closed historical candles.
+- Builds compact `training_features` at historical candle times.
+- Adds future-return labels for `5m`, `15m`, `1h`, and `4h`.
+- Adds max-upside/max-drawdown labels.
+- Adds stop-loss/take-profit-hit-first labels.
+- Creates offline replay rows in `experience_buffer` for `BUY` and `HOLD`.
+- Exports a CSV that can be used by `train_price_model.py`.
+
+API:
+
+```powershell
+curl -X POST http://localhost:8000/api/training/build-dataset `
+  -H "Content-Type: application/json" `
+  -d "{\"symbols\":[\"BTCUSDT\",\"ETHUSDT\"],\"days\":14,\"max_rows_per_symbol\":5000,\"stride\":5,\"backfill\":true,\"export\":true}"
+```
+
+This is much faster than waiting for live paper trades. Live paper trading remains the final test; historical replay is the fast training-data factory.
+
 Useful export filters:
 
 ```powershell
