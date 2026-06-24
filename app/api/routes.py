@@ -9,8 +9,10 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.ai.experience_buffer import record_experience
+from app.ai.news_sentiment import active_sentiment_model
 from app.ai.strategy import RuleBasedStrategy
 from app.api.webhooks import SignalRequest
+from app.config import settings
 from app.collectors.market_collector import BinanceMarketCollector, format_collector_error
 from app.collectors.news_collector import NewsCollector
 from app.db.models import (
@@ -25,6 +27,7 @@ from app.db.models import (
     NewsSentiment,
     PaperTrade,
     Position,
+    TrainingRun,
 )
 from app.db.session import get_session
 from app.features.feature_builder import FeatureBuilder
@@ -39,6 +42,13 @@ router = APIRouter(prefix="/api", tags=["lab"])
 
 def _dt(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _worker_manager(request: Request):
@@ -62,6 +72,56 @@ def status(request: Request, session: Session = Depends(get_session)) -> dict[st
         "account": snapshot,
         "collectors": _worker_manager(request).snapshot(),
         "auto_trader": _auto_trader(request).status(),
+    }
+
+
+@router.get("/dashboard/summary")
+def dashboard_summary(request: Request, session: Session = Depends(get_session)) -> dict[str, Any]:
+    account = PaperEngine(session).snapshot()
+    collectors = _worker_manager(request).snapshot()
+    latest_model = session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
+    latest_training_run = session.scalar(select(TrainingRun).order_by(desc(TrainingRun.started_at)).limit(1))
+    latest_decision = session.scalar(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(1))
+    return {
+        "account": account,
+        "mode": "paper",
+        "paper_start_balance": settings.paper_start_balance,
+        "market": market_snapshot(session, collectors.get("market", {})),
+        "news": news_snapshot(session, collectors.get("news", {})),
+        "collectors": collectors,
+        "auto_trader": _auto_trader(request).status(),
+        "sentiment_model": active_sentiment_model(),
+        "model": {
+            "model_id": latest_model.model_id if latest_model else None,
+            "name": latest_model.name if latest_model else "none",
+            "version": latest_model.version if latest_model else "untrained",
+            "feature_schema_version": latest_model.feature_schema_version if latest_model else CURRENT_FEATURE_SCHEMA_VERSION,
+            "status": latest_model.status if latest_model else "missing",
+        },
+        "training": {
+            "last_run_at": _dt(latest_training_run.started_at if latest_training_run else None),
+            "status": latest_training_run.status if latest_training_run else "none",
+            "feature_schema_version": latest_training_run.feature_schema_version if latest_training_run else CURRENT_FEATURE_SCHEMA_VERSION,
+        },
+        "counts": {
+            "candles": session.scalar(select(func.count(Candle.id))) or 0,
+            "news": session.scalar(select(func.count(NewsArticle.id))) or 0,
+            "sentiment": session.scalar(select(func.count(NewsSentiment.id))) or 0,
+            "features": session.scalar(select(func.count(Feature.id))) or 0,
+            "experiences": session.scalar(select(func.count(ExperienceRecord.id))) or 0,
+            "trades": session.scalar(select(func.count(PaperTrade.id))) or 0,
+            "open_positions": session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0,
+        },
+        "latest_decision": {
+            "id": latest_decision.id,
+            "symbol": latest_decision.symbol,
+            "action": latest_decision.action,
+            "confidence": latest_decision.confidence,
+            "created_at": _dt(latest_decision.created_at),
+        }
+        if latest_decision
+        else None,
+        "server_time": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -92,8 +152,69 @@ def market_status(request: Request, session: Session = Depends(get_session)) -> 
 
 
 @router.get("/market/latest")
-def market_latest(session: Session = Depends(get_session), limit: int = 50) -> list[dict[str, Any]]:
+def market_latest(
+    session: Session = Depends(get_session),
+    limit: int = 50,
+    symbol: str | None = None,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    if symbol:
+        candle = session.scalar(
+            select(Candle)
+            .where(Candle.symbol == symbol.upper())
+            .order_by(desc(Candle.open_time))
+            .limit(1)
+        )
+        if candle is None:
+            return {}
+        return {
+            "id": candle.id,
+            "symbol": candle.symbol,
+            "timeframe": candle.interval,
+            "open_time": _dt(candle.open_time),
+            "close_time": _dt(candle.close_time),
+            "open": candle.open,
+            "high": candle.high,
+            "low": candle.low,
+            "close": candle.close,
+            "volume": candle.volume,
+            "is_closed": candle.is_closed,
+        }
     return latest_candles(session, limit=limit)
+
+
+@router.get("/market/candles")
+def market_candles(
+    session: Session = Depends(get_session),
+    symbol: str = "BTCUSDT",
+    timeframe: str = "1m",
+    limit: int = 300,
+) -> list[dict[str, Any]]:
+    rows = list(
+        session.scalars(
+            select(Candle)
+            .where(Candle.symbol == symbol.upper(), Candle.interval == timeframe)
+            .order_by(desc(Candle.open_time))
+            .limit(min(max(limit, 1), 1000))
+        )
+    )
+    rows.reverse()
+    return [
+        {
+            "id": row.id,
+            "symbol": row.symbol,
+            "timeframe": row.interval,
+            "time": int(row.open_time.timestamp()) if row.open_time else None,
+            "open_time": _dt(row.open_time),
+            "close_time": _dt(row.close_time),
+            "open": row.open,
+            "high": row.high,
+            "low": row.low,
+            "close": row.close,
+            "volume": row.volume,
+            "is_closed": row.is_closed,
+        }
+        for row in rows
+    ]
 
 
 @router.post("/market/backfill")
@@ -398,6 +519,61 @@ def experiences(session: Session = Depends(get_session), limit: int = 50) -> lis
     ]
 
 
+@router.get("/ai-decisions")
+def ai_decisions(session: Session = Depends(get_session), limit: int = 50) -> list[dict[str, Any]]:
+    rows = session.scalars(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(limit)).all()
+    feature_ids = [row.feature_id for row in rows if row.feature_id]
+    features = {}
+    if feature_ids:
+        features = {feature.id: feature for feature in session.scalars(select(Feature).where(Feature.id.in_(feature_ids))).all()}
+    return [
+        {
+            "id": row.id,
+            "time": _dt(row.created_at),
+            "symbol": row.symbol,
+            "action": row.action,
+            "confidence": row.confidence,
+            "sentiment_score": features.get(row.feature_id).sentiment_score if row.feature_id in features else None,
+            "risk_score": features.get(row.feature_id).risk_score if row.feature_id in features else None,
+            "strategy": row.strategy_name,
+            "reward": row.reward,
+            "status": row.execution_status,
+            "reason": row.reason or row.execution_message,
+        }
+        for row in rows
+    ]
+
+
+@router.get("/sentiment/latest")
+def sentiment_latest(session: Session = Depends(get_session), limit: int = 50) -> list[dict[str, Any]]:
+    rows = session.execute(
+        select(NewsSentiment, NewsArticle)
+        .join(NewsArticle, NewsArticle.id == NewsSentiment.article_id)
+        .order_by(desc(NewsSentiment.created_at))
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": sentiment.id,
+            "article_id": article.id,
+            "time": _dt(sentiment.created_at),
+            "published_at": _dt(article.published_at),
+            "provider": article.source_name,
+            "source": article.source,
+            "title": article.title,
+            "url": article.url,
+            "sentiment_score": sentiment.sentiment_score,
+            "risk_score": sentiment.risk_score,
+            "label": sentiment.sentiment_label,
+            "confidence": sentiment.confidence,
+            "model_name": sentiment.model_name,
+            "affected_symbols": sentiment.affected_symbols or [],
+            "topics": sentiment.topics or [],
+        }
+        for sentiment, article in rows
+    ]
+
+
 @router.get("/trades")
 def trades(session: Session = Depends(get_session), limit: int = 50) -> list[dict[str, Any]]:
     rows = session.scalars(select(PaperTrade).order_by(desc(PaperTrade.created_at)).limit(limit)).all()
@@ -429,8 +605,12 @@ def positions(session: Session = Depends(get_session)) -> list[dict[str, Any]]:
             "quantity": row.quantity,
             "entry_price": row.entry_price,
             "current_price": row.current_price,
+            "notional": row.quantity * row.current_price,
             "unrealized_pnl": row.unrealized_pnl,
+            "unrealized_pnl_pct": (row.unrealized_pnl / (row.quantity * row.entry_price)) if row.quantity and row.entry_price else 0.0,
             "realized_pnl": row.realized_pnl,
+            "stop_loss": row.stop_loss,
+            "take_profit": row.take_profit,
             "status": row.status,
             "opened_at": _dt(row.opened_at),
             "closed_at": _dt(row.closed_at),

@@ -37,6 +37,7 @@ os.environ["RSS_FEEDS"] = f"file://{SMOKE_FEED_PATH}"
 os.environ["GDELT_ENABLED"] = "false"
 os.environ["NEWSAPI_ENABLED"] = "false"
 os.environ["NEWS_API_KEY"] = ""
+os.environ["ENABLE_HF_SENTIMENT"] = "false"
 os.environ["PAPER_START_BALANCE"] = "10000"
 os.environ["DASHBOARD_USERNAME"] = "admin"
 os.environ["DASHBOARD_PASSWORD"] = "secret"
@@ -83,7 +84,7 @@ def main() -> None:
         assert blocked_dashboard.status_code == 401, blocked_dashboard.text
         dashboard = client.get("/dashboard", auth=auth)
         assert dashboard.status_code == 200, dashboard.text[:500]
-        assert "Anata AI Trading Lab" in dashboard.text
+        assert "Anata AI Trader" in dashboard.text
 
         blocked_trade = client.post(
             "/api/signal",
@@ -128,6 +129,9 @@ def main() -> None:
         assert rss_latest.status_code == 200, rss_latest.text
         assert rss_latest.json()[0]["provider"] == "rss", rss_latest.text
         assert "BTCUSDT" in rss_latest.json()[0]["affected_symbols"], rss_latest.text
+        sentiment_latest = client.get("/api/sentiment/latest")
+        assert sentiment_latest.status_code == 200, sentiment_latest.text
+        assert sentiment_latest.json()[0]["model_name"], sentiment_latest.text
 
         mock_news = client.post(
             "/api/news/mock",
@@ -159,6 +163,12 @@ def main() -> None:
         market_status = client.get("/api/market/status")
         assert market_status.status_code == 200, market_status.text
         assert market_status.json()["candle_count"] > 0, market_status.text
+        candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5")
+        assert candles.status_code == 200, candles.text
+        assert len(candles.json()) > 0, candles.text
+        summary = client.get("/api/dashboard/summary")
+        assert summary.status_code == 200, summary.text
+        assert summary.json()["sentiment_model"]["active_model"], summary.text
 
         with SessionLocal() as session:
             decisions_before = session.scalar(select(func.count(AiDecision.id))) or 0
@@ -178,6 +188,8 @@ def main() -> None:
             time.sleep(0.25)
         assert auto_status.get("cycles", 0) >= 1, auto_status
         assert auto_status.get("last_run_at"), auto_status
+        decisions = client.get("/api/ai-decisions")
+        assert decisions.status_code == 200, decisions.text
 
         with SessionLocal() as session:
             decisions_after = session.scalar(select(func.count(AiDecision.id))) or 0

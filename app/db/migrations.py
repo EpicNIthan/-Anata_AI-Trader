@@ -22,6 +22,8 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "raw_payload": "JSON",
     },
     "news_sentiment": {
+        "sentiment_label": "VARCHAR(32)",
+        "confidence": "FLOAT",
         "source_name": "VARCHAR(128)",
         "raw_payload": "JSON",
     },
@@ -74,4 +76,3 @@ def run_additive_migrations(engine: Engine) -> None:
                     continue
                 logger.info("Adding missing column %s.%s", table_name, column_name)
                 conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
-

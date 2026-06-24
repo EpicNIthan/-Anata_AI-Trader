@@ -540,20 +540,24 @@ class NewsCollector:
                 session.add(article)
                 session.flush()
 
-                sentiment_score, risk_score, topics, affected_symbols = analyze_news(item.raw_text)
-                merged_symbols = sorted(set(affected_symbols) | set(item.affected_symbols))
+                sentiment = analyze_news(item.raw_text)
+                merged_symbols = sorted(set(sentiment.affected_symbols) | set(item.affected_symbols))
                 session.add(
                     NewsSentiment(
                         article_id=article.id,
-                        sentiment_score=sentiment_score,
-                        risk_score=risk_score,
-                        topics=topics,
+                        sentiment_score=sentiment.sentiment_score,
+                        risk_score=sentiment.risk_score,
+                        topics=sentiment.topics,
                         affected_symbols=merged_symbols,
-                        source_name=f"{item.provider}:placeholder-v1",
+                        model_name=sentiment.model_name,
+                        sentiment_label=sentiment.label,
+                        confidence=sentiment.confidence,
+                        source_name=f"{item.provider}:{sentiment.model_name}",
                         raw_payload={
                             "provider": item.provider,
                             "interface": "analyze_news",
                             "text_length": len(item.raw_text),
+                            **sentiment.raw_payload,
                         },
                     )
                 )

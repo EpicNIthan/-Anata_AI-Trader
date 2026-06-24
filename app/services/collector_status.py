@@ -221,6 +221,9 @@ def latest_news(session: Session, limit: int = 25, provider: str | None = None) 
             "published_at": _dt(article.published_at),
             "sentiment_score": sentiment.sentiment_score if sentiment else None,
             "risk_score": sentiment.risk_score if sentiment else None,
+            "sentiment_label": sentiment.sentiment_label if sentiment else None,
+            "confidence": sentiment.confidence if sentiment else None,
+            "model_name": sentiment.model_name if sentiment else None,
             "affected_symbols": sentiment.affected_symbols if sentiment else [],
         }
         for article, sentiment in rows

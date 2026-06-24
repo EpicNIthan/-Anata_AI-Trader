@@ -3,169 +3,79 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Anata AI Trading Lab</title>
-    <meta http-equiv="refresh" content="5">
+    <title>Anata AI Trader</title>
     <link rel="stylesheet" href="/static/styles.css">
+    <script defer src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+      window.DASHBOARD_CONFIG = {
+        symbols: ["BTCUSDT", "ETHUSDT"],
+        defaultSymbol: "BTCUSDT",
+        defaultTimeframe: "1m"
+      };
+    </script>
   </head>
   <body>
     <header class="topbar">
-      <div>
-        <p class="eyebrow">Paper mode: {{ mode|upper }}</p>
-        <h1>Anata AI Trading Lab</h1>
+      <div class="brand">
+        <h1>Anata AI Trader</h1>
+        <span class="badge">Paper</span>
       </div>
-      <div class="actions">
-        <button data-worker="market" data-action="start">Start Market</button>
-        <button data-worker="market" data-action="stop" class="secondary">Stop Market</button>
-        <button data-worker="news" data-action="start">Start News</button>
-        <button data-worker="news" data-action="stop" class="secondary">Stop News</button>
-        <button data-auto-trader="start">Start Auto</button>
-        <button data-auto-trader="stop" class="secondary">Stop Auto</button>
+      <div class="top-status">
+        <span>Market <b id="marketStatus">-</b></span>
+        <span>News <b id="newsStatus">-</b></span>
+        <span>Auto <b id="autoStatus">-</b></span>
+        <span>Model <b id="modelStatus">untrained</b></span>
+        <span>Sentiment <b id="sentimentModel">-</b></span>
+        <span>Updated <b id="lastUpdate">-</b></span>
       </div>
     </header>
 
-    <main>
-      <section class="metrics">
-        <article>
-          <span>Cash</span>
-          <strong>${{ fmt(account.cash_balance) }}</strong>
-        </article>
-        <article>
-          <span>Equity</span>
-          <strong>${{ fmt(account.equity) }}</strong>
-        </article>
-        <article>
-          <span>Total PnL</span>
-          <strong class="{{ 'positive' if pnl >= 0 else 'negative' }}">${{ fmt(pnl) }}</strong>
-        </article>
-        <article>
-          <span>Win Rate</span>
-          <strong>{{ fmt(win_rate * 100, 1) }}%</strong>
-        </article>
-        <article>
-          <span>Trades</span>
-          <strong>{{ trade_count }}</strong>
-        </article>
-        <article>
-          <span>Candles</span>
-          <strong>{{ market_status.candle_count }}</strong>
-        </article>
-        <article>
-          <span>News</span>
-          <strong>{{ news_status.news_count }}</strong>
-        </article>
-        <article>
-          <span>Experiences</span>
-          <strong>{{ data_counts.experiences }}</strong>
-        </article>
+    <main class="terminal">
+      <section class="metrics-strip">
+        <div><span>Cash</span><strong id="cashMetric">$-</strong></div>
+        <div><span>Equity</span><strong id="equityMetric">$-</strong></div>
+        <div><span>PnL</span><strong id="pnlMetric">$-</strong></div>
+        <div><span>Candles</span><strong id="candleMetric">-</strong></div>
+        <div><span>News</span><strong id="newsMetric">-</strong></div>
+        <div><span>Experiences</span><strong id="experienceMetric">-</strong></div>
       </section>
 
-      <section class="layout">
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>Equity</h2>
-            <span>Drawdown {{ fmt(account.drawdown * 100, 2) }}%</span>
-          </div>
-          <canvas id="equityChart" height="220"></canvas>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>Collectors</h2>
-            <span id="collectorMessage">Ready</span>
-          </div>
-          <div class="status-list">
-            {% for name, state in collectors.items() %}
+      <section class="trading-grid">
+        <article class="chart-panel">
+          <div class="panel-head compact">
+            <div class="symbol-line">
+              <select id="symbolSelect" aria-label="Symbol">
+                <option>BTCUSDT</option>
+                <option>ETHUSDT</option>
+              </select>
               <div>
-                <span class="dot {{ 'on' if state.running else '' }}"></span>
-                <span>{{ name|title }}</span>
-                <strong>{{ 'Running' if state.running else 'Stopped' }}</strong>
+                <strong id="latestPrice">-</strong>
+                <span id="priceChange" class="muted">-</span>
               </div>
-              <p>
-                saved {{ state.rows_saved or 0 }} |
-                messages {{ state.messages_received or 0 }} |
-                last message {{ state.last_message_at or '-' }} |
-                last saved {{ state.last_saved_at or '-' }}
-              </p>
-              {% if state.last_error or state.warning %}
-                <p class="warning">{{ state.last_error or state.warning }}</p>
-              {% endif %}
-              {% if name == 'news' %}
-                <p>
-                  {% for provider, item in news_status.providers.items() %}
-                    {{ provider|title }} {{ item.status }}{% if not loop.last %} | {% endif %}
-                  {% endfor %}
-                </p>
-              {% endif %}
-            {% endfor %}
+            </div>
+            <div class="segmented" id="timeframeSelect">
+              <button data-timeframe="1s">1s</button>
+              <button data-timeframe="1m" class="active">1m</button>
+              <button data-timeframe="5m">5m</button>
+              <button data-timeframe="15m">15m</button>
+              <button data-timeframe="1h">1h</button>
+            </div>
+          </div>
+          <div id="chart" class="chart"></div>
+          <div class="chart-footer">
+            <span>Volume <b id="volumeMetric">-</b></span>
+            <span>SMA20 <b id="smaMetric">-</b></span>
+            <span id="chartStatus">Loading</span>
           </div>
         </article>
 
-        <article class="panel">
+        <aside class="order-panel">
           <div class="panel-head">
-            <h2>Market Data</h2>
-            <span class="{{ 'negative' if market_status.stale else 'positive' }}">{{ 'Stale' if market_status.stale else 'Fresh' }}</span>
-          </div>
-          <dl class="decision">
-            <dt>Latest Candle</dt><dd>{{ market_status.latest_candle_time or '-' }}</dd>
-            <dt>Live Updates</dt><dd>{{ 'On' if market_status.store_live_candle_updates else 'Closed only' }}</dd>
-            <dt>WebSocket</dt><dd>{{ market_status.collector.websocket_url or '-' }}</dd>
-            <dt>Streams</dt><dd>{{ (market_status.collector.subscribed_streams or [])|join(', ') }}</dd>
-            {% for item in market_status.latest_by_symbol %}
-              <dt>{{ item.symbol }}</dt><dd>{{ fmt(item.price, 4) }} | {{ item.open_time or '-' }}</dd>
-            {% endfor %}
-          </dl>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>News Data</h2>
-            <span class="{{ 'negative' if news_status.warning or news_status.stale else 'positive' }}">{{ news_status.warning or ('Stale' if news_status.stale else 'Fresh') }}</span>
-          </div>
-          <div class="provider-list">
-            {% for provider, item in news_status.providers.items() %}
-              <div class="provider-row">
-                <strong>{{ provider|title }} · {{ item.status|title }}</strong>
-                <span>{{ item.role }}</span>
-                <span>{{ 'Enabled' if item.enabled else 'Disabled' }} | {{ 'Configured' if item.configured else 'Missing config' }}</span>
-                <span>{{ 'Fallback' if item.fallback else 'Primary' }}{% if item.delayed %} | Delayed/free{% endif %}</span>
-                <span>Articles {{ item.article_count or 0 }} | Parsed {{ item.rows_parsed or 0 }} | Saved this run {{ item.rows_saved or 0 }}</span>
-                <span>Latest {{ item.latest_article_at or '-' }}</span>
-                {% if item.response_code %}
-                  <span>HTTP {{ item.response_code }}</span>
-                {% endif %}
-                {% if item.query_url %}
-                  <span>{{ item.query_url }}</span>
-                {% endif %}
-                {% if item.last_error %}
-                  <span class="warning">{{ item.last_error }}</span>
-                {% endif %}
-              </div>
-            {% endfor %}
-          </div>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>Auto Trader</h2>
-            <span id="autoTraderMessage">{{ 'Running' if auto_trader.running else 'Stopped' }}</span>
-          </div>
-          <dl class="decision">
-            <dt>Status</dt><dd>{{ 'Running' if auto_trader.running else 'Stopped' }}</dd>
-            <dt>Interval</dt><dd>{{ auto_trader.interval_seconds or '-' }}s</dd>
-            <dt>Symbols</dt><dd>{{ (auto_trader.symbols or [])|join(', ') }}</dd>
-            <dt>Cycles</dt><dd>{{ auto_trader.cycles or 0 }}</dd>
-            <dt>Last Run</dt><dd>{{ auto_trader.last_run_at or 'No runs yet' }}</dd>
-            <dt>Last Error</dt><dd>{{ auto_trader.last_error or '-' }}</dd>
-          </dl>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <h2>Signal</h2>
+            <h2>Paper Signal</h2>
             <span>Paper only</span>
           </div>
           <form id="signalForm" class="signal-form">
-            <label>Symbol<input name="symbol" value="BTCUSDT" required></label>
+            <label>Symbol<input name="symbol" id="signalSymbol" value="BTCUSDT" required></label>
             <label>Action
               <select name="action">
                 <option>BUY</option>
@@ -175,146 +85,101 @@
               </select>
             </label>
             <label>Confidence<input name="confidence" value="0.75" type="number" min="0" max="1" step="0.01"></label>
-            <label>Price<input name="price" value="65000" type="number" min="0" step="0.01"></label>
             <label>Notional<input name="notional" value="250" type="number" min="0" step="0.01"></label>
-            <button type="submit">Send Signal</button>
+            <label>Stop Loss<input name="stop_loss" type="number" min="0" step="0.01"></label>
+            <label>Take Profit<input name="take_profit" type="number" min="0" step="0.01"></label>
+            <button type="submit" class="primary">Send Paper Signal</button>
             <output id="signalResult"></output>
           </form>
-        </article>
+          <div class="control-row">
+            <button data-auto-trader="start">Start Auto</button>
+            <button data-auto-trader="stop" class="secondary">Stop Auto</button>
+          </div>
+          <div class="control-row">
+            <button data-worker="market" data-action="start" class="secondary">Start Market</button>
+            <button data-worker="news" data-action="start" class="secondary">Start News</button>
+          </div>
+        </aside>
+      </section>
 
-        <article class="panel">
-          <div class="panel-head">
-            <h2>Open Positions</h2>
-            <span>{{ positions|length }}</span>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>PnL</th></tr></thead>
-              <tbody>
-                {% for position in positions %}
-                  <tr>
-                    <td>{{ position.symbol }}</td>
-                    <td>{{ fmt(position.quantity, 6) }}</td>
-                    <td>${{ fmt(position.entry_price) }}</td>
-                    <td class="{{ 'positive' if position.unrealized_pnl >= 0 else 'negative' }}">${{ fmt(position.unrealized_pnl) }}</td>
-                  </tr>
-                {% else %}
-                  <tr><td colspan="4" class="empty">No open positions</td></tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        </article>
+      <section class="tabs-shell">
+        <nav class="tabs" aria-label="Trading panels">
+          <button class="active" data-tab="positions">Open Positions</button>
+          <button data-tab="trades">Trade History</button>
+          <button data-tab="decisions">AI Decisions</button>
+          <button data-tab="news">News</button>
+          <button data-tab="sentiment">Sentiment</button>
+          <button data-tab="training">Training</button>
+          <button data-tab="diagnostics">Logs / Diagnostics</button>
+        </nav>
 
-        <article class="panel">
-          <div class="panel-head">
-            <h2>Latest Auto Decision</h2>
-            <span>{{ latest_auto_decision.strategy_name if latest_auto_decision else 'none' }}</span>
-          </div>
-          {% if latest_auto_decision %}
-          <dl class="decision">
-            <dt>Symbol</dt><dd>{{ latest_auto_decision.symbol }}</dd>
-            <dt>Action</dt><dd>{{ latest_auto_decision.action }}</dd>
-            <dt>Schema</dt><dd>{{ latest_auto_decision.feature_schema_version }}</dd>
-            <dt>Confidence</dt><dd>{{ fmt(latest_auto_decision.confidence_pct, 1) }}%</dd>
-            <dt>Status</dt><dd>{{ latest_auto_decision.execution_status }}</dd>
-            <dt>Reward</dt><dd>{{ fmt(latest_auto_decision.reward, 4) }}</dd>
-            <dt>Reason</dt><dd>{{ latest_auto_decision.reason }}</dd>
-          </dl>
-          {% else %}
-            <p class="empty">No auto decisions yet</p>
-          {% endif %}
-        </article>
+        <section id="tab-positions" class="tab-panel active">
+          <table>
+            <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry Price</th><th>Mark Price</th><th>PnL</th><th>PnL %</th><th>Notional</th><th>Stop Loss</th><th>Take Profit</th><th>Open Time</th><th>Action</th></tr></thead>
+            <tbody id="positionsBody"><tr><td colspan="12" class="empty">Loading</td></tr></tbody>
+          </table>
+        </section>
 
-        <article class="panel">
-          <div class="panel-head">
-            <h2>Model</h2>
-            <span>{{ latest_model.status if latest_model else 'missing' }}</span>
-          </div>
-          <dl class="decision">
-            <dt>Model ID</dt><dd>{{ latest_model.model_id if latest_model else 'none' }}</dd>
-            <dt>Name</dt><dd>{{ latest_model.name if latest_model else 'none' }}</dd>
-            <dt>Version</dt><dd>{{ latest_model.version if latest_model else 'untrained' }}</dd>
-            <dt>Feature Schema</dt><dd>{{ latest_model.feature_schema_version if latest_model else 'none' }}</dd>
-            <dt>Path</dt><dd>{{ latest_model.path if latest_model else '-' }}</dd>
-          </dl>
-        </article>
+        <section id="tab-trades" class="tab-panel">
+          <table>
+            <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th><th>Realized PnL</th><th>Reason</th></tr></thead>
+            <tbody id="tradesBody"></tbody>
+          </table>
+        </section>
 
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>Latest News Sentiment</h2>
-            <span>{{ latest_news|length }}</span>
-          </div>
-          <div class="news-list">
-            {% for item in latest_news %}
-              <a href="{{ item.url }}" target="_blank" rel="noreferrer">
-                <strong>{{ item.title }}</strong>
-                <span>{{ item.source }} | Sentiment {{ fmt(item.sentiment, 2) }} | Risk {{ fmt(item.risk, 2) }} | {{ item.symbols or 'market-wide' }}</span>
-              </a>
-            {% else %}
-              <p class="empty">No news collected yet</p>
-            {% endfor %}
-          </div>
-        </article>
+        <section id="tab-decisions" class="tab-panel">
+          <table>
+            <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Confidence</th><th>Sentiment</th><th>Risk</th><th>Strategy</th><th>Reward</th><th>Reason</th></tr></thead>
+            <tbody id="decisionsBody"></tbody>
+          </table>
+        </section>
 
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>Latest AI Decisions</h2>
-            <span>{{ latest_decisions|length }}</span>
+        <section id="tab-news" class="tab-panel">
+          <div class="panel-tools">
+            <select id="newsProviderFilter">
+              <option value="">All providers</option>
+              <option value="rss">RSS</option>
+              <option value="gdelt">GDELT</option>
+              <option value="newsapi">NewsAPI</option>
+            </select>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Confidence</th><th>Status</th><th>Reason</th></tr></thead>
-              <tbody>
-                {% for decision in latest_decisions %}
-                  <tr>
-                    <td>{{ dt(decision.created_at) }}</td>
-                    <td>{{ decision.symbol }}</td>
-                    <td>{{ decision.action }}</td>
-                    <td>{{ fmt(decision.confidence_pct, 1) }}%</td>
-                    <td>{{ decision.execution_status }}</td>
-                    <td>{{ decision.reason }}</td>
-                  </tr>
-                {% else %}
-                  <tr><td colspan="6" class="empty">No AI decisions yet</td></tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        </article>
+          <table>
+            <thead><tr><th>Time</th><th>Source</th><th>Provider</th><th>Title</th><th>Symbols</th><th>Sentiment</th><th>Risk</th><th>Link</th></tr></thead>
+            <tbody id="newsBody"></tbody>
+          </table>
+        </section>
 
-        <article class="panel wide">
-          <div class="panel-head">
-            <h2>Trade History</h2>
-            <span>{{ trades|length }}</span>
+        <section id="tab-sentiment" class="tab-panel">
+          <table>
+            <thead><tr><th>Time</th><th>Model</th><th>Label</th><th>Confidence</th><th>Sentiment</th><th>Risk</th><th>Topics</th><th>Title</th></tr></thead>
+            <tbody id="sentimentBody"></tbody>
+          </table>
+        </section>
+
+        <section id="tab-training" class="tab-panel">
+          <div class="training-grid">
+            <div><span>Dataset / Features</span><strong id="featureCount">-</strong></div>
+            <div><span>Candles</span><strong id="trainingCandleCount">-</strong></div>
+            <div><span>News</span><strong id="trainingNewsCount">-</strong></div>
+            <div><span>Experiences</span><strong id="trainingExperienceCount">-</strong></div>
+            <div><span>Model Version</span><strong id="trainingModelVersion">untrained</strong></div>
+            <div><span>Feature Schema</span><strong id="featureSchema">-</strong></div>
+            <div><span>Last Training Run</span><strong id="lastTrainingRun">-</strong></div>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Price</th><th>Fee</th><th>PnL</th></tr></thead>
-              <tbody>
-                {% for trade in trades %}
-                  <tr>
-                    <td>{{ dt(trade.created_at) }}</td>
-                    <td>{{ trade.symbol }}</td>
-                    <td>{{ trade.action }}</td>
-                    <td>{{ fmt(trade.quantity, 6) }}</td>
-                    <td>${{ fmt(trade.price) }}</td>
-                    <td>${{ fmt(trade.fee) }}</td>
-                    <td class="{{ 'positive' if trade.realized_pnl >= 0 else 'negative' }}">${{ fmt(trade.realized_pnl) }}</td>
-                  </tr>
-                {% else %}
-                  <tr><td colspan="7" class="empty">No paper trades yet</td></tr>
-                {% endfor %}
-              </tbody>
-            </table>
+          <button id="exportDatasetButton" class="primary">Export Dataset</button>
+          <pre id="exportResult" class="log-box"></pre>
+        </section>
+
+        <section id="tab-diagnostics" class="tab-panel">
+          <div class="diagnostics-grid">
+            <pre id="marketDiagnostics" class="log-box"></pre>
+            <pre id="newsDiagnostics" class="log-box"></pre>
+            <pre id="autoDiagnostics" class="log-box"></pre>
           </div>
-        </article>
+        </section>
       </section>
     </main>
 
-    <script>
-      window.EQUITY_POINTS = {{ equity_points_json|safe }};
-    </script>
     <script src="/static/dashboard.js"></script>
   </body>
 </html>

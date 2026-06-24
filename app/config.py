@@ -87,6 +87,11 @@ class Settings:
     news_poll_seconds: int = field(
         default_factory=lambda: _int("NEWS_POLL_INTERVAL_SECONDS", _int("NEWS_POLL_SECONDS", 300))
     )
+    news_sentiment_model: str = os.getenv(
+        "NEWS_SENTIMENT_MODEL",
+        "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis",
+    )
+    enable_hf_sentiment: bool = field(default_factory=lambda: _bool("ENABLE_HF_SENTIMENT", False))
     gdelt_enabled: bool = field(default_factory=lambda: _bool("GDELT_ENABLED", True))
     gdelt_poll_interval_seconds: int = field(default_factory=lambda: _int("GDELT_POLL_INTERVAL_SECONDS", 900))
     gdelt_max_records: int = field(default_factory=lambda: _int("GDELT_MAX_RECORDS", 20))
