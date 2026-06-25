@@ -462,6 +462,110 @@ def _external_snapshot(session: Session, worker_state: dict[str, Any] | None = N
     }
 
 
+def _approx_count(session: Session, model: Any) -> int:
+    return int(session.scalar(select(func.max(model.id))) or 0)
+
+
+def _aware_dt(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _fast_market_snapshot(session: Session, collector_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    latest_by_symbol: list[dict[str, Any]] = []
+    latest_time: datetime | None = None
+    for symbol in settings.binance_symbols:
+        normalized = symbol.upper()
+        candle = session.scalar(
+            select(Candle)
+            .where(Candle.symbol == normalized, Candle.is_closed.is_(True))
+            .order_by(desc(Candle.open_time))
+            .limit(1)
+        )
+        live_update = session.scalar(
+            select(LiveCandleUpdate)
+            .where(LiveCandleUpdate.symbol == normalized)
+            .order_by(desc(LiveCandleUpdate.open_time))
+            .limit(1)
+        )
+        display_price = candle.close if candle else None
+        display_time = candle.open_time if candle else None
+        display_source = candle.source_name if candle else None
+        display_closed = candle.is_closed if candle else None
+        if live_update and (display_time is None or live_update.open_time >= display_time):
+            display_price = live_update.close
+            display_time = live_update.open_time
+            display_source = live_update.source_name
+            display_closed = False
+        candle_time = _aware_dt(candle.open_time if candle else None)
+        if candle_time:
+            latest_time = max(latest_time, candle_time) if latest_time else candle_time
+        latest_by_symbol.append(
+            {
+                "symbol": normalized,
+                "price": display_price,
+                "open_time": _dt(display_time),
+                "is_closed": display_closed,
+                "source_name": display_source,
+            }
+        )
+    age_seconds = None
+    if latest_time:
+        age_seconds = (datetime.now(timezone.utc) - latest_time).total_seconds()
+    return {
+        "collector": collector_state or {},
+        "candle_count": _approx_count(session, Candle),
+        "latest_candle_time": _dt(latest_time),
+        "latest_by_symbol": latest_by_symbol,
+        "latest_prices": {row["symbol"]: row["price"] for row in latest_by_symbol},
+        "stale": latest_time is None or (age_seconds is not None and age_seconds > 300),
+        "age_seconds": age_seconds,
+        "store_live_candle_updates": settings.store_live_candle_updates,
+        "closed_candles_only": True,
+    }
+
+
+def _fast_news_snapshot(session: Session, collector_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    latest = session.scalar(select(NewsArticle).order_by(desc(NewsArticle.published_at)).limit(1))
+    age_seconds = None
+    if latest and latest.published_at:
+        published = _aware_dt(latest.published_at)
+        age_seconds = (datetime.now(timezone.utc) - published).total_seconds()
+    return {
+        "collector": collector_state or {},
+        "providers": ((collector_state or {}).get("details") or {}).get("providers") or {},
+        "news_count": _approx_count(session, NewsArticle),
+        "sentiment_count": _approx_count(session, NewsSentiment),
+        "experience_count": _approx_count(session, ExperienceRecord),
+        "latest_news_time": _dt(latest.published_at if latest else None),
+        "latest_title": latest.title if latest else None,
+        "latest_source": latest.source if latest else None,
+        "stale": latest is None or (age_seconds is not None and age_seconds > 7200),
+        "age_seconds": age_seconds,
+        "news_api_key_configured": bool(settings.news_api_key),
+        "warning": (collector_state or {}).get("warning") or (collector_state or {}).get("last_error"),
+        "mock_fallback_enabled": settings.news_mock_fallback_enabled,
+    }
+
+
+def _fast_data_coverage(session: Session) -> dict[str, Any]:
+    return {
+        "candles": _approx_count(session, Candle),
+        "news": _approx_count(session, NewsArticle),
+        "sentiment": _approx_count(session, NewsSentiment),
+        "derivatives": 0,
+        "liquidations": 0,
+        "fear_greed": 0,
+        "global_market": 0,
+        "stablecoin_risk": 0,
+        "macro_risk": 0,
+        "labeled_rows": 0,
+        "label_coverage_pct": 0.0,
+        "feature_schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
+    }
+
+
 def _data_coverage(session: Session) -> dict[str, Any]:
     label_info = label_status(session)
     external_counts = {
@@ -500,7 +604,7 @@ def _decision_source(row: AiDecision) -> str:
 
 
 def _trading_diagnostics(session: Session) -> dict[str, Any]:
-    decisions = list(session.scalars(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(500)))
+    decisions = list(session.scalars(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(100)))
     strategy_trades = 0
     exploration_trades = 0
     skipped_trades = 0
@@ -562,21 +666,48 @@ def status(request: Request, session: Session = Depends(get_session)) -> dict[st
 
 
 @router.get("/dashboard/summary")
-def dashboard_summary(request: Request, session: Session = Depends(get_session)) -> dict[str, Any]:
-    account = PaperEngine(session).snapshot()
+def dashboard_summary(
+    request: Request,
+    session: Session = Depends(get_session),
+    fast: bool = True,
+) -> dict[str, Any]:
+    account = PaperEngine(session).snapshot(record=False)
     collectors = _worker_manager(request).snapshot()
     active_model = session.scalar(select(ModelVersion).where(ModelVersion.status == "active").order_by(desc(ModelVersion.created_at)).limit(1))
     latest_model = active_model or session.scalar(select(ModelVersion).order_by(desc(ModelVersion.created_at)).limit(1))
     latest_training_run = session.scalar(select(TrainingRun).order_by(desc(TrainingRun.started_at)).limit(1))
     latest_decision = session.scalar(select(AiDecision).order_by(desc(AiDecision.created_at)).limit(1))
+    counts = {
+        "candles": _approx_count(session, Candle),
+        "news": _approx_count(session, NewsArticle),
+        "sentiment": _approx_count(session, NewsSentiment),
+        "features": _approx_count(session, Feature),
+        "training_features": _approx_count(session, TrainingFeature),
+        "experiences": _approx_count(session, ExperienceRecord),
+        "external_data_events": _approx_count(session, ExternalDataEvent),
+        "trades": _approx_count(session, PaperTrade),
+        "open_positions": session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0,
+    }
+    if not fast:
+        counts = {
+            "candles": session.scalar(select(func.count(Candle.id))) or 0,
+            "news": session.scalar(select(func.count(NewsArticle.id))) or 0,
+            "sentiment": session.scalar(select(func.count(NewsSentiment.id))) or 0,
+            "features": session.scalar(select(func.count(Feature.id))) or 0,
+            "training_features": session.scalar(select(func.count(TrainingFeature.id))) or 0,
+            "experiences": session.scalar(select(func.count(ExperienceRecord.id))) or 0,
+            "external_data_events": session.scalar(select(func.count(ExternalDataEvent.id))) or 0,
+            "trades": session.scalar(select(func.count(PaperTrade.id))) or 0,
+            "open_positions": session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0,
+        }
     return {
         "account": account,
         "mode": "paper",
         "paper_start_balance": settings.paper_start_balance,
-        "market": market_snapshot(session, collectors.get("market", {})),
-        "news": news_snapshot(session, collectors.get("news", {})),
-        "derivatives": _derivatives_snapshot(session, collectors.get("derivatives", {})),
-        "external": _external_snapshot(
+        "market": _fast_market_snapshot(session, collectors.get("market", {})) if fast else market_snapshot(session, collectors.get("market", {})),
+        "news": _fast_news_snapshot(session, collectors.get("news", {})) if fast else news_snapshot(session, collectors.get("news", {})),
+        "derivatives": {} if fast else _derivatives_snapshot(session, collectors.get("derivatives", {})),
+        "external": {} if fast else _external_snapshot(
             session,
             {
                 "external": collectors.get("external", {}),
@@ -587,7 +718,7 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
         "collectors": collectors,
         "auto_trader": _auto_trader(request).status(),
         "trading": _trading_diagnostics(session),
-        "coverage": _data_coverage(session),
+        "coverage": _fast_data_coverage(session) if fast else _data_coverage(session),
         "sentiment_model": active_sentiment_model(),
         "model": _model_payload(latest_model)
         | {
@@ -602,17 +733,7 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
             "feature_schema_version": latest_training_run.feature_schema_version if latest_training_run else CURRENT_FEATURE_SCHEMA_VERSION,
             "worker": _training_service(request).status(),
         },
-        "counts": {
-            "candles": session.scalar(select(func.count(Candle.id))) or 0,
-            "news": session.scalar(select(func.count(NewsArticle.id))) or 0,
-            "sentiment": session.scalar(select(func.count(NewsSentiment.id))) or 0,
-            "features": session.scalar(select(func.count(Feature.id))) or 0,
-            "training_features": session.scalar(select(func.count(TrainingFeature.id))) or 0,
-            "experiences": session.scalar(select(func.count(ExperienceRecord.id))) or 0,
-            "external_data_events": session.scalar(select(func.count(ExternalDataEvent.id))) or 0,
-            "trades": session.scalar(select(func.count(PaperTrade.id))) or 0,
-            "open_positions": session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0,
-        },
+        "counts": counts,
         "latest_decision": {
             "id": latest_decision.id,
             "symbol": latest_decision.symbol,

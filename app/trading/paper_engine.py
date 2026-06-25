@@ -96,10 +96,11 @@ class PaperEngine:
 
         return ExecutionResult("REJECTED", f"Unsupported action: {normalized_action}")
 
-    def snapshot(self) -> dict[str, float]:
+    def snapshot(self, *, record: bool = True) -> dict[str, float]:
         latest = self._latest_account(create=True)
-        latest = self._record_equity(latest.cash_balance)
-        self.session.commit()
+        if record:
+            latest = self._record_equity(latest.cash_balance)
+            self.session.commit()
         return {
             "cash_balance": latest.cash_balance,
             "equity": latest.equity,

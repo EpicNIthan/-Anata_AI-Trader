@@ -12,6 +12,7 @@
     forceFit: true,
     chartRequestId: 0,
     resizeObserver: null,
+    activeTab: "positions",
   };
   const featureFields = [
     ["sentiment_score", "sentiment_score"],
@@ -542,9 +543,29 @@
 
   async function refreshHeavy() {
     try {
-      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures(), refreshDbDiagnostics(), refreshModels(), refreshLabelStatus()]);
+      await Promise.all([refreshPositions(), refreshTrades(), refreshDecisions(), refreshNews(), refreshSentiment(), refreshFeatures(), refreshModels(), refreshLabelStatus()]);
     } catch (error) {
       console.warn("table refresh failed", error);
+    }
+  }
+
+  async function refreshActiveTab() {
+    try {
+      if (state.activeTab === "positions") await refreshPositions();
+      else if (state.activeTab === "trades") await refreshTrades();
+      else if (state.activeTab === "decisions") await refreshDecisions();
+      else if (state.activeTab === "news") await refreshNews();
+      else if (state.activeTab === "features") await refreshFeatures();
+      else if (state.activeTab === "sentiment") await refreshSentiment();
+      else if (state.activeTab === "training") {
+        await Promise.all([refreshModels(), refreshLabelStatus()]);
+      } else if (state.activeTab === "storage") {
+        await refreshStorageDiagnostics();
+      } else if (state.activeTab === "diagnostics") {
+        await refreshDbDiagnostics();
+      }
+    } catch (error) {
+      console.warn("active tab refresh failed", error);
     }
   }
 
@@ -781,9 +802,10 @@
     document.querySelectorAll("[data-auto-trader]").forEach((button) => button.addEventListener("click", () => autoTraderAction(button.dataset.autoTrader)));
     document.querySelectorAll("[data-tab]").forEach((button) => {
       button.addEventListener("click", () => {
+        state.activeTab = button.dataset.tab;
         document.querySelectorAll("[data-tab]").forEach((item) => item.classList.toggle("active", item === button));
         document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === `tab-${button.dataset.tab}`));
-        if (button.dataset.tab === "storage") refreshStorageDiagnostics();
+        refreshActiveTab();
       });
     });
     document.querySelectorAll("[data-timeframe]").forEach((button) => {
@@ -808,10 +830,9 @@
     wireEvents();
     setTimeout(setupChart, 300);
     tickFast();
-    refreshHeavy();
-    refreshStorageDiagnostics();
-    setInterval(tickFast, 1000);
-    setInterval(refreshHeavy, 6000);
+    refreshActiveTab();
+    setInterval(tickFast, 5000);
+    setInterval(refreshActiveTab, 10000);
   }
 
   if (document.readyState === "loading") {
