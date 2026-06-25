@@ -4,6 +4,7 @@ import argparse
 import json
 import socket
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib import error, request
 
@@ -48,18 +49,31 @@ def _json_api(url: str, token: str, path: str, *, method: str = "GET", body: dic
     return json.loads(_api(url, token, path, method=method, body=body, timeout=timeout).decode("utf-8"))
 
 
+def _finished_cutoff_iso(hours: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(microsecond=0).isoformat()
+
+
 def _compact_options(args: argparse.Namespace) -> dict:
+    if args.finished_only and args.use_all_data:
+        raise SystemExit("Do not combine --finished-only with --use-all-data. finished-only protects the under-24h live data.")
+    until_date = args.until_date
+    use_all_data = args.use_all_data
+    if args.finished_only:
+        until_date = until_date or _finished_cutoff_iso(args.finished_older_than_hours)
+        use_all_data = False
     payload = {
         "date": args.date,
         "since_date": args.since_date,
-        "until_date": args.until_date,
-        "use_all_data": args.use_all_data,
+        "until_date": until_date,
+        "use_all_data": use_all_data,
         "news_only": args.news_only,
         "include_market": args.include_market,
         "include_news": args.include_news,
         "include_external": args.include_external,
         "include_experience": args.include_experience,
         "include_models": args.include_models,
+        "finished_only": args.finished_only,
+        "finished_older_than_hours": args.finished_older_than_hours if args.finished_only else None,
     }
     if args.symbols:
         payload["symbols"] = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
@@ -85,6 +99,17 @@ def main() -> None:
     parser.add_argument("--since-date", default=None)
     parser.add_argument("--until-date", default=None)
     parser.add_argument("--use-all-data", action="store_true")
+    parser.add_argument(
+        "--finished-only",
+        action="store_true",
+        help="Export only data older than --finished-older-than-hours, so current under-24h DB rows stay untouched.",
+    )
+    parser.add_argument(
+        "--finished-older-than-hours",
+        type=float,
+        default=24.0,
+        help="Cutoff for --finished-only. Default: older than 24 hours.",
+    )
     parser.add_argument("--news-only", action="store_true")
     parser.add_argument("--include-market", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-news", action=argparse.BooleanOptionalAction, default=True)
@@ -105,7 +130,7 @@ def main() -> None:
     parser.add_argument(
         "--delete-all-finished-data",
         action="store_true",
-        help="With --cleanup-after-download, delete all finished_data folders on Railway, not only the selected date folder.",
+        help="With --cleanup-after-download, delete all finished_data folders on Railway. Does not change the protected finished-only DB cutoff.",
     )
     parser.add_argument("--keep-railway-archive", action="store_true", help="Do not delete the temporary raw export ZIP from Railway.")
     parser.add_argument("--keep-railway-finished-data", action="store_true", help="Do not delete finished_data folders from Railway.")
@@ -122,7 +147,11 @@ def main() -> None:
             timeout=args.timeout,
         )
         archive_id = export["archive_id"]
-        output = args.output or Path("datasets") / archive_id
+        if args.output is None and args.finished_only:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            output = Path("datasets") / "raw_finished" / f"raw_finished_until_{stamp}.zip"
+        else:
+            output = args.output or Path("datasets") / archive_id
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(_api(args.url, args.token, f"/api/raw-data/download/{archive_id}", timeout=args.timeout))
         local_manifest = _zip_manifest(output)
@@ -161,7 +190,7 @@ def main() -> None:
         print(json.dumps(result, indent=2))
     except Exception as exc:
         if _is_timeout(exc):
-            print("Raw data export timed out. Retry with --date YYYY-MM-DD, --news-only, or a smaller --since-date range.")
+            print("Raw data export timed out. Retry with --date YYYY-MM-DD, --news-only, --finished-only, or a smaller --since-date range.")
         elif "HTTP 502" in str(exc) or "Bad Gateway" in str(exc):
             print("Railway returned 502 while exporting raw data. Wait for redeploy/restart, then retry a smaller range.")
         else:
