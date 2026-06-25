@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-NEWS_CONVERTER_MODEL = "rule-based-fallback-v1"
 LABEL_TARGETS = {
     "target_future_return_5m": 5,
     "target_future_return_15m": 15,
@@ -24,6 +23,13 @@ NON_NUMERIC_COLUMNS = {
     "final_ai_input",
     "news_converter_model",
 }
+CONVERTER_MODEL_NAMES = {
+    "smart": "pc-news-converter-v1-finbert-cryptobert",
+    "finbert": "pc-news-converter-v1-finbert",
+    "cryptobert": "pc-news-converter-v1-cryptobert",
+    "rule-based": "rule-based-fallback-v1",
+}
+_PIPELINES: dict[str, Any] = {}
 
 
 def _load_pandas():
@@ -79,15 +85,73 @@ def _keyword_any(text: str, words: list[str]) -> bool:
     return any(word in lowered for word in words)
 
 
-def _score_news(text: str, title: str = "") -> dict[str, Any]:
-    full = f"{title}\n{text}".lower()
-    positive = ["approve", "approved", "etf inflow", "inflow", "bullish", "surge", "rally", "record high", "adoption", "partnership"]
-    negative = ["hack", "exploit", "lawsuit", "ban", "crackdown", "outflow", "liquidation", "war", "default", "collapse", "fraud"]
-    risk = ["risk", "hack", "exploit", "war", "sec", "lawsuit", "inflation", "federal reserve", "interest rate", "ban", "crackdown"]
-    pos_score = sum(1 for word in positive if word in full)
-    neg_score = sum(1 for word in negative if word in full)
-    risk_score = min(1.0, sum(1 for word in risk if word in full) / 4.0)
-    sentiment = max(-1.0, min(1.0, (pos_score - neg_score) / 3.0))
+def _local_model_device() -> int:
+    try:
+        import torch
+
+        return 0 if torch.cuda.is_available() else -1
+    except Exception:
+        return -1
+
+
+def _hf_pipeline(name: str, model: str):
+    if name in _PIPELINES:
+        return _PIPELINES[name]
+    try:
+        from transformers import pipeline
+    except Exception as exc:
+        raise SystemExit(
+            "Smart news conversion needs transformers + torch on your PC. Run: "
+            "pip install transformers torch sentencepiece. "
+            "Use --news-converter rule-based only for the weak fallback."
+        ) from exc
+    _PIPELINES[name] = pipeline("text-classification", model=model, tokenizer=model, device=_local_model_device())
+    return _PIPELINES[name]
+
+
+def _classification_scores(result: Any) -> dict[str, float]:
+    if isinstance(result, dict):
+        result = [result]
+    scores: dict[str, float] = {}
+    for item in result or []:
+        label = str(item.get("label", "")).lower()
+        scores[label] = float(item.get("score", 0.0) or 0.0)
+    return scores
+
+
+def _score_finbert(text: str) -> dict[str, float]:
+    classifier = _hf_pipeline("finbert", "ProsusAI/finbert")
+    result = classifier(text, truncation=True, max_length=512, top_k=None)
+    scores = _classification_scores(result)
+    positive = max(scores.get("positive", 0.0), scores.get("label_2", 0.0))
+    negative = max(scores.get("negative", 0.0), scores.get("label_0", 0.0))
+    neutral = max(scores.get("neutral", 0.0), scores.get("label_1", 0.0))
+    return {
+        "finbert_positive_score": positive,
+        "finbert_negative_score": negative,
+        "finbert_neutral_score": neutral,
+        "sentiment_score": max(-1.0, min(1.0, positive - negative)),
+        "sentiment_confidence": max(positive, negative, neutral),
+    }
+
+
+def _score_cryptobert(text: str) -> dict[str, float]:
+    classifier = _hf_pipeline("cryptobert", "ElKulako/cryptobert")
+    result = classifier(text, truncation=True, max_length=512, top_k=None)
+    scores = _classification_scores(result)
+    bullish = max(scores.get("bullish", 0.0), scores.get("positive", 0.0), scores.get("label_2", 0.0))
+    bearish = max(scores.get("bearish", 0.0), scores.get("negative", 0.0), scores.get("label_0", 0.0))
+    neutral = max(scores.get("neutral", 0.0), scores.get("label_1", 0.0))
+    return {
+        "crypto_bullish_score": bullish,
+        "crypto_bearish_score": bearish,
+        "crypto_neutral_score": neutral,
+        "crypto_sentiment_score": max(-1.0, min(1.0, bullish - bearish)),
+        "crypto_sentiment_confidence": max(bullish, bearish, neutral),
+    }
+
+
+def _topic_scores(full: str) -> dict[str, Any]:
     btc = _keyword_any(full, ["bitcoin", "btc"])
     eth = _keyword_any(full, ["ethereum", "ether", "eth"])
     sol = _keyword_any(full, ["solana", "sol"])
@@ -109,10 +173,6 @@ def _score_news(text: str, title: str = "") -> dict[str, Any]:
     if xrp:
         affected.append("XRPUSDT")
     return {
-        "sentiment_score": sentiment,
-        "sentiment_confidence": min(1.0, 0.35 + 0.12 * (pos_score + neg_score + len(affected))),
-        "risk_score": risk_score,
-        "impact_score": min(1.0, 0.15 + 0.15 * len(affected) + (0.25 if macro else 0.0) + (0.2 if regulation else 0.0)),
         "macro_related": float(macro),
         "btc_related": float(btc),
         "eth_related": float(eth),
@@ -124,18 +184,75 @@ def _score_news(text: str, title: str = "") -> dict[str, Any]:
         "war_risk_score": 1.0 if _keyword_any(full, ["war", "missile", "attack", "sanction"]) else 0.0,
         "security_risk_score": 1.0 if security else 0.0,
         "exchange_hack_risk_score": 1.0 if security and _keyword_any(full, ["exchange", "binance", "okx", "coinbase"]) else 0.0,
-        "etf_bullish_score": 1.0 if etf and sentiment >= 0 else 0.0,
+        "etf_bullish_score": 1.0 if etf else 0.0,
         "affected_symbols": affected,
     }
 
 
-def _news_frame(root: Path):
+def _score_news_rule_based(text: str, title: str = "") -> dict[str, Any]:
+    full = f"{title}\n{text}".lower()
+    positive = ["approve", "approved", "etf inflow", "inflow", "bullish", "surge", "rally", "record high", "adoption", "partnership"]
+    negative = ["hack", "exploit", "lawsuit", "ban", "crackdown", "outflow", "liquidation", "war", "default", "collapse", "fraud"]
+    risk = ["risk", "hack", "exploit", "war", "sec", "lawsuit", "inflation", "federal reserve", "interest rate", "ban", "crackdown"]
+    pos_score = sum(1 for word in positive if word in full)
+    neg_score = sum(1 for word in negative if word in full)
+    risk_score = min(1.0, sum(1 for word in risk if word in full) / 4.0)
+    sentiment = max(-1.0, min(1.0, (pos_score - neg_score) / 3.0))
+    topics = _topic_scores(full)
+    return {
+        "sentiment_score": sentiment,
+        "sentiment_confidence": min(1.0, 0.35 + 0.12 * (pos_score + neg_score + len(topics["affected_symbols"]))),
+        "risk_score": risk_score,
+        "impact_score": min(1.0, 0.15 + 0.15 * len(topics["affected_symbols"]) + (0.25 if topics["macro_related"] else 0.0) + (0.2 if topics["regulation_risk_score"] else 0.0)),
+        **topics,
+    }
+
+
+def _score_news(text: str, title: str = "", converter: str = "smart") -> dict[str, Any]:
+    full = f"{title}\n{text}".lower()[:4000]
+    if converter == "rule-based":
+        return _score_news_rule_based(text, title)
+    topics = _topic_scores(full)
+    if converter == "finbert":
+        scored = _score_finbert(full)
+        return {
+            **scored,
+            "risk_score": scored["finbert_negative_score"],
+            "impact_score": scored["sentiment_confidence"],
+            **topics,
+        }
+    if converter == "cryptobert":
+        scored = _score_cryptobert(full)
+        return {
+            "sentiment_score": scored["crypto_sentiment_score"],
+            "sentiment_confidence": scored["crypto_sentiment_confidence"],
+            "risk_score": scored["crypto_bearish_score"],
+            "impact_score": scored["crypto_sentiment_confidence"],
+            **topics,
+            **scored,
+        }
+    finbert = _score_finbert(full)
+    crypto = _score_cryptobert(full)
+    sentiment_score = (finbert["sentiment_score"] * 0.55) + (crypto["crypto_sentiment_score"] * 0.45)
+    risk_score = max(finbert["finbert_negative_score"], crypto["crypto_bearish_score"], topics["regulation_risk_score"], topics["security_risk_score"], topics["war_risk_score"])
+    return {
+        "sentiment_score": max(-1.0, min(1.0, sentiment_score)),
+        "sentiment_confidence": max(finbert["sentiment_confidence"], crypto["crypto_sentiment_confidence"]),
+        "risk_score": min(1.0, risk_score),
+        "impact_score": max(abs(sentiment_score), finbert["sentiment_confidence"] * 0.5, crypto["crypto_sentiment_confidence"] * 0.5),
+        **topics,
+        **finbert,
+        **crypto,
+    }
+
+
+def _news_frame(root: Path, converter: str):
     pd, _ = _load_pandas()
     rows = []
     for row in _read_jsonl_gz(root, "news_articles.jsonl.gz"):
         text = str(row.get("raw_text") or "")
         title = str(row.get("title") or "")
-        scored = _score_news(text, title)
+        scored = _score_news(text, title, converter=converter)
         event_time = row.get("published_at") or row.get("created_at")
         rows.append(
             {
@@ -394,7 +511,7 @@ def _add_labels(frame, candles, fee_rate: float):
     return pd.concat(result_rows, ignore_index=True).sort_values(["symbol", "as_of"])
 
 
-def _quality_report(frame, candles, news, external, experience_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _quality_report(frame, candles, news, external, experience_rows: list[dict[str, Any]], converter_model: str) -> dict[str, Any]:
     warnings = []
     total_rows = int(len(frame))
     labeled_rows = int(frame["target_trade_quality_score"].notna().sum()) if "target_trade_quality_score" in frame else 0
@@ -442,7 +559,7 @@ def _quality_report(frame, candles, news, external, experience_rows: list[dict[s
         "missing_columns": missing_columns,
         "target_distribution": target_distribution,
         "buy_sell_hold_balance": action_balance,
-        "news_converter_model": NEWS_CONVERTER_MODEL,
+        "news_converter_model": converter_model,
         "raw_news_rows": int(len(news)),
         "external_rows": int(len(external)),
         "future_leakage_detected": False,
@@ -450,10 +567,11 @@ def _quality_report(frame, candles, news, external, experience_rows: list[dict[s
     }
 
 
-def _process(root: Path, output_dir: Path, lookback_hours: float, fee_rate: float) -> dict[str, Any]:
+def _process(root: Path, output_dir: Path, lookback_hours: float, fee_rate: float, news_converter: str) -> dict[str, Any]:
     pd, _ = _load_pandas()
+    converter_model = CONVERTER_MODEL_NAMES[news_converter]
     candles = _candle_frame(root)
-    news = _news_frame(root)
+    news = _news_frame(root, news_converter)
     external = _external_frame(root)
     experience_rows = _read_jsonl_gz(root, "experience_buffer.jsonl.gz")
     frame = _feature_rows(root)
@@ -464,7 +582,7 @@ def _process(root: Path, output_dir: Path, lookback_hours: float, fee_rate: floa
     frame = _add_news_features(frame, news, lookback_hours)
     frame = _add_external_summary(frame, external, 24.0)
     frame = _add_labels(frame, candles, fee_rate)
-    frame["news_converter_model"] = NEWS_CONVERTER_MODEL
+    frame["news_converter_model"] = converter_model
     if "feature_schema_version" not in frame:
         frame["feature_schema_version"] = "local-raw-v1"
     frame = frame.sort_values(["symbol", "as_of"]).drop_duplicates(subset=["symbol", "as_of"], keep="last")
@@ -474,7 +592,7 @@ def _process(root: Path, output_dir: Path, lookback_hours: float, fee_rate: floa
     dataset_path = output_dir / f"anata_training_ready_{stamp}.csv.gz"
     report_path = output_dir / f"data_quality_{stamp}.json"
     frame.to_csv(dataset_path, index=False, compression="gzip")
-    report = _quality_report(frame, candles, news, external, experience_rows)
+    report = _quality_report(frame, candles, news, external, experience_rows, converter_model)
     report["dataset_path"] = str(dataset_path)
     report["created_at"] = datetime.now(timezone.utc).isoformat()
     report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
@@ -492,6 +610,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("datasets/processed"))
     parser.add_argument("--news-lookback-hours", type=float, default=6.0)
     parser.add_argument("--fee-rate", type=float, default=0.0004)
+    parser.add_argument(
+        "--news-converter",
+        choices=["smart", "finbert", "cryptobert", "rule-based"],
+        default="smart",
+        help="Use smart/finbert/cryptobert on your PC. rule-based is only the weak fallback.",
+    )
     args = parser.parse_args()
 
     try:
@@ -500,9 +624,9 @@ def main() -> None:
                 temp_root = Path(temp_dir)
                 with zipfile.ZipFile(args.input) as archive:
                     archive.extractall(temp_root)
-                print(json.dumps(_process(temp_root, args.output_dir, args.news_lookback_hours, args.fee_rate), indent=2))
+                print(json.dumps(_process(temp_root, args.output_dir, args.news_lookback_hours, args.fee_rate, args.news_converter), indent=2))
         else:
-            print(json.dumps(_process(args.input, args.output_dir, args.news_lookback_hours, args.fee_rate), indent=2))
+            print(json.dumps(_process(args.input, args.output_dir, args.news_lookback_hours, args.fee_rate, args.news_converter), indent=2))
     except Exception as exc:
         print(f"Prepare training data failed: {exc}")
         raise SystemExit(1) from exc
