@@ -117,6 +117,13 @@ class Settings:
         "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis",
     )
     enable_hf_sentiment: bool = field(default_factory=lambda: _bool("ENABLE_HF_SENTIMENT", False))
+    hf_sentiment_backend: str = os.getenv("HF_SENTIMENT_BACKEND", "api").lower()
+    hf_api_token: str | None = (
+        os.getenv("HF_API_TOKEN")
+        or os.getenv("HUGGINGFACE_API_TOKEN")
+        or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    )
+    hf_api_timeout_seconds: int = field(default_factory=lambda: _int("HF_API_TIMEOUT_SECONDS", 20))
     gdelt_enabled: bool = field(default_factory=lambda: _bool("GDELT_ENABLED", True))
     gdelt_poll_interval_seconds: int = field(default_factory=lambda: _int("GDELT_POLL_INTERVAL_SECONDS", 900))
     gdelt_max_records: int = field(default_factory=lambda: _int("GDELT_MAX_RECORDS", 20))

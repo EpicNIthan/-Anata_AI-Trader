@@ -297,7 +297,34 @@ Reprocess existing news sentiment after enabling Hugging Face:
 curl -X POST http://localhost:8000/api/sentiment/reprocess -H "Content-Type: application/json" -d "{\"limit\":200,\"reset_model\":true}"
 ```
 
-`/api/dashboard/summary` and the dashboard sentiment status show whether HF really loaded. If `hf_loaded=false`, the app is still using the rule-based fallback. This can happen if Railway cannot download the model, does not have enough memory for `transformers`/`torch`, or the variable is not enabled. Quoted booleans like `ENABLE_HF_SENTIMENT="true"` are accepted, but Railway variables should normally be entered without quotes.
+Railway-safe Hugging Face sentiment should use the hosted HF Inference API instead of loading `torch` in the Railway container:
+
+```env
+ENABLE_HF_SENTIMENT=true
+HF_SENTIMENT_BACKEND=api
+HF_API_TOKEN=hf_your_token_here
+NEWS_SENTIMENT_MODEL=mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis
+```
+
+Then check:
+
+```powershell
+curl -H "x-admin-token: YOUR_ADMIN_TOKEN" https://your-app.up.railway.app/api/sentiment/model-status
+curl -X POST https://your-app.up.railway.app/api/sentiment/reprocess `
+  -H "x-admin-token: YOUR_ADMIN_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d "{\"limit\":200,\"reset_model\":true}"
+```
+
+`/api/dashboard/summary` and the dashboard sentiment status show whether HF really loaded. If `hf_loaded=false`, the app is still using the rule-based fallback. This can happen if `HF_API_TOKEN` is missing, Hugging Face rejects/rate-limits the request, Railway cannot reach HF, or the variable is not enabled. Quoted booleans like `ENABLE_HF_SENTIMENT="true"` are accepted, but Railway variables should normally be entered without quotes.
+
+Local laptop-only HF is still possible with:
+
+```env
+HF_SENTIMENT_BACKEND=local
+```
+
+and `pip install -r requirements-hf.txt`, but this is not recommended on small Railway containers.
 
 Data lifecycle rules:
 

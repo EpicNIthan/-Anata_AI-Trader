@@ -238,6 +238,29 @@ def main() -> None:
         sentiment_latest = client.get("/api/sentiment/latest", auth=auth)
         assert sentiment_latest.status_code == 200, sentiment_latest.text
         assert sentiment_latest.json()[0]["model_name"], sentiment_latest.text
+        sentiment_model_status = client.get("/api/sentiment/model-status", auth=auth)
+        assert sentiment_model_status.status_code == 200, sentiment_model_status.text
+        assert "backend" in sentiment_model_status.json(), sentiment_model_status.text
+        hf_env = os.environ.copy()
+        hf_env["ENABLE_HF_SENTIMENT"] = "true"
+        hf_env["HF_SENTIMENT_BACKEND"] = "api"
+        hf_env["HF_API_TOKEN"] = ""
+        hf_missing_token = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json; from app.ai.news_sentiment import active_sentiment_model; print(json.dumps(active_sentiment_model()))",
+            ],
+            cwd=ROOT,
+            env=hf_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert hf_missing_token.returncode == 0, hf_missing_token.stderr
+        missing_token_status = json.loads(hf_missing_token.stdout)
+        assert missing_token_status["fallback"] is True, missing_token_status
+        assert "HF_API_TOKEN" in (missing_token_status["hf_last_error"] or ""), missing_token_status
         sentiment_reprocess = client.post("/api/sentiment/reprocess", json={"limit": 5, "reset_model": True}, auth=auth)
         assert sentiment_reprocess.status_code == 200, sentiment_reprocess.text
         assert sentiment_reprocess.json()["processed"] >= 1, sentiment_reprocess.text

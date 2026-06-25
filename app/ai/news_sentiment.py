@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
+import json
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Any
+from urllib import error, request
 
 from app.config import settings
 
@@ -115,6 +117,7 @@ LABEL_TO_SCORE = {
     "negative": -1.0,
 }
 HF_LAST_ERROR: str | None = None
+HF_API_LAST_OK: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +171,8 @@ def _hf_pipeline() -> Any | None:
     if not settings.enable_hf_sentiment:
         HF_LAST_ERROR = None
         return None
+    if settings.hf_sentiment_backend not in {"local", "auto"}:
+        return None
     try:
         from transformers import pipeline
 
@@ -181,7 +186,81 @@ def _hf_pipeline() -> Any | None:
         return None
 
 
-def _hf_analysis(text: str) -> tuple[str, float, dict[str, Any]] | None:
+def _normalize_hf_payload(payload: Any) -> tuple[str, float, dict[str, Any]] | None:
+    if isinstance(payload, dict) and payload.get("error"):
+        return None
+    candidates = payload
+    if isinstance(payload, list) and payload and isinstance(payload[0], list):
+        candidates = payload[0]
+    if isinstance(candidates, list):
+        scored = [item for item in candidates if isinstance(item, dict)]
+        if not scored:
+            return None
+        first = max(scored, key=lambda item: float(item.get("score") or 0.0))
+    elif isinstance(candidates, dict):
+        first = candidates
+    else:
+        return None
+    label = str(first.get("label") or "neutral").lower()
+    confidence = float(first.get("score") or 0.0)
+    if "positive" in label or label in {"label_2", "2"}:
+        label = "positive"
+    elif "negative" in label or label in {"label_0", "0"}:
+        label = "negative"
+    else:
+        label = "neutral"
+    return label, confidence, {"result": first, "raw_response": payload}
+
+
+def _hf_api_analysis(text: str) -> tuple[str, float, dict[str, Any]] | None:
+    global HF_API_LAST_OK, HF_LAST_ERROR
+    if not settings.hf_api_token:
+        HF_LAST_ERROR = "HF API backend selected but HF_API_TOKEN is missing"
+        HF_API_LAST_OK = False
+        return None
+    endpoint = f"https://api-inference.huggingface.co/models/{settings.news_sentiment_model}"
+    body = json.dumps(
+        {
+            "inputs": text[:1800],
+            "options": {"wait_for_model": True},
+        }
+    ).encode("utf-8")
+    req = request.Request(
+        endpoint,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {settings.hf_api_token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=settings.hf_api_timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        HF_LAST_ERROR = f"HF API HTTP {exc.code}: {detail}"
+        HF_API_LAST_OK = False
+        logger.warning("Hugging Face API sentiment failed: %s", HF_LAST_ERROR)
+        return None
+    except Exception as exc:
+        HF_LAST_ERROR = f"HF API {type(exc).__name__}: {exc}"
+        HF_API_LAST_OK = False
+        logger.warning("Hugging Face API sentiment failed: %s", HF_LAST_ERROR)
+        return None
+    normalized = _normalize_hf_payload(payload)
+    if normalized is None:
+        HF_LAST_ERROR = f"HF API returned unsupported payload: {str(payload)[:300]}"
+        HF_API_LAST_OK = False
+        return None
+    HF_API_LAST_OK = True
+    HF_LAST_ERROR = None
+    label, confidence, raw = normalized
+    return label, confidence, {"provider": "huggingface-api", "model": settings.news_sentiment_model, **raw}
+
+
+def _hf_local_analysis(text: str) -> tuple[str, float, dict[str, Any]] | None:
+    global HF_LAST_ERROR
     model = _hf_pipeline()
     if model is None:
         return None
@@ -193,15 +272,29 @@ def _hf_analysis(text: str) -> tuple[str, float, dict[str, Any]] | None:
     first = result[0] if isinstance(result, list) and result else result
     if not isinstance(first, dict):
         return None
-    label = str(first.get("label") or "neutral").lower()
-    confidence = float(first.get("score") or 0.0)
-    if "positive" in label:
-        label = "positive"
-    elif "negative" in label:
-        label = "negative"
-    else:
-        label = "neutral"
-    return label, confidence, {"provider": "huggingface", "result": first}
+    normalized = _normalize_hf_payload(first)
+    if normalized is None:
+        return None
+    HF_LAST_ERROR = None
+    label, confidence, raw = normalized
+    return label, confidence, {"provider": "huggingface-local", "model": settings.news_sentiment_model, **raw}
+
+
+def _hf_analysis(text: str) -> tuple[str, float, dict[str, Any]] | None:
+    if not settings.enable_hf_sentiment:
+        return None
+    backend = settings.hf_sentiment_backend
+    if backend not in {"api", "local", "auto"}:
+        backend = "api"
+    if backend in {"api", "auto"}:
+        api_result = _hf_api_analysis(text)
+        if api_result is not None:
+            return api_result
+        if backend == "api":
+            return None
+    if backend in {"local", "auto"}:
+        return _hf_local_analysis(text)
+    return None
 
 
 def analyze_news(text: str) -> SentimentResult:
@@ -245,12 +338,23 @@ def analyze_news(text: str) -> SentimentResult:
 
 
 def active_sentiment_model() -> dict[str, Any]:
-    hf_loaded = _hf_pipeline() is not None if settings.enable_hf_sentiment else False
+    global HF_LAST_ERROR
+    backend = settings.hf_sentiment_backend if settings.hf_sentiment_backend in {"api", "local", "auto"} else "api"
+    api_ready = settings.enable_hf_sentiment and backend in {"api", "auto"} and bool(settings.hf_api_token)
+    local_loaded = _hf_pipeline() is not None if settings.enable_hf_sentiment and backend in {"local", "auto"} else False
+    api_loaded = api_ready and HF_API_LAST_OK is not False
+    hf_loaded = api_loaded or local_loaded
+    if settings.enable_hf_sentiment and backend in {"api", "auto"} and not settings.hf_api_token:
+        HF_LAST_ERROR = HF_LAST_ERROR or "HF_API_TOKEN is missing for Hugging Face API sentiment"
     return {
         "requested_model": settings.news_sentiment_model,
         "active_model": settings.news_sentiment_model if hf_loaded else "rule-based-fallback-v1",
+        "backend": backend,
         "hf_enabled": settings.enable_hf_sentiment,
         "hf_loaded": hf_loaded,
+        "hf_api_configured": api_ready,
+        "hf_api_last_ok": HF_API_LAST_OK,
+        "hf_local_loaded": local_loaded,
         "hf_last_error": HF_LAST_ERROR,
         "fallback": not hf_loaded,
         "future_models": ["ProsusAI/finbert", "ElKulako/cryptobert"],
@@ -258,6 +362,7 @@ def active_sentiment_model() -> dict[str, Any]:
 
 
 def reset_sentiment_model_cache() -> None:
-    global HF_LAST_ERROR
+    global HF_API_LAST_OK, HF_LAST_ERROR
     HF_LAST_ERROR = None
+    HF_API_LAST_OK = None
     _hf_pipeline.cache_clear()

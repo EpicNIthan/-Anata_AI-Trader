@@ -1578,6 +1578,11 @@ def sentiment_latest(session: Session = Depends(get_session), limit: int = 50) -
     ]
 
 
+@router.get("/sentiment/model-status")
+def sentiment_model_status() -> dict[str, Any]:
+    return active_sentiment_model()
+
+
 @router.post("/sentiment/reprocess")
 def sentiment_reprocess(
     payload: dict[str, Any] | None = Body(default=None),
