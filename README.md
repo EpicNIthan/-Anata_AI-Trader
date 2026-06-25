@@ -412,7 +412,7 @@ curl -L https://your-app.up.railway.app/api/training/download/anata_dataset_YYYY
   -o datasets/anata_dataset_YYYYMMDD_HHMMSS.csv.gz
 ```
 
-Laptop workflow for your Railway app:
+PowerShell workflow for your Railway app:
 
 ```powershell
 python -m venv .venv
@@ -420,18 +420,51 @@ python -m venv .venv
 pip install -r requirements.txt
 pip install -r requirements-local-training.txt
 
-python scripts/download_dataset.py --url https://anataai-trader-production.up.railway.app --token YOUR_ADMIN_TOKEN
+$Url = "https://anataai-trader-production.up.railway.app"
+$Token = "YOUR_ADMIN_TOKEN"
+$Headers = @{
+  "x-admin-token" = $Token
+  "Content-Type" = "application/json"
+}
 
+# 1. Build labels first so export does not spend the whole request doing heavy label work.
+Invoke-RestMethod -Method Post -Uri "$Url/api/training/build-labels" -Headers $Headers -Body "{}"
+
+# 2. Export a date range and only print the dataset_id. Use a recent since_date if Railway is slow.
+$DatasetId = python scripts/download_dataset.py --url $Url --token $Token --since-date 2026-06-24 --no-auto-build-labels --timeout 600 --export-only
+$DatasetId
+
+# Optional full export after compaction/labeling:
+# $DatasetId = python scripts/download_dataset.py --url $Url --token $Token --use-all-data --no-auto-build-labels --timeout 900 --export-only
+
+# 3. Download by dataset_id. This can be retried without creating another export.
+python scripts/download_dataset.py --url $Url --token $Token --dataset-id $DatasetId --output datasets/latest.csv.gz --timeout 600
+
+# 4. Train locally.
 python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type sklearn_hist_gradient_boosting --target target_trade_quality_score
 
 python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type lightgbm --target target_trade_quality_score
 
 python scripts/evaluate_local_model.py --dataset datasets/latest.csv.gz --model models/YOUR_MODEL.joblib
 
+# 5. Package, upload as candidate, then activate only after checking metrics.
 python scripts/package_model.py --model models/YOUR_MODEL.joblib
 
-python scripts/upload_model.py --url https://anataai-trader-production.up.railway.app --token YOUR_ADMIN_TOKEN --package model_package_VERSION.zip
+python scripts/upload_model.py --url $Url --token $Token --package model_package_VERSION.zip
+
+python scripts/activate_model.py --url $Url --token $Token --model-id MODEL_ID
 ```
+
+For large Railway datasets, `scripts/download_dataset.py` supports:
+
+```powershell
+python scripts/download_dataset.py --url $Url --token $Token --since-date 2026-06-24 --timeout 600
+python scripts/download_dataset.py --url $Url --token $Token --use-all-data --timeout 900
+python scripts/download_dataset.py --url $Url --token $Token --since-date 2026-06-24 --export-only
+python scripts/download_dataset.py --url $Url --token $Token --dataset-id anata_dataset_YYYYMMDD_HHMMSS.csv.gz --output datasets/latest.csv.gz
+```
+
+If export times out, build labels first, run DB compact from the dashboard/Data tab, or retry with a smaller `--since-date` range.
 
 Supported local model types:
 
