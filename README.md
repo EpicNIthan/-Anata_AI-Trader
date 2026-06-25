@@ -412,6 +412,9 @@ python scripts/sync_daily_bundles.py --url $Url --token $Token --days 7
 
 # Download, then delete finished Railway data. Today's unfinished day remains collecting.
 python scripts/sync_daily_bundles.py --url $Url --token $Token --days 7 --delete-finished-from-railway
+
+# If Railway returns 502 during bundle build, wait for redeploy and try smaller first:
+python scripts/sync_daily_bundles.py --url $Url --token $Token --days 1
 ```
 
 Each daily bundle contains only useful training data:

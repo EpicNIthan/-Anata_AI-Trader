@@ -106,22 +106,26 @@ def _date_range(session: Session, since_date: datetime | None = None, days: int 
     return [start_day + timedelta(days=index) for index in range(total_days)]
 
 
-def _rows_for_day(session: Session, table: BundleTable, start: datetime, end: datetime) -> list[Any]:
+def _query_for_day(table: BundleTable, start: datetime, end: datetime) -> Any:
     query = select(table.model).where(table.time_column >= start, table.time_column < end).order_by(table.time_column)
     if table.model is Candle:
         query = query.where(Candle.is_closed.is_(True))
-    return list(session.scalars(query))
+    return query
 
 
-def _write_table(path: Path, table_name: str, rows: list[Any]) -> dict[str, Any]:
+def _write_table(session: Session, path: Path, table: BundleTable, start: datetime, end: datetime) -> dict[str, Any]:
+    table_name = table.name
     columns = [column.name for column in Base.metadata.tables[table_name].columns]
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows_written = 0
     with gzip.open(path, "wt", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
-        for row in rows:
+        for row in session.scalars(_query_for_day(table, start, end)).yield_per(1000):
             writer.writerow({column: _json_safe(getattr(row, column)) for column in columns})
-    return {"file": path.name, "rows": len(rows)}
+            rows_written += 1
+    session.expunge_all()
+    return {"file": path.name, "rows": rows_written}
 
 
 def _zip_dir(source_dir: Path, output_path: Path) -> None:
@@ -155,9 +159,8 @@ def build_daily_bundles(
         table_exports = {}
         total_rows = 0
         for table in BUNDLE_TABLES:
-            rows = _rows_for_day(session, table, day, end)
-            table_exports[table.name] = _write_table(bundle_dir / f"{table.name}.csv.gz", table.name, rows)
-            total_rows += len(rows)
+            table_exports[table.name] = _write_table(session, bundle_dir / f"{table.name}.csv.gz", table, day, end)
+            total_rows += int(table_exports[table.name]["rows"])
         manifest = {
             "bundle_id": f"{day.date().isoformat()}_{status}.zip",
             "day": day.date().isoformat(),

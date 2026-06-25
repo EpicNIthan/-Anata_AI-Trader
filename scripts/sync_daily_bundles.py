@@ -24,8 +24,19 @@ def _api(
         method=method,
         headers={"x-admin-token": token, "Content-Type": "application/json"},
     )
-    with request.urlopen(req, timeout=timeout) as response:
-        return response.read()
+    try:
+        with request.urlopen(req, timeout=timeout) as response:
+            return response.read()
+    except error.HTTPError as exc:
+        try:
+            body_text = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body_text = ""
+        detail = body_text[:1200].strip()
+        message = f"Railway returned HTTP {exc.code} {exc.reason} for {path}"
+        if detail:
+            message = f"{message}: {detail}"
+        raise RuntimeError(message) from exc
 
 
 def _json_api(url: str, token: str, path: str, *, method: str = "GET", body: dict | None = None, timeout: int = 900) -> dict:
@@ -115,7 +126,13 @@ def main() -> None:
         _write_json(args.output_root / "latest_manifest_failed.json", manifest | {"error": str(exc), "error_type": type(exc).__name__})
         if _is_timeout(exc):
             print("Bundle sync timed out. Retry with --days 2 or a higher --timeout.")
-        raise
+        elif "HTTP 502" in str(exc) or "Bad Gateway" in str(exc):
+            print("Railway returned 502 while building bundles.")
+            print("Most likely the old deployment ran out of memory or Railway is still redeploying.")
+            print("Wait for the latest deployment, then retry. If it still fails, use --days 1 first.")
+        else:
+            print(f"Bundle sync failed: {exc}")
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
