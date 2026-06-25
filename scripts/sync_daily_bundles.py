@@ -85,14 +85,21 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, default=Path("local_data/daily_bundles"))
     parser.add_argument("--since-date", default=None)
     parser.add_argument("--days", type=int, default=None)
+    parser.add_argument("--all-data", action="store_true", help="Download every available day. This is also the default when --days is omitted.")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--no-unfinished", action="store_true", help="Do not include today's unfinished bundle.")
     parser.add_argument("--no-extract", action="store_true", help="Keep zip files only.")
     parser.add_argument("--delete-finished-from-railway", action="store_true")
     parser.add_argument(
+        "--preset",
+        choices=["training", "all"],
+        default="training",
+        help="training = only useful model-training tables. all = every supported DB table snapshot.",
+    )
+    parser.add_argument(
         "--tables",
-        default="candles,news_articles,news_sentiment,external_data_events,training_features,experience_buffer",
-        help="Comma-separated tables to bundle. Default is the compact training-useful set.",
+        default=None,
+        help="Optional comma-separated tables. Overrides --preset.",
     )
     parser.add_argument("--compact-first", action="store_true", help="Run Railway compact cleanup before building bundles.")
     args = parser.parse_args()
@@ -101,6 +108,7 @@ def main() -> None:
     try:
         if args.compact_first:
             manifest["compact_first"] = _json_api(args.url, args.token, "/api/db/compact", method="POST", body={}, timeout=args.timeout)
+        selected_tables = args.tables or args.preset
         build = _json_api(
             args.url,
             args.token,
@@ -108,9 +116,9 @@ def main() -> None:
             method="POST",
             body={
                 "since_date": args.since_date,
-                "days": args.days,
+                "days": None if args.all_data else args.days,
                 "include_unfinished": not args.no_unfinished,
-                "tables": args.tables,
+                "tables": selected_tables,
             },
             timeout=args.timeout,
         )

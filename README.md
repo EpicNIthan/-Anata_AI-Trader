@@ -407,11 +407,14 @@ Railway can package useful training data into one folder per UTC day. A complete
 $Url = "https://anataai-trader-production.up.railway.app"
 $Token = "YOUR_ADMIN_TOKEN"
 
-# Download daily zip folders into local_data/daily_bundles/.
-python scripts/sync_daily_bundles.py --url $Url --token $Token --days 7
+# Download all useful training history into local_data/daily_bundles/.
+python scripts/sync_daily_bundles.py --url $Url --token $Token --all-data --preset training
 
 # Download, then delete finished Railway data. Today's unfinished day remains collecting.
-python scripts/sync_daily_bundles.py --url $Url --token $Token --days 7 --delete-finished-from-railway
+python scripts/sync_daily_bundles.py --url $Url --token $Token --all-data --preset training --delete-finished-from-railway
+
+# Full database-style snapshot for backup/research, not the normal training input.
+python scripts/sync_daily_bundles.py --url $Url --token $Token --all-data --preset all
 
 # If Railway returns 502 during bundle build, wait for redeploy and try smaller first:
 python scripts/sync_daily_bundles.py --url $Url --token $Token --days 1
@@ -420,14 +423,16 @@ python scripts/sync_daily_bundles.py --url $Url --token $Token --days 1
 python scripts/sync_daily_bundles.py --url $Url --token $Token --days 1 --compact-first
 ```
 
-Each daily bundle contains only useful training data:
+The normal `--preset training` bundle contains only useful training data:
 
 - `candles.csv.gz` closed training-quality candles.
 - `news_articles.csv.gz` raw news for local news AI.
 - `news_sentiment.csv.gz` current sentiment scores.
 - `external_data_events.csv.gz` trader-flow, macro, liquidation, fear/greed, stablecoin context.
-- `features.csv.gz` and `training_features.csv.gz`.
-- `experience_buffer.csv.gz`, `ai_decisions.csv.gz`, `paper_trades.csv.gz`, and `account_equity.csv.gz`.
+- `training_features.csv.gz` compact numeric feature/label rows.
+- `experience_buffer.csv.gz` compact action-result/reward memory.
+
+`--preset all` includes extra operational tables too, such as debug features, AI decisions, trades, equity, positions, model versions, and training runs. Use it when you want a full backup, but train primarily from the `training` preset because it avoids wasting space on rows the model cannot learn much from.
 
 Recommended normal loop:
 

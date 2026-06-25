@@ -23,10 +23,13 @@ from app.db.models import (
     Feature,
     LiveCandleUpdate,
     MarketTick,
+    ModelVersion,
     NewsArticle,
     NewsSentiment,
     PaperTrade,
+    Position,
     TrainingFeature,
+    TrainingRun,
 )
 
 BUNDLE_ROOT = Path("datasets") / "daily_bundles"
@@ -50,6 +53,9 @@ BUNDLE_TABLES = [
     BundleTable("ai_decisions", AiDecision, AiDecision.created_at),
     BundleTable("paper_trades", PaperTrade, PaperTrade.created_at),
     BundleTable("account_equity", AccountEquity, AccountEquity.timestamp),
+    BundleTable("positions", Position, Position.opened_at),
+    BundleTable("model_versions", ModelVersion, ModelVersion.created_at),
+    BundleTable("training_runs", TrainingRun, TrainingRun.started_at),
 ]
 BUNDLE_TABLES_BY_NAME = {table.name: table for table in BUNDLE_TABLES}
 DEFAULT_TRAINING_BUNDLE_TABLES = [
@@ -60,6 +66,7 @@ DEFAULT_TRAINING_BUNDLE_TABLES = [
     "training_features",
     "experience_buffer",
 ]
+ALL_BUNDLE_TABLES = [table.name for table in BUNDLE_TABLES]
 
 
 def _utc_day(value: datetime) -> datetime:
@@ -98,13 +105,21 @@ def _bundle_zip_path(day: datetime, status: str) -> Path:
     return BUNDLE_ROOT / f"{day.date().isoformat()}_{status}.zip"
 
 
-def _date_range(session: Session, since_date: datetime | None = None, days: int | None = None) -> list[datetime]:
+def _date_range(
+    session: Session,
+    *,
+    selected_tables: list[BundleTable],
+    since_date: datetime | None = None,
+    days: int | None = None,
+) -> list[datetime]:
     current_day = _now_day()
     if since_date:
         start_day = _utc_day(since_date)
     else:
         earliest_values = []
-        for table in BUNDLE_TABLES:
+        for table in selected_tables:
+            if table.time_column is None:
+                continue
             value = session.scalar(select(func.min(table.time_column)))
             if value:
                 earliest_values.append(value if value.tzinfo else value.replace(tzinfo=timezone.utc))
@@ -116,6 +131,8 @@ def _date_range(session: Session, since_date: datetime | None = None, days: int 
 
 
 def _query_for_day(table: BundleTable, start: datetime, end: datetime) -> Any:
+    if table.model is None or table.time_column is None:
+        return None
     query = select(table.model).where(table.time_column >= start, table.time_column < end).order_by(table.time_column)
     if table.model is Candle:
         query = query.where(Candle.is_closed.is_(True))
@@ -130,7 +147,10 @@ def _write_table(session: Session, path: Path, table: BundleTable, start: dateti
     with gzip.open(path, "wt", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
-        for row in session.scalars(_query_for_day(table, start, end)).yield_per(1000):
+        query = _query_for_day(table, start, end)
+        if query is None:
+            return {"file": path.name, "rows": 0, "note": "table has no daily time column"}
+        for row in session.scalars(query).yield_per(1000):
             writer.writerow({column: _json_safe(getattr(row, column)) for column in columns})
             rows_written += 1
     session.expunge_all()
@@ -149,6 +169,10 @@ def _zip_dir(source_dir: Path, output_path: Path) -> None:
 
 def _selected_tables(tables: list[str] | None = None) -> list[BundleTable]:
     names = tables or DEFAULT_TRAINING_BUNDLE_TABLES
+    if any(str(name).strip().lower() in {"all", "*", "database"} for name in names):
+        names = ALL_BUNDLE_TABLES
+    if any(str(name).strip().lower() in {"training", "useful", "default"} for name in names):
+        names = DEFAULT_TRAINING_BUNDLE_TABLES
     selected = []
     for name in names:
         table = BUNDLE_TABLES_BY_NAME.get(str(name).strip())
@@ -169,7 +193,7 @@ def build_daily_bundles(
     current_day = _now_day()
     selected_tables = _selected_tables(tables)
     bundles = []
-    for day in _date_range(session, since_date=since_date, days=days):
+    for day in _date_range(session, selected_tables=selected_tables, since_date=since_date, days=days):
         status = "unfinished" if day >= current_day else "finished"
         if status == "unfinished" and not include_unfinished:
             continue
