@@ -613,13 +613,17 @@ class FeatureBuilder:
         }
 
     def _recent_news_features(self, symbol: str, now: datetime) -> dict[str, Any]:
-        since = datetime.now(timezone.utc) - timedelta(hours=48)
+        now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        since = now - timedelta(hours=48)
         rows = list(
             self.session.execute(
                 select(NewsSentiment, NewsArticle)
                 .join(NewsArticle, NewsArticle.id == NewsSentiment.article_id)
-                .where(NewsSentiment.created_at >= since)
-                .order_by(desc(NewsSentiment.created_at))
+                .where(
+                    NewsArticle.published_at >= since,
+                    NewsArticle.published_at <= now,
+                )
+                .order_by(desc(NewsArticle.published_at))
                 .limit(200)
             )
         )

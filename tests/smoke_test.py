@@ -84,6 +84,7 @@ def main() -> None:
     accelerated_exported_path: Path | None = None
     uploaded_model_package: Path | None = None
     uploaded_model_file: Path | None = None
+    sentiment_upload_path: Path | None = None
     archive_paths: list[Path] = []
     if db_path.exists():
         db_path.unlink()
@@ -279,8 +280,47 @@ def main() -> None:
         with SessionLocal() as session:
             news_count = session.scalar(select(func.count(NewsArticle.id))) or 0
             sentiment_count = session.scalar(select(func.count(NewsSentiment.id))) or 0
+            first_article = session.scalar(select(NewsArticle).order_by(NewsArticle.id).limit(1))
         assert news_count > 0
         assert sentiment_count > 0
+        assert first_article is not None
+        raw_news_export = client.post("/api/news/export-raw", json={"use_all_data": True}, auth=auth)
+        assert raw_news_export.status_code == 200, raw_news_export.text
+        assert raw_news_export.json()["rows"] > 0, raw_news_export.text
+        raw_news_download = client.get(raw_news_export.json()["download_url"], auth=auth)
+        assert raw_news_download.status_code == 200, raw_news_download.text
+        assert raw_news_download.content
+        sentiment_upload_path = Path("_smoke_news_sentiment.jsonl.gz")
+        with gzip.open(sentiment_upload_path, "wt", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "article_id": first_article.id,
+                        "url": first_article.url,
+                        "sentiment_score": 0.42,
+                        "risk_score": 0.12,
+                        "topics": ["macro", "market"],
+                        "affected_symbols": ["BTCUSDT"],
+                        "label": "positive",
+                        "confidence": 0.88,
+                        "model_name": "smoke-local-news-model",
+                        "raw_payload": {"test": True},
+                    }
+                )
+                + "\n"
+            )
+        with sentiment_upload_path.open("rb") as handle:
+            sentiment_import = client.post(
+                "/api/sentiment/import",
+                files={"file": (sentiment_upload_path.name, handle, "application/gzip")},
+                auth=auth,
+            )
+        assert sentiment_import.status_code == 200, sentiment_import.text
+        assert sentiment_import.json()["imported"] == 1, sentiment_import.text
+        with SessionLocal() as session:
+            imported_sentiment = session.scalar(select(NewsSentiment).where(NewsSentiment.article_id == first_article.id).limit(1))
+            assert imported_sentiment is not None
+            assert imported_sentiment.model_name == "smoke-local-news-model"
 
         collector_status = client.get("/api/collectors/status", auth=auth)
         assert collector_status.status_code == 200, collector_status.text
@@ -689,6 +729,8 @@ def main() -> None:
         uploaded_model_file.unlink()
     if uploaded_model_package and uploaded_model_package.exists():
         uploaded_model_package.unlink()
+    if sentiment_upload_path and sentiment_upload_path.exists():
+        sentiment_upload_path.unlink()
     smoke_model_dir = Path("_smoke_models")
     if smoke_model_dir.exists():
         shutil.rmtree(smoke_model_dir)

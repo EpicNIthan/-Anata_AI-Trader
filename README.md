@@ -336,6 +336,37 @@ HF_SENTIMENT_BACKEND=local
 
 and `pip install -r requirements-hf.txt`, but this is not recommended on small Railway containers.
 
+Recommended heavy-news workflow:
+
+Railway only collects raw news. Your laptop converts raw news text into smarter numeric sentiment, uploads those scores, then you rebuild/export/train.
+
+```powershell
+$Url = "https://anataai-trader-production.up.railway.app"
+$Token = "YOUR_ADMIN_TOKEN"
+
+# 1. Download raw news from Railway.
+python scripts/download_raw_news.py --url $Url --token $Token --since-date 2026-06-24 --output datasets/latest_raw_news.csv.gz
+
+# 2. On your laptop, install heavy sentiment deps if you want Hugging Face locally.
+python -m pip install -r requirements-hf.txt
+
+# 3. Score raw news locally. If transformers is unavailable, this still writes a fallback file.
+python scripts/score_news_local.py --input datasets/latest_raw_news.csv.gz --output datasets/latest_news_sentiment.jsonl.gz
+
+# 4. Upload smarter sentiment rows back to Railway.
+python scripts/upload_sentiment.py --url $Url --token $Token --file datasets/latest_news_sentiment.jsonl.gz
+
+# 5. Rebuild compact training rows so they use the uploaded sentiment scores, then export/train.
+Invoke-RestMethod -Method Post -Uri "$Url/api/training/build-dataset" `
+  -Headers @{"x-admin-token"=$Token;"Content-Type"="application/json"} `
+  -Body '{"symbols":["BTCUSDT","ETHUSDT"],"days":14,"max_rows_per_symbol":5000,"stride":5,"backfill":false,"export":false}'
+
+python scripts/download_dataset.py --url $Url --token $Token --since-date 2026-06-24 --no-auto-build-labels --output datasets/latest.csv.gz
+python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type sklearn_hist_gradient_boosting --target target_trade_quality_score
+```
+
+This loop can be repeated: collect more data on Railway, download raw news/dataset again, score/train on your laptop, upload a new candidate model, activate only after metrics look good.
+
 Data lifecycle rules:
 
 - `live_candle_updates` is short-term chart data and is upserted by symbol/timeframe/open time.

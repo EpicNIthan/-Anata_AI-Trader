@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import gzip
+import io
 import json
 import logging
 import shutil
@@ -331,6 +334,44 @@ def _dataset_download_path(dataset_id: str) -> Path:
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Dataset not found")
     return path
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _json_or_csv_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if str(item)]
+        except json.JSONDecodeError:
+            pass
+        return [item.strip() for item in stripped.split(",") if item.strip()]
+    return []
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+        except json.JSONDecodeError:
+            return {"value": value}
+    return {}
 
 
 def _model_payload(model: ModelVersion | None) -> dict[str, Any]:
@@ -1152,6 +1193,74 @@ def news_latest(
     return latest_news(session, limit=limit, provider=provider)
 
 
+@router.post("/news/export-raw")
+def news_export_raw(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    since_date = parse_since_date(payload.get("since_date"))
+    use_all_data = bool(payload.get("use_all_data", False))
+    limit = int(payload["limit"]) if payload.get("limit") else None
+    provider = str(payload.get("provider") or "").lower().strip() or None
+    query = select(NewsArticle).order_by(NewsArticle.published_at)
+    if since_date and not use_all_data:
+        query = query.where(NewsArticle.published_at >= since_date)
+    if provider:
+        query = query.where(NewsArticle.source_name == provider)
+    if limit:
+        query = query.limit(max(1, min(limit, 1_000_000)))
+    rows = list(session.scalars(query))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_path = Path("datasets") / f"anata_raw_news_{timestamp}.csv.gz"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "article_id",
+        "provider",
+        "source",
+        "title",
+        "url",
+        "published_at",
+        "raw_text",
+        "raw_payload",
+        "created_at",
+    ]
+    with gzip.open(output_path, "wt", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for article in rows:
+            writer.writerow(
+                {
+                    "article_id": article.id,
+                    "provider": article.source_name or "",
+                    "source": article.source or "",
+                    "title": article.title or "",
+                    "url": article.url or "",
+                    "published_at": _dt(article.published_at),
+                    "raw_text": article.raw_text or "",
+                    "raw_payload": json.dumps(article.raw_payload or article.raw or {}, separators=(",", ":"), default=str),
+                    "created_at": _dt(article.created_at),
+                }
+            )
+    return {
+        "status": "ok",
+        "dataset_id": output_path.name,
+        "download_url": f"/api/news/download/{output_path.name}",
+        "exported_path": str(output_path),
+        "rows": len(rows),
+        "since_date": since_date.isoformat() if since_date else None,
+        "use_all_data": use_all_data,
+        "provider": provider,
+    }
+
+
+@router.get("/news/download/{dataset_id}")
+def news_download(dataset_id: str) -> FileResponse:
+    path = _dataset_download_path(dataset_id)
+    return FileResponse(path, filename=path.name, media_type="application/gzip" if path.suffix == ".gz" else "text/csv")
+
+
 @router.post("/news/run-once")
 async def news_run_once(
     payload: dict[str, Any] | None = Body(default=None),
@@ -1702,6 +1811,84 @@ def sentiment_latest(session: Session = Depends(get_session), limit: int = 50) -
 @router.get("/sentiment/model-status")
 def sentiment_model_status() -> dict[str, Any]:
     return active_sentiment_model()
+
+
+@router.post("/sentiment/import")
+async def sentiment_import(
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    filename = Path(file.filename or "sentiment.jsonl").name
+    raw_bytes = await file.read()
+    if filename.endswith(".gz"):
+        raw_bytes = gzip.decompress(raw_bytes)
+        filename = filename[:-3]
+    text = raw_bytes.decode("utf-8-sig")
+    rows: list[dict[str, Any]] = []
+    if filename.endswith(".csv"):
+        rows = [dict(row) for row in csv.DictReader(io.StringIO(text))]
+    elif filename.endswith(".json"):
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            rows = [row for row in parsed if isinstance(row, dict)]
+        elif isinstance(parsed, dict):
+            data_rows = parsed.get("rows") if isinstance(parsed.get("rows"), list) else [parsed]
+            rows = [row for row in data_rows if isinstance(row, dict)]
+    else:
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                rows.append(parsed)
+
+    imported = 0
+    skipped = 0
+    updated_article_ids: list[int] = []
+    for row in rows:
+        article: NewsArticle | None = None
+        article_id = row.get("article_id") or row.get("id")
+        if article_id not in (None, ""):
+            try:
+                article = session.get(NewsArticle, int(article_id))
+            except (TypeError, ValueError):
+                article = None
+        if article is None and row.get("url"):
+            article = session.scalar(select(NewsArticle).where(NewsArticle.url == str(row["url"])).limit(1))
+        if article is None:
+            skipped += 1
+            continue
+
+        sentiment = session.scalar(select(NewsSentiment).where(NewsSentiment.article_id == article.id).limit(1))
+        if sentiment is None:
+            sentiment = NewsSentiment(article_id=article.id)
+            session.add(sentiment)
+        model_name = str(row.get("model_name") or row.get("model") or "local-news-model")
+        sentiment.sentiment_score = _safe_float(row.get("sentiment_score"))
+        sentiment.risk_score = _safe_float(row.get("risk_score"))
+        sentiment.topics = _json_or_csv_list(row.get("topics"))
+        sentiment.affected_symbols = _json_or_csv_list(row.get("affected_symbols"))
+        sentiment.model_name = model_name
+        sentiment.sentiment_label = str(row.get("label") or row.get("sentiment_label") or "")
+        sentiment.confidence = _safe_float(row.get("confidence"), 0.0)
+        sentiment.source_name = f"{article.source_name or 'unknown'}:{model_name}"
+        sentiment.raw_payload = _json_dict(row.get("raw_payload")) | {
+            "imported_from": filename,
+            "local_processed": True,
+        }
+        imported += 1
+        updated_article_ids.append(article.id)
+    session.commit()
+    return {
+        "status": "ok",
+        "filename": filename,
+        "rows_received": len(rows),
+        "imported": imported,
+        "skipped": skipped,
+        "updated_article_ids_sample": updated_article_ids[:20],
+        "next_step": "Rebuild features/dataset so training uses the improved local sentiment scores.",
+    }
 
 
 @router.post("/sentiment/reprocess")

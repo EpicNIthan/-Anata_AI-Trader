@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from statistics import mean, pstdev
 from typing import Any
 
@@ -9,7 +9,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db.models import Candle, TrainingFeature
+from app.db.models import Candle, NewsArticle, NewsSentiment, TrainingFeature
 from app.db.session import SessionLocal, create_db_and_tables
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, feature_payload
 
@@ -43,6 +43,78 @@ def _horizon_rows(interval: str) -> dict[str, int]:
     return {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
 
 
+def _recency_weight(published_at: datetime | None, as_of: datetime) -> float:
+    if published_at is None:
+        return 0.25
+    published = published_at if published_at.tzinfo else published_at.replace(tzinfo=timezone.utc)
+    current = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
+    age_hours = max((current - published).total_seconds() / 3600, 0.0)
+    return _clamp(1.0 - (age_hours / 48.0), 0.05, 1.0)
+
+
+def _historical_news_values(session: Session, symbol: str, as_of: datetime) -> dict[str, Any]:
+    current = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
+    since = current - timedelta(hours=48)
+    rows = list(
+        session.execute(
+            select(NewsSentiment, NewsArticle)
+            .join(NewsArticle, NewsArticle.id == NewsSentiment.article_id)
+            .where(
+                NewsArticle.published_at >= since,
+                NewsArticle.published_at <= current,
+            )
+            .order_by(NewsArticle.published_at.desc())
+            .limit(100)
+        )
+    )
+    relevant: list[tuple[NewsSentiment, NewsArticle, float]] = []
+    btc_related = 0.0
+    eth_related = 0.0
+    macro_related = 0.0
+    for sentiment, article in rows:
+        affected_symbols = sentiment.affected_symbols or []
+        topics = sentiment.topics or []
+        text = f"{article.title or ''} {article.raw_text or ''}".lower()
+        article_btc_related = "BTCUSDT" in affected_symbols or "bitcoin" in text or " btc" in f" {text}"
+        article_eth_related = "ETHUSDT" in affected_symbols or "ethereum" in text or " eth" in f" {text}"
+        article_macro_related = "macro" in topics or any(term in text for term in ("fed", "federal reserve", "inflation", "interest rate", "rates", "war", "sec"))
+        btc_related = max(btc_related, 1.0 if article_btc_related else 0.0)
+        eth_related = max(eth_related, 1.0 if article_eth_related else 0.0)
+        macro_related = max(macro_related, 1.0 if article_macro_related else 0.0)
+        if not affected_symbols or symbol in affected_symbols or article_macro_related:
+            relevant.append((sentiment, article, _recency_weight(article.published_at or sentiment.created_at, current)))
+    if not relevant:
+        return {
+            "sentiment_score": 0.0,
+            "sentiment_confidence": 0.0,
+            "risk_score": 0.0,
+            "impact_score": 0.0,
+            "recency_weight": 0.0,
+            "btc_related": btc_related,
+            "eth_related": eth_related,
+            "macro_related": macro_related,
+            "sentiment_articles_used": 0,
+        }
+    weights = [max(weight, 0.01) * (sentiment.confidence if sentiment.confidence is not None else 0.5) for sentiment, _, weight in relevant]
+    total_weight = sum(weights) or 1.0
+    sentiment_score = sum(sentiment.sentiment_score * weight for (sentiment, _, _), weight in zip(relevant, weights)) / total_weight
+    risk_score = sum(sentiment.risk_score * weight for (sentiment, _, _), weight in zip(relevant, weights)) / total_weight
+    confidence = sum((sentiment.confidence if sentiment.confidence is not None else 0.5) * weight for (sentiment, _, _), weight in zip(relevant, weights)) / total_weight
+    recency = mean(weight for _, _, weight in relevant)
+    impact_score = _clamp((abs(sentiment_score) * confidence * 0.45) + (risk_score * 0.40) + (recency * 0.15), 0.0, 1.0)
+    return {
+        "sentiment_score": _clamp(sentiment_score, -1.0, 1.0),
+        "sentiment_confidence": _clamp(confidence, 0.0, 1.0),
+        "risk_score": _clamp(risk_score, 0.0, 1.0),
+        "impact_score": impact_score,
+        "recency_weight": _clamp(recency, 0.0, 1.0),
+        "btc_related": btc_related,
+        "eth_related": eth_related,
+        "macro_related": macro_related,
+        "sentiment_articles_used": len(relevant),
+    }
+
+
 def _existing_training_feature(session: Session, symbol: str, as_of: datetime) -> TrainingFeature | None:
     return session.scalar(
         select(TrainingFeature)
@@ -63,6 +135,7 @@ def _build_values(
     current_index: int,
     candles: list[Candle],
     horizons: dict[str, int],
+    news_values: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     closes = [row.close for row in lookback]
     volumes = [row.volume for row in lookback]
@@ -117,25 +190,26 @@ def _build_values(
         1.0,
     )
 
+    news_values = news_values or {}
     values: dict[str, Any] = {
         "price_change": price_change,
         "volume_change": volume_change,
         "volatility": volatility,
         "trend": trend,
         "trend_score": trend_score,
-        "sentiment_score": 0.0,
-        "sentiment_confidence": 0.0,
-        "risk_score": 0.0,
-        "impact_score": 0.0,
-        "recency_weight": 0.0,
-        "btc_related": 1.0 if symbol == "BTCUSDT" else 0.0,
-        "eth_related": 1.0 if symbol == "ETHUSDT" else 0.0,
-        "macro_related": 0.0,
+        "sentiment_score": news_values.get("sentiment_score", 0.0),
+        "sentiment_confidence": news_values.get("sentiment_confidence", 0.0),
+        "risk_score": news_values.get("risk_score", 0.0),
+        "impact_score": news_values.get("impact_score", 0.0),
+        "recency_weight": news_values.get("recency_weight", 0.0),
+        "btc_related": max(float(news_values.get("btc_related", 0.0) or 0.0), 1.0 if symbol == "BTCUSDT" else 0.0),
+        "eth_related": max(float(news_values.get("eth_related", 0.0) or 0.0), 1.0 if symbol == "ETHUSDT" else 0.0),
+        "macro_related": news_values.get("macro_related", 0.0),
         "candle_return_1m": candle_return_1m,
         "candle_return_5m": candle_return_5m,
         "last_close": entry_price,
         "candles_used": len(lookback),
-        "sentiment_articles_used": 0,
+        "sentiment_articles_used": news_values.get("sentiment_articles_used", 0),
         "crowd_long_account_pct": 0.0,
         "crowd_short_account_pct": 0.0,
         "crowd_long_short_ratio": 0.0,
@@ -189,6 +263,7 @@ def build_training_labels(
     normalized_symbols = [symbol.upper() for symbol in (symbols or settings.binance_symbols)]
     horizons = _horizon_rows(interval)
     per_symbol: dict[str, int] = {}
+    per_symbol_updated: dict[str, int] = {}
     with SessionLocal() as session:
         for symbol in normalized_symbols:
             rows = list(
@@ -201,12 +276,12 @@ def build_training_labels(
             )
             candles = list(reversed(rows))
             created = 0
+            updated = 0
             last_usable_index = len(candles) - horizons["4h"] - 1
             for current_index in range(lookback, max(last_usable_index, lookback), max(stride, 1)):
                 current = candles[current_index]
                 as_of = current.close_time or current.open_time
-                if _existing_training_feature(session, symbol, as_of):
-                    continue
+                existing = _existing_training_feature(session, symbol, as_of)
                 lookback_rows = candles[current_index - lookback : current_index + 1]
                 values = _build_values(
                     symbol=symbol,
@@ -215,6 +290,7 @@ def build_training_labels(
                     current_index=current_index,
                     candles=candles,
                     horizons=horizons,
+                    news_values=_historical_news_values(session, symbol, as_of),
                 )
                 payload = feature_payload(
                     schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
@@ -227,7 +303,7 @@ def build_training_labels(
                         "label_horizons": horizons,
                         "source_candle_id": current.id,
                     },
-                    sources={"candles": "candles", "news_sentiment": "zero_unavailable", "derivatives": "zero_unavailable"},
+                    sources={"candles": "candles", "news_sentiment": "news_sentiment", "derivatives": "zero_unavailable"},
                 )
                 training_values = dict(payload["values"])
                 training_values.pop("final_ai_input", None)
@@ -239,6 +315,12 @@ def build_training_labels(
                         "debug_payload": "full final_ai_input omitted from compact training rows",
                     },
                 }
+                if existing:
+                    existing.schema_version = CURRENT_FEATURE_SCHEMA_VERSION
+                    existing.feature_values = training_values
+                    existing.payload = training_payload
+                    updated += 1
+                    continue
                 session.add(
                     TrainingFeature(
                         source_feature_id=None,
@@ -252,6 +334,7 @@ def build_training_labels(
                 )
                 created += 1
             per_symbol[symbol] = created
+            per_symbol_updated[symbol] = updated
         session.commit()
     return {
         "symbols": normalized_symbols,
@@ -259,7 +342,10 @@ def build_training_labels(
         "lookback": lookback,
         "stride": stride,
         "rows_created": sum(per_symbol.values()),
+        "rows_updated": sum(per_symbol_updated.values()),
         "per_symbol": per_symbol,
+        "per_symbol_updated": per_symbol_updated,
+        "note": "Existing historical rows are refreshed with current local/imported news sentiment when rebuilt.",
         "schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
     }
 
