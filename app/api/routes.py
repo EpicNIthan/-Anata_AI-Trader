@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import zipfile
 from datetime import datetime, timezone
@@ -38,7 +39,7 @@ from app.db.models import (
     TrainingFeature,
     TrainingRun,
 )
-from app.db.session import get_session
+from app.db.session import create_db_and_tables, get_session
 from app.features.feature_builder import FeatureBuilder
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, values_from_feature
 from app.security import require_admin
@@ -51,6 +52,7 @@ from app.training.label_builder import build_labels_for_existing_features, label
 from app.trading.paper_engine import PaperEngine
 
 router = APIRouter(prefix="/api", tags=["lab"], dependencies=[Depends(require_admin)])
+logger = logging.getLogger(__name__)
 
 INSPECTOR_FEATURE_KEYS = [
     "sentiment_score",
@@ -791,6 +793,29 @@ def storage_status(session: Session = Depends(get_session)) -> dict[str, Any]:
     return database_diagnostics(session, include_raw_estimates=True)
 
 
+@router.post("/db/migrate")
+def db_migrate(_: None = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        migration = create_db_and_tables()
+    except Exception as exc:
+        logger.exception("Database migration failed")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "message": "Database migration failed. Check Railway logs for the full traceback.",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        ) from exc
+    return {
+        "status": "ok",
+        "migration": migration,
+        "added_columns": migration.get("added_columns", []) if isinstance(migration, dict) else [],
+        "existing_tables": migration.get("existing_tables", []) if isinstance(migration, dict) else [],
+    }
+
+
 @router.post("/storage/cleanup/run")
 def storage_cleanup_run(request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
     return _data_lifecycle(request).compact_once()
@@ -1185,24 +1210,43 @@ def training_build_labels(
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     payload = payload or {}
-    symbols = payload.get("symbols")
-    if isinstance(symbols, str):
-        symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
-    if symbols is not None and not isinstance(symbols, list):
-        raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
-    result = build_labels_for_existing_features(
-        session,
-        symbols=symbols,
-        interval=str(payload.get("interval")) if payload.get("interval") else None,
-        schema_version=str(payload.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION),
-        force=bool(payload.get("force", False)),
-        limit=int(payload["limit"]) if payload.get("limit") else None,
-        sync_features=bool(payload.get("sync_features", True)),
-    )
-    return {
-        **result,
-        "label_status": label_status(session, schema_version=str(payload.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION)),
-    }
+    try:
+        symbols = payload.get("symbols")
+        if isinstance(symbols, str):
+            symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        if symbols is not None and not isinstance(symbols, list):
+            raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
+        schema_version = str(payload.get("schema_version") or payload.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION)
+        limit = int(payload["limit"]) if payload.get("limit") else None
+        result = build_labels_for_existing_features(
+            session,
+            symbols=symbols,
+            interval=str(payload.get("interval")) if payload.get("interval") else None,
+            schema_version=schema_version,
+            force=bool(payload.get("force", False)),
+            limit=limit,
+            sync_features=bool(payload.get("sync_features", True)),
+        )
+        return {
+            "status": "ok",
+            **result,
+            "label_status": label_status(session, schema_version=schema_version),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        session.rollback()
+        logger.exception("Training label build failed")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "message": "Training label build failed. Run POST /api/db/migrate, then retry with a small limit like 500.",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "accepted_payload": ["symbols", "limit", "force", "interval", "schema_version", "feature_schema_version"],
+            },
+        ) from exc
 
 
 @router.post("/training/export")

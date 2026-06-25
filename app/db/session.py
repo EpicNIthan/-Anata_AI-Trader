@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from typing import Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
@@ -20,9 +21,9 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
-def create_db_and_tables() -> None:
+def create_db_and_tables() -> dict[str, Any]:
     Base.metadata.create_all(bind=engine)
-    run_additive_migrations(engine)
+    return run_additive_migrations(engine)
 
 
 def get_session() -> Generator[Session, None, None]:

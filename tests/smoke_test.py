@@ -68,7 +68,7 @@ os.environ["DASHBOARD_PASSWORD"] = "secret"
 sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient
-from sqlalchemy import func, inspect, select
+from sqlalchemy import func, inspect, select, text
 
 from app.collectors.market_collector import BinanceMarketCollector
 from app.db.models import AiDecision, Candle, ExperienceRecord, ExternalDataEvent, Feature, LiveCandleUpdate, ModelVersion, NewsArticle, NewsSentiment, TrainingFeature
@@ -87,6 +87,20 @@ def main() -> None:
     archive_paths: list[Path] = []
     if db_path.exists():
         db_path.unlink()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE training_features (
+                    id INTEGER PRIMARY KEY,
+                    symbol VARCHAR(32),
+                    schema_version VARCHAR(64),
+                    as_of TIMESTAMP,
+                    created_at TIMESTAMP
+                )
+                """
+            )
+        )
 
     required_tables = {
         "candles",
@@ -111,6 +125,13 @@ def main() -> None:
         health = client.get("/health")
         assert health.status_code == 200, health.text
         assert health.json()["status"] == "ok", health.text
+        migrated_training_feature_columns = {column["name"] for column in inspect(engine).get_columns("training_features")}
+        for column_name in ("source_feature_id", "source_name", "feature_values", "payload"):
+            assert column_name in migrated_training_feature_columns, sorted(migrated_training_feature_columns)
+        manual_migrate = client.post("/api/db/migrate", auth=auth)
+        assert manual_migrate.status_code == 200, manual_migrate.text
+        assert manual_migrate.json()["status"] == "ok", manual_migrate.text
+        assert "training_features" in manual_migrate.json()["existing_tables"], manual_migrate.text
         blocked_api = client.get("/api/dashboard/summary")
         assert blocked_api.status_code == 401, blocked_api.text
 
