@@ -175,7 +175,13 @@ class FearGreedCollector(BaseExternalCollector):
     name = "fear_greed"
     role = "Alternative.me crypto fear/greed index"
     source_name = "alternative_me_fear_greed"
-    data_types = ("fear_greed_value", "fear_greed_change_1d", "fear_greed_classification_score")
+    data_types = (
+        "fear_greed_value",
+        "fear_greed_change_1d",
+        "fear_greed_change_24h",
+        "fear_greed_classification_score",
+        "fear_greed_classification",
+    )
 
     @property
     def enabled(self) -> bool:
@@ -212,7 +218,9 @@ class FearGreedCollector(BaseExternalCollector):
             for data_type, numeric in (
                 ("fear_greed_value", value),
                 ("fear_greed_change_1d", change),
+                ("fear_greed_change_24h", change),
                 ("fear_greed_classification_score", _classification_score(classification)),
+                ("fear_greed_classification", _classification_score(classification)),
             ):
                 saved += int(
                     _upsert_event(
@@ -236,12 +244,15 @@ class GlobalMarketCollector(BaseExternalCollector):
     source_name = "coingecko_global_market"
     data_types = (
         "global_market_cap_usd",
+        "total_market_cap_usd",
         "global_market_cap_change_24h",
+        "market_cap_change_24h",
         "total_volume_usd",
         "total_volume_change_24h",
         "btc_dominance",
         "eth_dominance",
         "btc_dominance_change",
+        "btc_dominance_change_24h",
     )
 
     @property
@@ -283,12 +294,15 @@ class GlobalMarketCollector(BaseExternalCollector):
             btc_dominance_change = btc_dominance - previous_btc_dominance if previous_btc_dominance is not None else 0.0
             values = {
                 "global_market_cap_usd": market_cap,
+                "total_market_cap_usd": market_cap,
                 "global_market_cap_change_24h": market_cap_change,
+                "market_cap_change_24h": market_cap_change,
                 "total_volume_usd": volume,
                 "total_volume_change_24h": volume_change,
                 "btc_dominance": btc_dominance,
                 "eth_dominance": eth_dominance,
                 "btc_dominance_change": btc_dominance_change,
+                "btc_dominance_change_24h": btc_dominance_change,
             }
             saved = 0
             for data_type, numeric in values.items():
@@ -312,7 +326,15 @@ class StablecoinRiskCollector(BaseExternalCollector):
     name = "stablecoin_risk"
     role = "DefiLlama stablecoin peg/supply context"
     source_name = "defillama_stablecoin_risk"
-    data_types = ("usdt_price_deviation", "usdc_price_deviation", "stablecoin_depeg_risk", "stablecoin_supply_change_1d")
+    data_types = (
+        "usdt_price_deviation",
+        "usdc_price_deviation",
+        "usdt_deviation",
+        "usdc_deviation",
+        "stablecoin_depeg_risk",
+        "stablecoin_supply_change_1d",
+        "stablecoin_supply_change_24h",
+    )
 
     @property
     def enabled(self) -> bool:
@@ -358,8 +380,11 @@ class StablecoinRiskCollector(BaseExternalCollector):
         values = {
             "usdt_price_deviation": usdt_deviation,
             "usdc_price_deviation": usdc_deviation,
+            "usdt_deviation": usdt_deviation,
+            "usdc_deviation": usdc_deviation,
             "stablecoin_depeg_risk": depeg_risk,
             "stablecoin_supply_change_1d": supply_change,
+            "stablecoin_supply_change_24h": supply_change,
         }
         event_time = _minute()
         saved = 0
@@ -385,12 +410,26 @@ class MacroRiskCollector(BaseExternalCollector):
     name = "macro_risk"
     role = "news-derived macro/regulation/security/world risk"
     source_name = "macro_risk_news"
-    data_types = ("macro_risk_score", "regulation_risk_score", "security_risk_score", "etf_bullish_score", "world_risk_score")
+    data_types = (
+        "macro_risk_score",
+        "regulation_risk_score",
+        "fed_risk_score",
+        "war_risk_score",
+        "exchange_hack_risk_score",
+        "security_risk_score",
+        "etf_positive_score",
+        "etf_bullish_score",
+        "world_risk_score",
+    )
 
     KEYWORDS = {
         "macro_risk_score": ("fed", "federal reserve", "cpi", "rate hike", "rate cut", "inflation", "recession", "bank crisis"),
         "regulation_risk_score": ("sec", "lawsuit", "regulation", "regulatory", "ban", "enforcement"),
+        "fed_risk_score": ("fed", "federal reserve", "cpi", "rate hike", "rate cut", "inflation"),
+        "war_risk_score": ("war", "geopolitical", "sanction", "missile", "conflict"),
+        "exchange_hack_risk_score": ("hack", "exploit", "bridge attack", "exchange hack", "stolen", "drain"),
         "security_risk_score": ("hack", "exploit", "bridge attack", "stolen", "drain", "vulnerability"),
+        "etf_positive_score": ("etf approval", "spot etf", "etf inflow", "approval"),
         "etf_bullish_score": ("etf approval", "spot etf", "etf inflow", "approval"),
         "world_risk_score": ("war", "geopolitical", "bank crisis", "recession", "sanction"),
     }
@@ -405,7 +444,11 @@ class MacroRiskCollector(BaseExternalCollector):
                 scores = {
                     "macro_risk_score": 0.55,
                     "regulation_risk_score": 0.35,
+                    "fed_risk_score": 0.45,
+                    "war_risk_score": 0.20,
+                    "exchange_hack_risk_score": 0.10,
                     "security_risk_score": 0.10,
+                    "etf_positive_score": 0.40,
                     "etf_bullish_score": 0.40,
                     "world_risk_score": 0.20,
                 }
@@ -435,7 +478,7 @@ class MacroRiskCollector(BaseExternalCollector):
                 matches = sum(1 for keyword in keywords if keyword in text)
                 if matches <= 0:
                     continue
-                if data_type == "etf_bullish_score":
+                if data_type in {"etf_bullish_score", "etf_positive_score"}:
                     accum[data_type].append(_clamp((0.35 + max(sentiment_score, 0.0)) * min(matches, 3) / 3, 0.0, 1.0))
                 else:
                     accum[data_type].append(_clamp((0.35 + risk) * min(matches, 3) / 3, 0.0, 1.0))
@@ -469,6 +512,8 @@ class LiquidationCollector(BaseExternalCollector):
     data_types = (
         "liquidation_long_usd_5m",
         "liquidation_short_usd_5m",
+        "liquidation_long_usd_1m",
+        "liquidation_short_usd_1m",
         "liquidation_total_usd_5m",
         "liquidation_imbalance_5m",
         "liquidation_spike_score",
@@ -580,12 +625,17 @@ class LiquidationCollector(BaseExternalCollector):
                 rows = [item for item in recent if item["symbol"] == symbol]
                 long_usd = sum(item["notional"] for item in rows if item["side"] == "SELL")
                 short_usd = sum(item["notional"] for item in rows if item["side"] == "BUY")
+                rows_1m = [item for item in rows if item["event_time"] >= event_time - timedelta(minutes=1)]
+                long_usd_1m = sum(item["notional"] for item in rows_1m if item["side"] == "SELL")
+                short_usd_1m = sum(item["notional"] for item in rows_1m if item["side"] == "BUY")
                 total = long_usd + short_usd
                 imbalance = (short_usd - long_usd) / total if total > 0 else 0.0
                 previous_total = _previous_numeric(session, self.source_name, "liquidation_total_usd_5m", symbol) or 0.0
                 spike = _clamp((total / max(previous_total, 50_000.0)) - 1.0, 0.0, 10.0)
                 payload = {"mode": mode, "window": "5m", "events_used": len(rows)}
                 values = {
+                    "liquidation_long_usd_1m": long_usd_1m,
+                    "liquidation_short_usd_1m": short_usd_1m,
                     "liquidation_long_usd_5m": long_usd,
                     "liquidation_short_usd_5m": short_usd,
                     "liquidation_total_usd_5m": total,
@@ -693,4 +743,3 @@ def _serialize_event(row: ExternalDataEvent) -> dict[str, Any]:
         "numeric_value": row.numeric_value,
         "payload": row.payload,
     }
-

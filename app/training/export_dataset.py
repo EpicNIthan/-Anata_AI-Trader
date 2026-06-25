@@ -65,6 +65,7 @@ def export_dataset(
             target_payload = next_feature.payload if isinstance(next_feature, TrainingFeature) else next_feature
             target = values_from_feature(target_payload, ["price_change"])["price_change"]
         payload_values = values_for_training_feature(feature) if isinstance(feature, TrainingFeature) else (feature.payload or {}).get("values", {})
+        metadata = (feature.payload or {}).get("metadata", {}) if isinstance(feature, TrainingFeature) else (feature.payload or {}).get("metadata", {})
         values = values_from_feature(
             {"schema_version": feature.schema_version or feature_schema_version, "values": payload_values},
             feature_columns,
@@ -81,6 +82,8 @@ def export_dataset(
                 "trend": values.get("trend") or "sideways",
                 "target_next_price_change": target,
                 "final_ai_input": json.dumps(payload_values.get("final_ai_input") or {}, separators=(",", ":")),
+                "source_freshness": json.dumps(metadata.get("source_freshness") or {}, separators=(",", ":"), default=str),
+                "stale_sources": json.dumps(metadata.get("stale_sources") or [], separators=(",", ":"), default=str),
                 **{column: values.get(column, 0.0) for column in feature_columns},
                 **{column: payload_values.get(column, "") for column in TARGET_COLUMNS},
             }
@@ -98,6 +101,8 @@ def export_dataset(
                 "feature_schema_version",
                 "trend",
                 "final_ai_input",
+                "source_freshness",
+                "stale_sources",
                 *feature_columns,
                 "target_next_price_change",
                 *TARGET_COLUMNS,

@@ -455,6 +455,8 @@ def main() -> None:
         storage_status = client.get("/api/storage/status", auth=auth)
         assert storage_status.status_code == 200, storage_status.text
         assert "top_largest_tables" in storage_status.json(), storage_status.text
+        storage_compact = client.post("/api/storage/compact", auth=auth)
+        assert storage_compact.status_code == 200, storage_compact.text
         candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5", auth=auth)
         assert candles.status_code == 200, candles.text
         assert len(candles.json()) > 0, candles.text
@@ -522,7 +524,14 @@ def main() -> None:
         assert "trader_crowd_score" in feature_payload["vector"], feature_latest.text
         assert feature_payload["vector"]["derivatives_recency_weight"] > 0, feature_latest.text
         assert feature_payload["vector"]["fear_greed_value"] > 0, feature_latest.text
+        assert "fear_greed_change_24h" in feature_payload["vector"], feature_latest.text
+        assert "market_cap_change_24h" in feature_payload["vector"], feature_latest.text
+        assert "liquidation_long_usd_1m" in feature_payload["vector"], feature_latest.text
+        assert "usdt_deviation" in feature_payload["vector"], feature_latest.text
+        assert "stablecoin_supply_change_24h" in feature_payload["vector"], feature_latest.text
+        assert "fed_risk_score" in feature_payload["vector"], feature_latest.text
         assert "market_regime_score" in feature_payload["vector"], feature_latest.text
+        assert "source_freshness" in feature_payload, feature_latest.text
         assert len(feature_payload["derivatives_context"]) >= 1, feature_latest.text
         assert len(feature_payload["external_context"]) >= 1, feature_latest.text
         assert "final_ai_input" in feature_payload, feature_latest.text
@@ -591,6 +600,8 @@ def main() -> None:
         assert len(download.content) > 0, export.text
         with gzip.open(exported_path, "rt", newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
+            assert "source_freshness" in (reader.fieldnames or []), export.text
+            assert "fear_greed_change_24h" in (reader.fieldnames or []), export.text
             labeled_export_rows = [
                 row for row in reader if row.get("target_trade_quality_score") not in (None, "")
             ]

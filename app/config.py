@@ -85,7 +85,9 @@ class Settings:
     enable_fear_greed_collector: bool = field(default_factory=lambda: _bool("ENABLE_FEAR_GREED_COLLECTOR", False))
     enable_global_market_collector: bool = field(default_factory=lambda: _bool("ENABLE_GLOBAL_MARKET_COLLECTOR", False))
     enable_liquidation_collector: bool = field(default_factory=lambda: _bool("ENABLE_LIQUIDATION_COLLECTOR", False))
-    enable_stablecoin_risk_collector: bool = field(default_factory=lambda: _bool("ENABLE_STABLECOIN_RISK_COLLECTOR", False))
+    enable_stablecoin_risk_collector: bool = field(
+        default_factory=lambda: _bool("ENABLE_STABLECOIN_RISK_COLLECTOR", _bool("ENABLE_STABLECOIN_COLLECTOR", False))
+    )
     enable_macro_risk_collector: bool = field(default_factory=lambda: _bool("ENABLE_MACRO_RISK_COLLECTOR", False))
     external_collector_interval_seconds: int = field(default_factory=lambda: _int("EXTERNAL_COLLECTOR_INTERVAL_SECONDS", 300))
     liquidation_rollup_seconds: int = field(default_factory=lambda: _int("LIQUIDATION_ROLLUP_SECONDS", 60))

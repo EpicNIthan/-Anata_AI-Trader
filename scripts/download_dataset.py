@@ -34,6 +34,16 @@ def _row_count(path: Path) -> int | None:
         return None
 
 
+def _label_count(path: Path) -> int | None:
+    try:
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            return sum(1 for row in reader if row.get("target_trade_quality_score") not in (None, ""))
+    except Exception:
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download an exported dataset from Railway.")
     parser.add_argument("--url", required=True, help="Railway app URL, for example https://your-app.up.railway.app")
@@ -52,13 +62,17 @@ def main() -> None:
     data = _api(args.url, args.token, f"/api/training/download/{Path(dataset_id).name}")
     output.write_bytes(data)
     rows = _row_count(output)
+    labeled_rows = _label_count(output)
     result = {
         "downloaded_path": str(output),
         "file_size_bytes": output.stat().st_size,
         "row_count": rows,
+        "labeled_target_trade_quality_score_rows": labeled_rows,
         "source_dataset_id": Path(dataset_id).name,
     }
     print(json.dumps(result, indent=2))
+    if rows and labeled_rows == 0:
+        print("WARNING: Dataset has features but no labels. Run /api/training/build-labels or wait for future candles.")
 
 
 if __name__ == "__main__":

@@ -138,6 +138,7 @@ Optional external context collectors are off by default and store compact numeri
 ENABLE_FEAR_GREED_COLLECTOR=false
 ENABLE_GLOBAL_MARKET_COLLECTOR=false
 ENABLE_LIQUIDATION_COLLECTOR=false
+ENABLE_STABLECOIN_COLLECTOR=false
 ENABLE_STABLECOIN_RISK_COLLECTOR=false
 ENABLE_MACRO_RISK_COLLECTOR=false
 STORE_RAW_EXTERNAL_EVENTS=false
@@ -285,6 +286,7 @@ curl http://localhost:8000/api/db/storage
 curl http://localhost:8000/api/storage/status
 curl -X POST http://localhost:8000/api/db/compact
 curl -X POST http://localhost:8000/api/storage/cleanup/run
+curl -X POST http://localhost:8000/api/storage/compact
 curl -X POST http://localhost:8000/api/db/cleanup
 curl -X POST http://localhost:8000/api/db/archive
 ```
@@ -325,6 +327,7 @@ Features are stored as versioned JSON payloads. The current schema is `price-new
 `price-news-market-v4` keeps all v3 columns and adds:
 
 - fear/greed value and 1d change
+- prompt-compatible aliases such as `fear_greed_change_24h`, `market_cap_change_24h`, `usdt_deviation`, and `stablecoin_supply_change_24h`
 - global market cap and volume change
 - BTC dominance and dominance change
 - liquidation long/short/total/imbalance/spike rollups

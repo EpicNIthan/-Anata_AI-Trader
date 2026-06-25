@@ -156,21 +156,37 @@ class FeatureBuilder:
             "derivatives_recency_weight": derivatives_features["derivatives_recency_weight"],
             "fear_greed_value": external_features["fear_greed_value"],
             "fear_greed_change_1d": external_features["fear_greed_change_1d"],
+            "fear_greed_change_24h": external_features["fear_greed_change_24h"],
+            "fear_greed_classification": external_features["fear_greed_classification"],
+            "total_market_cap_usd": external_features["total_market_cap_usd"],
+            "market_cap_change_24h": external_features["market_cap_change_24h"],
             "global_market_cap_change_24h": external_features["global_market_cap_change_24h"],
+            "total_volume_usd": external_features["total_volume_usd"],
             "total_volume_change_24h": external_features["total_volume_change_24h"],
             "btc_dominance": external_features["btc_dominance"],
             "btc_dominance_change": external_features["btc_dominance_change"],
+            "btc_dominance_change_24h": external_features["btc_dominance_change_24h"],
+            "eth_dominance": external_features["eth_dominance"],
+            "liquidation_long_usd_1m": external_features["liquidation_long_usd_1m"],
+            "liquidation_short_usd_1m": external_features["liquidation_short_usd_1m"],
             "liquidation_long_usd_5m": external_features["liquidation_long_usd_5m"],
             "liquidation_short_usd_5m": external_features["liquidation_short_usd_5m"],
             "liquidation_total_usd_5m": external_features["liquidation_total_usd_5m"],
             "liquidation_imbalance_5m": external_features["liquidation_imbalance_5m"],
             "liquidation_spike_score": external_features["liquidation_spike_score"],
+            "usdt_deviation": external_features["usdt_deviation"],
+            "usdc_deviation": external_features["usdc_deviation"],
             "usdt_price_deviation": external_features["usdt_price_deviation"],
             "usdc_price_deviation": external_features["usdc_price_deviation"],
             "stablecoin_depeg_risk": external_features["stablecoin_depeg_risk"],
             "stablecoin_supply_change_1d": external_features["stablecoin_supply_change_1d"],
+            "stablecoin_supply_change_24h": external_features["stablecoin_supply_change_24h"],
             "macro_risk_score": external_features["macro_risk_score"],
             "regulation_risk_score": external_features["regulation_risk_score"],
+            "fed_risk_score": external_features["fed_risk_score"],
+            "war_risk_score": external_features["war_risk_score"],
+            "exchange_hack_risk_score": external_features["exchange_hack_risk_score"],
+            "etf_positive_score": external_features["etf_positive_score"],
             "security_risk_score": external_features["security_risk_score"],
             "etf_bullish_score": external_features["etf_bullish_score"],
             "world_risk_score": external_features["world_risk_score"],
@@ -207,21 +223,37 @@ class FeatureBuilder:
                 "derivatives_recency_weight",
                 "fear_greed_value",
                 "fear_greed_change_1d",
+                "fear_greed_change_24h",
+                "fear_greed_classification",
+                "total_market_cap_usd",
+                "market_cap_change_24h",
                 "global_market_cap_change_24h",
+                "total_volume_usd",
                 "total_volume_change_24h",
                 "btc_dominance",
                 "btc_dominance_change",
+                "btc_dominance_change_24h",
+                "eth_dominance",
+                "liquidation_long_usd_1m",
+                "liquidation_short_usd_1m",
                 "liquidation_long_usd_5m",
                 "liquidation_short_usd_5m",
                 "liquidation_total_usd_5m",
                 "liquidation_imbalance_5m",
                 "liquidation_spike_score",
+                "usdt_deviation",
+                "usdc_deviation",
                 "usdt_price_deviation",
                 "usdc_price_deviation",
                 "stablecoin_depeg_risk",
                 "stablecoin_supply_change_1d",
+                "stablecoin_supply_change_24h",
                 "macro_risk_score",
                 "regulation_risk_score",
+                "fed_risk_score",
+                "war_risk_score",
+                "exchange_hack_risk_score",
+                "etf_positive_score",
                 "security_risk_score",
                 "etf_bullish_score",
                 "world_risk_score",
@@ -258,6 +290,8 @@ class FeatureBuilder:
                 "news_context": news_features["news_context"],
                 "derivatives_context": derivatives_features["derivatives_context"],
                 "external_context": external_features["external_context"],
+                "source_freshness": external_features["source_freshness"],
+                "stale_sources": external_features["stale_sources"],
                 "training_quality_candles": training_quality_candles,
                 "closed_candles_used": len([candle for candle in candles if candle.is_closed]),
                 "live_candles_used": len([candle for candle in candles if not candle.is_closed]),
@@ -435,23 +469,55 @@ class FeatureBuilder:
             row = row or latest_by_type.get((data_type, None))
             return float(row.numeric_value) if row and row.numeric_value is not None else default
 
+        def latest_time(data_type: str, *, symbol_first: bool = False) -> datetime | None:
+            row = latest_by_type.get((data_type, symbol)) if symbol_first else None
+            row = row or latest_by_type.get((data_type, None))
+            return _aware(row.event_time) if row and row.event_time else None
+
+        def freshness(source_name: str, data_types: list[str], *, symbol_first: bool = False, stale_after_hours: float = 6.0) -> dict[str, Any]:
+            times = [latest_time(data_type, symbol_first=symbol_first) for data_type in data_types]
+            latest = max([item for item in times if item is not None], default=None)
+            age_hours = ((now - latest).total_seconds() / 3600.0) if latest else None
+            return {
+                "source_name": source_name,
+                "latest_at": latest.isoformat() if latest else None,
+                "age_hours": age_hours,
+                "stale": True if age_hours is None else age_hours > stale_after_hours,
+            }
+
         fear_greed_value = value("fear_greed_value")
         fear_greed_change_1d = value("fear_greed_change_1d")
-        global_market_cap_change_24h = value("global_market_cap_change_24h")
+        fear_greed_change_24h = value("fear_greed_change_24h", fear_greed_change_1d)
+        fear_greed_classification = value("fear_greed_classification", value("fear_greed_classification_score"))
+        total_market_cap_usd = value("total_market_cap_usd", value("global_market_cap_usd"))
+        market_cap_change_24h = value("market_cap_change_24h", value("global_market_cap_change_24h"))
+        global_market_cap_change_24h = value("global_market_cap_change_24h", market_cap_change_24h)
+        total_volume_usd = value("total_volume_usd")
         total_volume_change_24h = value("total_volume_change_24h")
         btc_dominance = value("btc_dominance")
         btc_dominance_change = value("btc_dominance_change")
+        btc_dominance_change_24h = value("btc_dominance_change_24h", btc_dominance_change)
+        eth_dominance = value("eth_dominance")
+        liquidation_long_usd_1m = value("liquidation_long_usd_1m", symbol_first=True)
+        liquidation_short_usd_1m = value("liquidation_short_usd_1m", symbol_first=True)
         liquidation_long_usd_5m = value("liquidation_long_usd_5m", symbol_first=True)
         liquidation_short_usd_5m = value("liquidation_short_usd_5m", symbol_first=True)
         liquidation_total_usd_5m = value("liquidation_total_usd_5m", symbol_first=True)
         liquidation_imbalance_5m = value("liquidation_imbalance_5m", symbol_first=True)
         liquidation_spike_score = value("liquidation_spike_score", symbol_first=True)
-        usdt_price_deviation = value("usdt_price_deviation")
-        usdc_price_deviation = value("usdc_price_deviation")
+        usdt_price_deviation = value("usdt_price_deviation", value("usdt_deviation"))
+        usdc_price_deviation = value("usdc_price_deviation", value("usdc_deviation"))
+        usdt_deviation = value("usdt_deviation", usdt_price_deviation)
+        usdc_deviation = value("usdc_deviation", usdc_price_deviation)
         stablecoin_depeg_risk = value("stablecoin_depeg_risk")
         stablecoin_supply_change_1d = value("stablecoin_supply_change_1d")
+        stablecoin_supply_change_24h = value("stablecoin_supply_change_24h", stablecoin_supply_change_1d)
         macro_risk_score = value("macro_risk_score")
         regulation_risk_score = value("regulation_risk_score")
+        fed_risk_score = value("fed_risk_score")
+        war_risk_score = value("war_risk_score")
+        exchange_hack_risk_score = value("exchange_hack_risk_score")
+        etf_positive_score = value("etf_positive_score", value("etf_bullish_score"))
         security_risk_score = value("security_risk_score")
         etf_bullish_score = value("etf_bullish_score")
         world_risk_score = value("world_risk_score")
@@ -480,21 +546,37 @@ class FeatureBuilder:
         return {
             "fear_greed_value": fear_greed_value,
             "fear_greed_change_1d": fear_greed_change_1d,
+            "fear_greed_change_24h": fear_greed_change_24h,
+            "fear_greed_classification": fear_greed_classification,
+            "total_market_cap_usd": total_market_cap_usd,
+            "market_cap_change_24h": market_cap_change_24h,
             "global_market_cap_change_24h": global_market_cap_change_24h,
+            "total_volume_usd": total_volume_usd,
             "total_volume_change_24h": total_volume_change_24h,
             "btc_dominance": btc_dominance,
             "btc_dominance_change": btc_dominance_change,
+            "btc_dominance_change_24h": btc_dominance_change_24h,
+            "eth_dominance": eth_dominance,
+            "liquidation_long_usd_1m": liquidation_long_usd_1m,
+            "liquidation_short_usd_1m": liquidation_short_usd_1m,
             "liquidation_long_usd_5m": liquidation_long_usd_5m,
             "liquidation_short_usd_5m": liquidation_short_usd_5m,
             "liquidation_total_usd_5m": liquidation_total_usd_5m,
             "liquidation_imbalance_5m": liquidation_imbalance_5m,
             "liquidation_spike_score": liquidation_spike_score,
+            "usdt_deviation": usdt_deviation,
+            "usdc_deviation": usdc_deviation,
             "usdt_price_deviation": usdt_price_deviation,
             "usdc_price_deviation": usdc_price_deviation,
             "stablecoin_depeg_risk": stablecoin_depeg_risk,
             "stablecoin_supply_change_1d": stablecoin_supply_change_1d,
+            "stablecoin_supply_change_24h": stablecoin_supply_change_24h,
             "macro_risk_score": macro_risk_score,
             "regulation_risk_score": regulation_risk_score,
+            "fed_risk_score": fed_risk_score,
+            "war_risk_score": war_risk_score,
+            "exchange_hack_risk_score": exchange_hack_risk_score,
+            "etf_positive_score": etf_positive_score,
             "security_risk_score": security_risk_score,
             "etf_bullish_score": etf_bullish_score,
             "world_risk_score": world_risk_score,
@@ -509,6 +591,24 @@ class FeatureBuilder:
                     "payload": row.payload,
                 }
                 for row in rows[:20]
+            ],
+            "source_freshness": {
+                "fear_greed": freshness("alternative_me_fear_greed", ["fear_greed_value"], stale_after_hours=30.0),
+                "global_market": freshness("coingecko_global_market", ["global_market_cap_change_24h", "market_cap_change_24h"], stale_after_hours=12.0),
+                "liquidations": freshness("binance_futures_liquidations", ["liquidation_total_usd_5m"], symbol_first=True, stale_after_hours=1.0),
+                "stablecoin_risk": freshness("defillama_stablecoin_risk", ["stablecoin_depeg_risk"], stale_after_hours=30.0),
+                "macro_risk": freshness("macro_risk_news", ["macro_risk_score"], stale_after_hours=12.0),
+            },
+            "stale_sources": [
+                name
+                for name, item in {
+                    "fear_greed": freshness("alternative_me_fear_greed", ["fear_greed_value"], stale_after_hours=30.0),
+                    "global_market": freshness("coingecko_global_market", ["global_market_cap_change_24h", "market_cap_change_24h"], stale_after_hours=12.0),
+                    "liquidations": freshness("binance_futures_liquidations", ["liquidation_total_usd_5m"], symbol_first=True, stale_after_hours=1.0),
+                    "stablecoin_risk": freshness("defillama_stablecoin_risk", ["stablecoin_depeg_risk"], stale_after_hours=30.0),
+                    "macro_risk": freshness("macro_risk_news", ["macro_risk_score"], stale_after_hours=12.0),
+                }.items()
+                if item["stale"]
             ],
         }
 

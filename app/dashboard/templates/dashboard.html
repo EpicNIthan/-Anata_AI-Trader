@@ -166,7 +166,7 @@
           <button data-tab="features">AI Features</button>
           <button data-tab="sentiment">Sentiment</button>
           <button data-tab="training">Training</button>
-          <button data-tab="storage">DB Storage</button>
+          <button data-tab="storage">Data / Storage</button>
           <button data-tab="diagnostics">Logs / Diagnostics</button>
         </nav>
 
@@ -265,9 +265,14 @@
             <div><span>Last Training Run</span><strong id="lastTrainingRun">-</strong></div>
             <div><span>Fallback</span><strong id="modelFallbackReason">-</strong></div>
             <div><span>Label Coverage</span><strong id="labelCoverage">-</strong></div>
+            <div><span>Feature Rows</span><strong id="labelFeatureRows">-</strong></div>
+            <div><span>Labeled Rows</span><strong id="labelLabeledRows">-</strong></div>
+            <div><span>Unlabeled Rows</span><strong id="labelUnlabeledRows">-</strong></div>
+            <div><span>Latest Labeled</span><strong id="latestLabeledAt">-</strong></div>
             <div><span>Training Target</span><strong id="trainingTarget">-</strong></div>
             <div><span>Label Readiness</span><strong id="labelReadiness">-</strong></div>
           </div>
+          <p id="labelWarning" class="warning"></p>
           <div class="panel-tools">
             <button id="refreshModelsButton" class="secondary">Refresh Models</button>
             <output id="modelActionResult"></output>
@@ -290,6 +295,7 @@
             <div><span>Estimated Monthly Cost</span><strong id="dbMonthlyCost">-</strong></div>
             <div><span>Largest Table</span><strong id="dbLargestTable">-</strong></div>
             <div><span>Last Cleanup</span><strong id="dbLastCleanup">-</strong></div>
+            <div><span>Retention</span><strong id="dbRetentionSummary">-</strong></div>
           </div>
           <p id="dbStorageWarning" class="warning"></p>
           <div class="panel-tools">

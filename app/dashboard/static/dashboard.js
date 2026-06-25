@@ -42,21 +42,37 @@
     ["derivatives_recency_weight", "derivatives_recency_weight"],
     ["fear_greed_value", "fear_greed_value"],
     ["fear_greed_change_1d", "fear_greed_change_1d"],
+    ["fear_greed_change_24h", "fear_greed_change_24h"],
+    ["fear_greed_classification", "fear_greed_classification"],
+    ["total_market_cap_usd", "total_market_cap_usd"],
+    ["market_cap_change_24h", "market_cap_change_24h"],
     ["global_market_cap_change_24h", "global_market_cap_change_24h"],
+    ["total_volume_usd", "total_volume_usd"],
     ["total_volume_change_24h", "total_volume_change_24h"],
     ["btc_dominance", "btc_dominance"],
     ["btc_dominance_change", "btc_dominance_change"],
+    ["btc_dominance_change_24h", "btc_dominance_change_24h"],
+    ["eth_dominance", "eth_dominance"],
+    ["liquidation_long_usd_1m", "liquidation_long_usd_1m"],
+    ["liquidation_short_usd_1m", "liquidation_short_usd_1m"],
     ["liquidation_long_usd_5m", "liquidation_long_usd_5m"],
     ["liquidation_short_usd_5m", "liquidation_short_usd_5m"],
     ["liquidation_total_usd_5m", "liquidation_total_usd_5m"],
     ["liquidation_imbalance_5m", "liquidation_imbalance_5m"],
     ["liquidation_spike_score", "liquidation_spike_score"],
+    ["usdt_deviation", "usdt_deviation"],
+    ["usdc_deviation", "usdc_deviation"],
     ["usdt_price_deviation", "usdt_price_deviation"],
     ["usdc_price_deviation", "usdc_price_deviation"],
     ["stablecoin_depeg_risk", "stablecoin_depeg_risk"],
     ["stablecoin_supply_change_1d", "stablecoin_supply_change_1d"],
+    ["stablecoin_supply_change_24h", "stablecoin_supply_change_24h"],
     ["macro_risk_score", "macro_risk_score"],
     ["regulation_risk_score", "regulation_risk_score"],
+    ["fed_risk_score", "fed_risk_score"],
+    ["war_risk_score", "war_risk_score"],
+    ["exchange_hack_risk_score", "exchange_hack_risk_score"],
+    ["etf_positive_score", "etf_positive_score"],
     ["security_risk_score", "security_risk_score"],
     ["etf_bullish_score", "etf_bullish_score"],
     ["world_risk_score", "world_risk_score"],
@@ -431,6 +447,8 @@
       setText("dbMonthlyCost", Number.isFinite(Number(data.estimated_monthly_storage_cost_usd)) ? `$${Number(data.estimated_monthly_storage_cost_usd).toFixed(4)}` : "-");
       setText("dbLargestTable", largest.table ? `${largest.table} (${number(largest.rows, 0)} rows)` : "-");
       setText("dbLastCleanup", lifecycle.last_run_at ? when(lifecycle.last_run_at) : "-");
+      const retention = lifecycle.retention || {};
+      setText("dbRetentionSummary", `live ${retention.live_update_retention_hours ?? "-"}h / raw external ${retention.raw_external_event_retention_days ?? "-"}d / candles ${retention.keep_closed_candles_days ?? retention.closed_candle_retention_days ?? "-"}d`);
       setText("dbStorageWarning", total.warning || "");
       const rows = data.rows_by_table || [];
       body.innerHTML = rows.length ? rows
@@ -488,12 +506,17 @@
   async function refreshLabelStatus() {
     try {
       const data = await api("/api/training/label-status");
-      const total = Number(data.total_training_features || 0);
+      const total = Number(data.total_training_feature_rows || data.total_training_features || 0);
       const labeled = Number(data.rows_with_target_trade_quality_score || 0);
       setText("labelCoverage", `${number(labeled, 0)} / ${number(total, 0)} (${pct(data.label_coverage_pct || 0, 1)})`);
+      setText("labelFeatureRows", number(data.total_feature_rows, 0));
+      setText("labelLabeledRows", number(labeled, 0));
+      setText("labelUnlabeledRows", number(data.unlabeled_rows, 0));
+      setText("latestLabeledAt", when(data.latest_labeled_as_of));
       setText("trainingTarget", data.selected_training_target || "-");
       setText("labelReadiness", data.label_readiness || "NOT READY");
       setClass("labelReadiness", data.label_readiness === "OK" ? "positive" : "warning");
+      setText("labelWarning", data.warning || (labeled === 0 && total > 0 ? "Label coverage is 0. Build labels or wait for future closed candles." : ""));
     } catch (error) {
       setText("labelReadiness", `Error: ${error.message}`);
       setClass("labelReadiness", "warning");

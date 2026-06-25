@@ -81,21 +81,37 @@ INSPECTOR_FEATURE_KEYS = [
     "derivatives_recency_weight",
     "fear_greed_value",
     "fear_greed_change_1d",
+    "fear_greed_change_24h",
+    "fear_greed_classification",
+    "total_market_cap_usd",
+    "market_cap_change_24h",
     "global_market_cap_change_24h",
+    "total_volume_usd",
     "total_volume_change_24h",
     "btc_dominance",
     "btc_dominance_change",
+    "btc_dominance_change_24h",
+    "eth_dominance",
+    "liquidation_long_usd_1m",
+    "liquidation_short_usd_1m",
     "liquidation_long_usd_5m",
     "liquidation_short_usd_5m",
     "liquidation_total_usd_5m",
     "liquidation_imbalance_5m",
     "liquidation_spike_score",
+    "usdt_deviation",
+    "usdc_deviation",
     "usdt_price_deviation",
     "usdc_price_deviation",
     "stablecoin_depeg_risk",
     "stablecoin_supply_change_1d",
+    "stablecoin_supply_change_24h",
     "macro_risk_score",
     "regulation_risk_score",
+    "fed_risk_score",
+    "war_risk_score",
+    "exchange_hack_risk_score",
+    "etf_positive_score",
     "security_risk_score",
     "etf_bullish_score",
     "world_risk_score",
@@ -780,6 +796,11 @@ def storage_cleanup_run(request: Request, _: None = Depends(require_admin)) -> d
     return _data_lifecycle(request).compact_once()
 
 
+@router.post("/storage/compact")
+def storage_compact(request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
+    return _data_lifecycle(request).compact_once()
+
+
 @router.get("/db/lifecycle/status")
 def db_lifecycle_status(request: Request) -> dict[str, Any]:
     return _data_lifecycle(request).status()
@@ -1430,6 +1451,8 @@ def latest_feature(
         "news_context": metadata.get("news_context", []),
         "derivatives_context": metadata.get("derivatives_context", []),
         "external_context": metadata.get("external_context", []),
+        "source_freshness": metadata.get("source_freshness", {}),
+        "stale_sources": metadata.get("stale_sources", []),
         "raw_payload": payload,
     }
 
