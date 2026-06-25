@@ -40,6 +40,19 @@
         <div><span>Experiences</span><strong id="experienceMetric">-</strong></div>
       </section>
 
+      <section class="coverage-panel">
+        <div><span>Candles</span><b id="coverageCandles">-</b></div>
+        <div><span>News</span><b id="coverageNews">-</b></div>
+        <div><span>Sentiment</span><b id="coverageSentiment">-</b></div>
+        <div><span>Derivatives</span><b id="coverageDerivatives">-</b></div>
+        <div><span>Liquidations</span><b id="coverageLiquidations">-</b></div>
+        <div><span>Fear/Greed</span><b id="coverageFearGreed">-</b></div>
+        <div><span>Global</span><b id="coverageGlobalMarket">-</b></div>
+        <div><span>Stablecoin</span><b id="coverageStablecoinRisk">-</b></div>
+        <div><span>Macro</span><b id="coverageMacroRisk">-</b></div>
+        <div><span>Labeled</span><b id="coverageLabeledRows">-</b></div>
+      </section>
+
       <section class="trading-grid">
         <aside class="market-rail">
           <div class="panel-head">
@@ -123,6 +136,8 @@
             <button data-worker="market" data-action="start" class="secondary">Start Market</button>
             <button data-worker="news" data-action="start" class="secondary">Start News</button>
             <button data-worker="derivatives" data-action="start" class="secondary">Start Flow</button>
+            <button data-worker="external" data-action="start" class="secondary">Start External</button>
+            <button data-worker="liquidations" data-action="start" class="secondary">Start Liq</button>
           </div>
           <div class="trade-flow">
             <div class="panel-head">
@@ -299,6 +314,7 @@
             <pre id="marketDiagnostics" class="log-box"></pre>
             <pre id="newsDiagnostics" class="log-box"></pre>
             <pre id="derivativesDiagnostics" class="log-box"></pre>
+            <pre id="externalDiagnostics" class="log-box"></pre>
             <pre id="autoDiagnostics" class="log-box"></pre>
             <pre id="dbDiagnostics" class="log-box"></pre>
           </div>
@@ -306,6 +322,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v11"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v12"></script>
   </body>
 </html>

@@ -264,6 +264,7 @@ def build_labels_for_existing_features(
 
 def label_status(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHEMA_VERSION) -> dict[str, Any]:
     rows = list(session.scalars(select(TrainingFeature).where(TrainingFeature.schema_version == schema_version)))
+    feature_rows = list(session.scalars(select(Feature).where(Feature.schema_version == schema_version)))
     counts = {column: 0 for column in TARGET_COLUMNS}
     labeled_times: list[datetime] = []
     unlabeled_times: list[datetime] = []
@@ -315,14 +316,24 @@ def label_status(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHE
         }
     target_count = counts["target_trade_quality_score"]
     total = len(rows)
+    all_times = [row.as_of for row in rows if row.as_of] + [row.as_of for row in feature_rows if row.as_of]
+    symbols_covered = sorted({row.symbol for row in rows} | {row.symbol for row in feature_rows})
     return {
         "schema_version": schema_version,
         "selected_training_target": settings.model_target,
+        "total_feature_rows": len(feature_rows),
+        "total_training_feature_rows": total,
         "total_training_features": total,
+        "unlabeled_rows": total - target_count,
+        "earliest_feature_time": min(all_times).isoformat() if all_times else None,
+        "latest_feature_time": max(all_times).isoformat() if all_times else None,
+        "symbols_covered": symbols_covered,
         "rows_with_target_future_return_5m": counts["target_future_return_5m"],
         "rows_with_target_future_return_15m": counts["target_future_return_15m"],
         "rows_with_target_future_return_1h": counts["target_future_return_1h"],
+        "rows_with_target_direction_15m": counts["target_direction_15m"],
         "rows_with_target_trade_quality_score": target_count,
+        "labeled_rows_by_target": counts,
         "label_coverage_pct": (target_count / total) if total else 0.0,
         "label_readiness": "OK" if target_count > 0 else "NOT READY",
         "latest_labeled_as_of": max(labeled_times).isoformat() if labeled_times else None,

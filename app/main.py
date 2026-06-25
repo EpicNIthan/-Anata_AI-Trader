@@ -39,6 +39,17 @@ async def lifespan(app: FastAPI):
         await manager.start("news")
     if settings.enable_derivatives_collector:
         await manager.start("derivatives")
+    if any(
+        [
+            settings.enable_fear_greed_collector,
+            settings.enable_global_market_collector,
+            settings.enable_stablecoin_risk_collector,
+            settings.enable_macro_risk_collector,
+        ]
+    ):
+        await manager.start("external")
+    if settings.enable_liquidation_collector:
+        await manager.start("liquidations")
     if settings.auto_trader_enabled:
         await auto_trader.start()
     try:
@@ -76,4 +87,11 @@ def health() -> dict[str, object]:
         "symbols": settings.binance_symbols,
         "auto_trader_enabled": settings.auto_trader_enabled,
         "derivatives_enabled": settings.derivatives_enabled,
+        "external_collectors_enabled": {
+            "fear_greed": settings.enable_fear_greed_collector,
+            "global_market": settings.enable_global_market_collector,
+            "liquidations": settings.enable_liquidation_collector,
+            "stablecoin_risk": settings.enable_stablecoin_risk_collector,
+            "macro_risk": settings.enable_macro_risk_collector,
+        },
     }

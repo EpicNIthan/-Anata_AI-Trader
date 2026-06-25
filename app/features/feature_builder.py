@@ -111,6 +111,7 @@ class FeatureBuilder:
 
         news_features = self._recent_news_features(normalized_symbol, now=datetime.now(timezone.utc))
         derivatives_features = self._recent_derivatives_features(normalized_symbol, now=datetime.now(timezone.utc))
+        external_features = self._recent_external_context_features(normalized_symbol, now=datetime.now(timezone.utc))
         sentiment_score = news_features["sentiment_score"]
         sentiment_confidence = news_features["sentiment_confidence"]
         risk_score = news_features["risk_score"]
@@ -153,6 +154,27 @@ class FeatureBuilder:
             "trader_crowd_score": derivatives_features["trader_crowd_score"],
             "crowd_risk_score": derivatives_features["crowd_risk_score"],
             "derivatives_recency_weight": derivatives_features["derivatives_recency_weight"],
+            "fear_greed_value": external_features["fear_greed_value"],
+            "fear_greed_change_1d": external_features["fear_greed_change_1d"],
+            "global_market_cap_change_24h": external_features["global_market_cap_change_24h"],
+            "total_volume_change_24h": external_features["total_volume_change_24h"],
+            "btc_dominance": external_features["btc_dominance"],
+            "btc_dominance_change": external_features["btc_dominance_change"],
+            "liquidation_long_usd_5m": external_features["liquidation_long_usd_5m"],
+            "liquidation_short_usd_5m": external_features["liquidation_short_usd_5m"],
+            "liquidation_total_usd_5m": external_features["liquidation_total_usd_5m"],
+            "liquidation_imbalance_5m": external_features["liquidation_imbalance_5m"],
+            "liquidation_spike_score": external_features["liquidation_spike_score"],
+            "usdt_price_deviation": external_features["usdt_price_deviation"],
+            "usdc_price_deviation": external_features["usdc_price_deviation"],
+            "stablecoin_depeg_risk": external_features["stablecoin_depeg_risk"],
+            "stablecoin_supply_change_1d": external_features["stablecoin_supply_change_1d"],
+            "macro_risk_score": external_features["macro_risk_score"],
+            "regulation_risk_score": external_features["regulation_risk_score"],
+            "security_risk_score": external_features["security_risk_score"],
+            "etf_bullish_score": external_features["etf_bullish_score"],
+            "world_risk_score": external_features["world_risk_score"],
+            "market_regime_score": external_features["market_regime_score"],
         }
         inspector_vector = {
             key: values[key]
@@ -183,6 +205,27 @@ class FeatureBuilder:
                 "trader_crowd_score",
                 "crowd_risk_score",
                 "derivatives_recency_weight",
+                "fear_greed_value",
+                "fear_greed_change_1d",
+                "global_market_cap_change_24h",
+                "total_volume_change_24h",
+                "btc_dominance",
+                "btc_dominance_change",
+                "liquidation_long_usd_5m",
+                "liquidation_short_usd_5m",
+                "liquidation_total_usd_5m",
+                "liquidation_imbalance_5m",
+                "liquidation_spike_score",
+                "usdt_price_deviation",
+                "usdc_price_deviation",
+                "stablecoin_depeg_risk",
+                "stablecoin_supply_change_1d",
+                "macro_risk_score",
+                "regulation_risk_score",
+                "security_risk_score",
+                "etf_bullish_score",
+                "world_risk_score",
+                "market_regime_score",
             )
         }
         values["final_ai_input"] = {
@@ -199,6 +242,9 @@ class FeatureBuilder:
                 "trader_crowd_score": derivatives_features["trader_crowd_score"],
                 "crowd_risk_score": derivatives_features["crowd_risk_score"],
                 "taker_buy_pressure": derivatives_features["taker_buy_pressure"],
+                "market_regime_score": external_features["market_regime_score"],
+                "macro_risk_score": external_features["macro_risk_score"],
+                "stablecoin_depeg_risk": external_features["stablecoin_depeg_risk"],
             },
         }
         payload = feature_payload(
@@ -211,6 +257,7 @@ class FeatureBuilder:
                 "missing_future_features_default": "0/null",
                 "news_context": news_features["news_context"],
                 "derivatives_context": derivatives_features["derivatives_context"],
+                "external_context": external_features["external_context"],
                 "training_quality_candles": training_quality_candles,
                 "closed_candles_used": len([candle for candle in candles if candle.is_closed]),
                 "live_candles_used": len([candle for candle in candles if not candle.is_closed]),
@@ -219,6 +266,7 @@ class FeatureBuilder:
                 "candles": "candles",
                 "news_sentiment": "news_sentiment",
                 "derivatives": "external_data_events",
+                "market_context": "external_data_events",
             },
         )
         feature = Feature(
@@ -243,6 +291,7 @@ class FeatureBuilder:
             training_metadata = dict(payload.get("metadata", {}))
             training_metadata.pop("news_context", None)
             training_metadata.pop("derivatives_context", None)
+            training_metadata.pop("external_context", None)
             training_metadata["debug_payload"] = "full final_ai_input kept on recent features rows only"
             training_payload = {
                 **payload,
@@ -350,6 +399,116 @@ class FeatureBuilder:
                     "payload": row.payload,
                 }
                 for row in latest_by_type.values()
+            ],
+        }
+
+    def _recent_external_context_features(self, symbol: str, now: datetime) -> dict[str, Any]:
+        since = now - timedelta(hours=48)
+        rows = list(
+            self.session.scalars(
+                select(ExternalDataEvent)
+                .where(
+                    ExternalDataEvent.event_time >= since,
+                    ExternalDataEvent.source_name.in_(
+                        [
+                            "alternative_me_fear_greed",
+                            "coingecko_global_market",
+                            "binance_futures_liquidations",
+                            "defillama_stablecoin_risk",
+                            "macro_risk_news",
+                        ]
+                    ),
+                )
+                .order_by(desc(ExternalDataEvent.event_time))
+                .limit(300)
+            )
+        )
+
+        latest_by_type: dict[tuple[str, str | None], ExternalDataEvent] = {}
+        for row in rows:
+            key = (row.data_type, row.symbol)
+            latest_by_type.setdefault(key, row)
+            latest_by_type.setdefault((row.data_type, None), row)
+
+        def value(data_type: str, default: float = 0.0, *, symbol_first: bool = False) -> float:
+            row = latest_by_type.get((data_type, symbol)) if symbol_first else None
+            row = row or latest_by_type.get((data_type, None))
+            return float(row.numeric_value) if row and row.numeric_value is not None else default
+
+        fear_greed_value = value("fear_greed_value")
+        fear_greed_change_1d = value("fear_greed_change_1d")
+        global_market_cap_change_24h = value("global_market_cap_change_24h")
+        total_volume_change_24h = value("total_volume_change_24h")
+        btc_dominance = value("btc_dominance")
+        btc_dominance_change = value("btc_dominance_change")
+        liquidation_long_usd_5m = value("liquidation_long_usd_5m", symbol_first=True)
+        liquidation_short_usd_5m = value("liquidation_short_usd_5m", symbol_first=True)
+        liquidation_total_usd_5m = value("liquidation_total_usd_5m", symbol_first=True)
+        liquidation_imbalance_5m = value("liquidation_imbalance_5m", symbol_first=True)
+        liquidation_spike_score = value("liquidation_spike_score", symbol_first=True)
+        usdt_price_deviation = value("usdt_price_deviation")
+        usdc_price_deviation = value("usdc_price_deviation")
+        stablecoin_depeg_risk = value("stablecoin_depeg_risk")
+        stablecoin_supply_change_1d = value("stablecoin_supply_change_1d")
+        macro_risk_score = value("macro_risk_score")
+        regulation_risk_score = value("regulation_risk_score")
+        security_risk_score = value("security_risk_score")
+        etf_bullish_score = value("etf_bullish_score")
+        world_risk_score = value("world_risk_score")
+
+        fear_greed_bias = _clamp((fear_greed_value - 50.0) / 50.0, -1.0, 1.0) if fear_greed_value else 0.0
+        growth_bias = _clamp(global_market_cap_change_24h * 8.0 + total_volume_change_24h * 2.0, -1.0, 1.0)
+        risk_drag = _clamp(
+            (stablecoin_depeg_risk * 0.35)
+            + (macro_risk_score * 0.20)
+            + (regulation_risk_score * 0.15)
+            + (security_risk_score * 0.15)
+            + (world_risk_score * 0.15),
+            0.0,
+            1.0,
+        )
+        liquidation_drag = _clamp(liquidation_spike_score / 5.0, 0.0, 1.0)
+        market_regime_score = _clamp(
+            fear_greed_bias * 0.25
+            + growth_bias * 0.30
+            + etf_bullish_score * 0.20
+            - risk_drag * 0.35
+            - liquidation_drag * 0.10,
+            -1.0,
+            1.0,
+        )
+        return {
+            "fear_greed_value": fear_greed_value,
+            "fear_greed_change_1d": fear_greed_change_1d,
+            "global_market_cap_change_24h": global_market_cap_change_24h,
+            "total_volume_change_24h": total_volume_change_24h,
+            "btc_dominance": btc_dominance,
+            "btc_dominance_change": btc_dominance_change,
+            "liquidation_long_usd_5m": liquidation_long_usd_5m,
+            "liquidation_short_usd_5m": liquidation_short_usd_5m,
+            "liquidation_total_usd_5m": liquidation_total_usd_5m,
+            "liquidation_imbalance_5m": liquidation_imbalance_5m,
+            "liquidation_spike_score": liquidation_spike_score,
+            "usdt_price_deviation": usdt_price_deviation,
+            "usdc_price_deviation": usdc_price_deviation,
+            "stablecoin_depeg_risk": stablecoin_depeg_risk,
+            "stablecoin_supply_change_1d": stablecoin_supply_change_1d,
+            "macro_risk_score": macro_risk_score,
+            "regulation_risk_score": regulation_risk_score,
+            "security_risk_score": security_risk_score,
+            "etf_bullish_score": etf_bullish_score,
+            "world_risk_score": world_risk_score,
+            "market_regime_score": market_regime_score,
+            "external_context": [
+                {
+                    "source_name": row.source_name,
+                    "data_type": row.data_type,
+                    "symbol": row.symbol,
+                    "event_time": row.event_time.isoformat() if row.event_time else None,
+                    "numeric_value": row.numeric_value,
+                    "payload": row.payload,
+                }
+                for row in rows[:20]
             ],
         }
 

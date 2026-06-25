@@ -168,11 +168,12 @@ def compact_database(
     raw_payload_cutoff = _cutoff(hours=settings.raw_payload_retention_hours)
     live_cutoff = _cutoff(hours=settings.live_update_retention_hours)
     raw_tick_cutoff = _cutoff(days=settings.raw_tick_retention_days)
+    raw_external_event_cutoff = _cutoff(days=settings.raw_external_event_retention_days)
     raw_news_text_cutoff = _cutoff(days=settings.raw_news_text_retention_days)
     account_equity_cutoff = _cutoff(days=settings.account_equity_retention_days)
     external_data_cutoff = _cutoff(days=settings.external_data_retention_days)
     closed_candle_cutoff = _cutoff(days=settings.keep_closed_candles_days)
-    training_feature_cutoff = _cutoff(days=settings.keep_training_features_days)
+    training_feature_cutoff = _cutoff(days=settings.training_feature_retention_days)
 
     archived: dict[str, Any] | None = None
     if archive_before_delete:
@@ -282,7 +283,7 @@ def compact_database(
     compacted_external_events = _rowcount(
         session.execute(
             update(ExternalDataEvent)
-            .where(ExternalDataEvent.event_time < raw_payload_cutoff)
+            .where(ExternalDataEvent.event_time < raw_external_event_cutoff)
             .values(raw_payload=None)
         )
     )
@@ -337,10 +338,12 @@ def retention_config() -> dict[str, Any]:
         "keep_training_features_days": settings.keep_training_features_days,
         "keep_experience_days": settings.keep_experience_days,
         "raw_news_retention_days": settings.raw_news_retention_days,
+        "raw_external_event_retention_days": settings.raw_external_event_retention_days,
         "raw_tick_retention_days": settings.raw_tick_retention_days,
         "store_market_ticks": settings.store_market_ticks,
         "diagnostic_retention_days": settings.diagnostic_retention_days,
         "external_data_retention_days": settings.external_data_retention_days,
+        "training_feature_retention_days": settings.training_feature_retention_days,
         "experience_retention_days": settings.experience_retention_days,
         "closed_candle_retention_days": settings.closed_candle_retention_days,
         "archive_dir": str(settings.archive_dir),

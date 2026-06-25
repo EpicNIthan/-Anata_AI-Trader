@@ -19,6 +19,7 @@ from app.ai.strategy import RuleBasedStrategy
 from app.api.webhooks import SignalRequest
 from app.config import settings
 from app.collectors.derivatives_collector import BinanceDerivativesCollector
+from app.collectors.external_market_collectors import ExternalMarketCollectorManager, LiquidationCollector
 from app.collectors.market_collector import BinanceMarketCollector, format_collector_error
 from app.collectors.news_collector import NewsCollector
 from app.db.models import (
@@ -78,6 +79,27 @@ INSPECTOR_FEATURE_KEYS = [
     "trader_crowd_score",
     "crowd_risk_score",
     "derivatives_recency_weight",
+    "fear_greed_value",
+    "fear_greed_change_1d",
+    "global_market_cap_change_24h",
+    "total_volume_change_24h",
+    "btc_dominance",
+    "btc_dominance_change",
+    "liquidation_long_usd_5m",
+    "liquidation_short_usd_5m",
+    "liquidation_total_usd_5m",
+    "liquidation_imbalance_5m",
+    "liquidation_spike_score",
+    "usdt_price_deviation",
+    "usdc_price_deviation",
+    "stablecoin_depeg_risk",
+    "stablecoin_supply_change_1d",
+    "macro_risk_score",
+    "regulation_risk_score",
+    "security_risk_score",
+    "etf_bullish_score",
+    "world_risk_score",
+    "market_regime_score",
 ]
 
 
@@ -408,6 +430,45 @@ def _derivatives_snapshot(session: Session, worker_state: dict[str, Any] | None 
     }
 
 
+def _external_snapshot(session: Session, worker_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    worker_state = worker_state or {}
+    status = ExternalMarketCollectorManager().status(session)
+    liquidation_status = LiquidationCollector().status(session)
+    return {
+        **status,
+        "liquidations": liquidation_status
+        | {
+            "running": bool(worker_state.get("liquidations_running")),
+        },
+        "worker": worker_state,
+    }
+
+
+def _data_coverage(session: Session) -> dict[str, Any]:
+    label_info = label_status(session)
+    external_counts = {
+        source_name: int(count)
+        for source_name, count in session.execute(
+            select(ExternalDataEvent.source_name, func.count(ExternalDataEvent.id)).group_by(ExternalDataEvent.source_name)
+        ).all()
+    }
+    return {
+        "candles": session.scalar(select(func.count(Candle.id))) or 0,
+        "news": session.scalar(select(func.count(NewsArticle.id))) or 0,
+        "sentiment": session.scalar(select(func.count(NewsSentiment.id))) or 0,
+        "derivatives": sum(count for source, count in external_counts.items() if source.startswith("binance_futures_") and source != "binance_futures_liquidations"),
+        "liquidations": external_counts.get("binance_futures_liquidations", 0),
+        "fear_greed": external_counts.get("alternative_me_fear_greed", 0),
+        "global_market": external_counts.get("coingecko_global_market", 0),
+        "stablecoin_risk": external_counts.get("defillama_stablecoin_risk", 0),
+        "macro_risk": external_counts.get("macro_risk_news", 0),
+        "labeled_rows": label_info.get("rows_with_target_trade_quality_score", 0),
+        "label_coverage_pct": label_info.get("label_coverage_pct", 0.0),
+        "label_warning": label_info.get("warning"),
+        "feature_schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
+    }
+
+
 def _decision_source(row: AiDecision) -> str:
     raw = row.raw or row.raw_payload or {}
     source = raw.get("decision_source") if isinstance(raw, dict) else None
@@ -497,9 +558,18 @@ def dashboard_summary(request: Request, session: Session = Depends(get_session))
         "market": market_snapshot(session, collectors.get("market", {})),
         "news": news_snapshot(session, collectors.get("news", {})),
         "derivatives": _derivatives_snapshot(session, collectors.get("derivatives", {})),
+        "external": _external_snapshot(
+            session,
+            {
+                "external": collectors.get("external", {}),
+                "liquidations": collectors.get("liquidations", {}),
+                "liquidations_running": bool(collectors.get("liquidations", {}).get("running")),
+            },
+        ),
         "collectors": collectors,
         "auto_trader": _auto_trader(request).status(),
         "trading": _trading_diagnostics(session),
+        "coverage": _data_coverage(session),
         "sentiment_model": active_sentiment_model(),
         "model": _model_payload(latest_model)
         | {
@@ -608,6 +678,88 @@ async def derivatives_run_once(
     return await collector.fetch_once(mock=mock)
 
 
+@router.get("/external/status")
+def external_status(request: Request, session: Session = Depends(get_session)) -> dict[str, Any]:
+    states = _worker_manager(request).snapshot()
+    return _external_snapshot(
+        session,
+        {
+            "external": states.get("external", {}),
+            "liquidations": states.get("liquidations", {}),
+            "liquidations_running": bool(states.get("liquidations", {}).get("running")),
+        },
+    )
+
+
+@router.get("/external/latest")
+def external_latest(
+    session: Session = Depends(get_session),
+    source_name: str | None = None,
+    data_type: str | None = None,
+    symbol: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    query = select(ExternalDataEvent)
+    if source_name:
+        query = query.where(ExternalDataEvent.source_name == source_name)
+    if data_type:
+        query = query.where(ExternalDataEvent.data_type == data_type)
+    if symbol:
+        query = query.where(ExternalDataEvent.symbol == symbol.upper())
+    rows = session.scalars(query.order_by(desc(ExternalDataEvent.event_time)).limit(min(max(limit, 1), 300))).all()
+    return [
+        {
+            "id": row.id,
+            "source_name": row.source_name,
+            "data_type": row.data_type,
+            "symbol": row.symbol,
+            "event_time": _dt(row.event_time),
+            "numeric_value": row.numeric_value,
+            "payload": row.payload,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/external/run-once")
+async def external_run_once(
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    collector_name = payload.get("collector") or payload.get("name")
+    mock = bool(payload.get("mock", False))
+    if collector_name and str(collector_name).lower() in {"liquidations", "liquidation"}:
+        liquidation_result = await LiquidationCollector().fetch_once(mock=mock)
+        return {
+            "rows_saved": liquidation_result.rows_saved,
+            "collectors": {
+                "liquidations": liquidation_result.__dict__,
+            },
+        }
+    result = await ExternalMarketCollectorManager().fetch_once(
+        collector_name=str(collector_name).lower() if collector_name else None,
+        mock=mock,
+    )
+    return result
+
+
+@router.post("/liquidations/run-once")
+async def liquidations_run_once(
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    symbols = payload.get("symbols")
+    if isinstance(symbols, str):
+        symbols = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+    if symbols is not None and not isinstance(symbols, list):
+        raise HTTPException(status_code=400, detail="symbols must be a list or comma-separated string")
+    collector = LiquidationCollector(symbols=symbols)
+    result = await collector.fetch_once(mock=bool(payload.get("mock", False)))
+    return result.__dict__
+
+
 @router.get("/db/diagnostics")
 def db_diagnostics(session: Session = Depends(get_session), include_raw_estimates: bool = False) -> dict[str, Any]:
     return database_diagnostics(session, include_raw_estimates=include_raw_estimates)
@@ -616,6 +768,16 @@ def db_diagnostics(session: Session = Depends(get_session), include_raw_estimate
 @router.get("/db/storage")
 def db_storage(session: Session = Depends(get_session)) -> dict[str, Any]:
     return database_diagnostics(session, include_raw_estimates=True)
+
+
+@router.get("/storage/status")
+def storage_status(session: Session = Depends(get_session)) -> dict[str, Any]:
+    return database_diagnostics(session, include_raw_estimates=True)
+
+
+@router.post("/storage/cleanup/run")
+def storage_cleanup_run(request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
+    return _data_lifecycle(request).compact_once()
 
 
 @router.get("/db/lifecycle/status")
@@ -847,14 +1009,14 @@ def news_mock(
 
 @router.post("/collectors/{name}/start")
 async def start_collector(name: str, request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
-    if name not in {"market", "news", "derivatives"}:
+    if name not in {"market", "news", "derivatives", "external", "liquidations"}:
         raise HTTPException(status_code=404, detail="Unknown collector")
     return await _worker_manager(request).start(name)
 
 
 @router.post("/collectors/{name}/stop")
 async def stop_collector(name: str, request: Request, _: None = Depends(require_admin)) -> dict[str, Any]:
-    if name not in {"market", "news", "derivatives"}:
+    if name not in {"market", "news", "derivatives", "external", "liquidations"}:
         raise HTTPException(status_code=404, detail="Unknown collector")
     return await _worker_manager(request).stop(name)
 
@@ -1267,6 +1429,7 @@ def latest_feature(
         "final_ai_input": final_ai_input,
         "news_context": metadata.get("news_context", []),
         "derivatives_context": metadata.get("derivatives_context", []),
+        "external_context": metadata.get("external_context", []),
         "raw_payload": payload,
     }
 

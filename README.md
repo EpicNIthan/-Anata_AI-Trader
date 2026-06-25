@@ -126,6 +126,33 @@ curl -X POST http://localhost:8000/api/derivatives/run-once -H "Content-Type: ap
 
 The derivatives collector uses public aggregate data only. It does not know individual trader win rate. It approximates current crowd behavior through account long/short ratios, taker buy/sell pressure, open interest, and funding. Those values are stored in `external_data_events` and compacted into `training_features`.
 
+Optional external context collectors are off by default and store compact numeric rows in `external_data_events`:
+
+- Fear/Greed: Alternative.me crypto fear/greed index.
+- Global market: CoinGecko public global endpoint.
+- Liquidations: Binance Futures force-order websocket rollups.
+- Stablecoin risk: DefiLlama stablecoin peg/supply data.
+- Macro risk: news-derived macro/regulation/security/ETF/world-risk scores.
+
+```env
+ENABLE_FEAR_GREED_COLLECTOR=false
+ENABLE_GLOBAL_MARKET_COLLECTOR=false
+ENABLE_LIQUIDATION_COLLECTOR=false
+ENABLE_STABLECOIN_RISK_COLLECTOR=false
+ENABLE_MACRO_RISK_COLLECTOR=false
+STORE_RAW_EXTERNAL_EVENTS=false
+STORE_RAW_LIQUIDATIONS=false
+RAW_EXTERNAL_EVENT_RETENTION_DAYS=7
+```
+
+Run a safe mock collection pass:
+
+```powershell
+curl -X POST http://localhost:8000/api/external/run-once -H "Content-Type: application/json" -d "{\"mock\":true}"
+curl -X POST http://localhost:8000/api/liquidations/run-once -H "Content-Type: application/json" -d "{\"mock\":true}"
+curl http://localhost:8000/api/external/status
+```
+
 Market status exposes `last_message_at`, `last_saved_at`, `messages_received`, `rows_saved`, `last_error`, `subscribed_streams`, `websocket_url`, and whether candles are live-updated or closed-only. Binance streams are lowercase, for example `btcusdt@kline_1m`.
 
 Use this to see live candle changes before candle close:
@@ -212,9 +239,11 @@ KEEP_CLOSED_CANDLES_DAYS=365
 KEEP_TRAINING_FEATURES_DAYS=365
 KEEP_EXPERIENCE_DAYS=365
 RAW_NEWS_RETENTION_DAYS=30
+RAW_EXTERNAL_EVENT_RETENTION_DAYS=7
 RAW_TICK_RETENTION_DAYS=7
 DIAGNOSTIC_RETENTION_DAYS=7
 EXTERNAL_DATA_RETENTION_DAYS=365
+TRAINING_FEATURE_RETENTION_DAYS=365
 EXPERIENCE_RETENTION_DAYS=365
 CLOSED_CANDLE_RETENTION_DAYS=365
 ```
@@ -253,7 +282,9 @@ Diagnostics:
 ```powershell
 curl http://localhost:8000/api/db/diagnostics
 curl http://localhost:8000/api/db/storage
+curl http://localhost:8000/api/storage/status
 curl -X POST http://localhost:8000/api/db/compact
+curl -X POST http://localhost:8000/api/storage/cleanup/run
 curl -X POST http://localhost:8000/api/db/cleanup
 curl -X POST http://localhost:8000/api/db/archive
 ```
@@ -279,7 +310,7 @@ Data lifecycle rules:
 
 ## Training Workflow
 
-Features are stored as versioned JSON payloads. The current schema is `price-news-v3`; `price-news-v2` and `price-news-v1` remain available for older models. Missing future values default to `0` or `null` so older models keep running when new data sources are added.
+Features are stored as versioned JSON payloads. The current schema is `price-news-market-v4`; `price-news-v3`, `price-news-v2`, and `price-news-v1` remain available for older models. Missing future values default to `0` or `null` so older models keep running when new data sources are added.
 
 `price-news-v3` adds public trader-flow features:
 
@@ -290,6 +321,16 @@ Features are stored as versioned JSON payloads. The current schema is `price-new
 - funding rate
 - combined `trader_crowd_score`
 - combined `crowd_risk_score`
+
+`price-news-market-v4` keeps all v3 columns and adds:
+
+- fear/greed value and 1d change
+- global market cap and volume change
+- BTC dominance and dominance change
+- liquidation long/short/total/imbalance/spike rollups
+- USDT/USDC peg deviation and stablecoin depeg risk
+- macro, regulation, security, ETF, and world risk scores
+- combined `market_regime_score`
 
 Railway is inference-only by default:
 

@@ -74,7 +74,7 @@ from app.collectors.market_collector import BinanceMarketCollector
 from app.db.models import AiDecision, Candle, ExperienceRecord, ExternalDataEvent, Feature, LiveCandleUpdate, ModelVersion, NewsArticle, NewsSentiment, TrainingFeature
 from app.db.session import engine
 from app.db.session import SessionLocal
-from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema
+from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, numeric_vector
 from app.main import app
 
 
@@ -255,6 +255,15 @@ def main() -> None:
         derivatives_latest = client.get("/api/derivatives/latest?symbol=BTCUSDT", auth=auth)
         assert derivatives_latest.status_code == 200, derivatives_latest.text
         assert len(derivatives_latest.json()) >= 1, derivatives_latest.text
+        external_run = client.post("/api/external/run-once", json={"mock": True}, auth=auth)
+        assert external_run.status_code == 200, external_run.text
+        assert external_run.json()["rows_saved"] >= 17, external_run.text
+        liquidation_run = client.post("/api/liquidations/run-once", json={"mock": True}, auth=auth)
+        assert liquidation_run.status_code == 200, liquidation_run.text
+        assert liquidation_run.json()["rows_saved"] >= 10, liquidation_run.text
+        external_status = client.get("/api/external/status", auth=auth)
+        assert external_status.status_code == 200, external_status.text
+        assert external_status.json()["collectors"]["fear_greed"]["counts_by_type"]["fear_greed_value"] >= 1, external_status.text
 
         accelerated = client.post(
             "/api/training/build-dataset",
@@ -443,6 +452,9 @@ def main() -> None:
         db_storage = client.get("/api/db/storage", auth=auth)
         assert db_storage.status_code == 200, db_storage.text
         assert "rows_by_table" in db_storage.json(), db_storage.text
+        storage_status = client.get("/api/storage/status", auth=auth)
+        assert storage_status.status_code == 200, storage_status.text
+        assert "top_largest_tables" in storage_status.json(), storage_status.text
         candles = client.get("/api/market/candles?symbol=BTCUSDT&timeframe=1m&limit=5", auth=auth)
         assert candles.status_code == 200, candles.text
         assert len(candles.json()) > 0, candles.text
@@ -504,15 +516,23 @@ def main() -> None:
         assert feature_latest.status_code == 200, feature_latest.text
         feature_payload = feature_latest.json()
         assert feature_payload["symbol"] == "BTCUSDT", feature_latest.text
-        assert feature_payload["schema_version"] == "price-news-v3", feature_latest.text
+        assert feature_payload["schema_version"] == "price-news-market-v4", feature_latest.text
         assert "sentiment_confidence" in feature_payload["vector"], feature_latest.text
         assert "candle_return_1m" in feature_payload["vector"], feature_latest.text
         assert "trader_crowd_score" in feature_payload["vector"], feature_latest.text
         assert feature_payload["vector"]["derivatives_recency_weight"] > 0, feature_latest.text
+        assert feature_payload["vector"]["fear_greed_value"] > 0, feature_latest.text
+        assert "market_regime_score" in feature_payload["vector"], feature_latest.text
         assert len(feature_payload["derivatives_context"]) >= 1, feature_latest.text
+        assert len(feature_payload["external_context"]) >= 1, feature_latest.text
         assert "final_ai_input" in feature_payload, feature_latest.text
         assert "strategy_input" in feature_payload["final_ai_input"], feature_latest.text
         with SessionLocal() as session:
+            latest_feature_row = session.get(Feature, feature_payload["id"])
+            assert latest_feature_row is not None
+            v3_columns = columns_for_schema("price-news-v3")
+            assert "market_regime_score" not in v3_columns
+            assert len(numeric_vector(latest_feature_row, v3_columns)) == len(v3_columns)
             training_feature_count = session.scalar(select(func.count(TrainingFeature.id))) or 0
             external_event_count = session.scalar(select(func.count(ExternalDataEvent.id))) or 0
         assert training_feature_count > 0

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.collectors.derivatives_collector import BinanceDerivativesCollector
+from app.collectors.external_market_collectors import ExternalMarketCollectorManager, LiquidationCollector
 from app.collectors.market_collector import BinanceMarketCollector
 from app.collectors.news_collector import NewsCollector
 
@@ -76,6 +77,8 @@ class WorkerManager:
             "market": CollectorState(name="market"),
             "news": CollectorState(name="news"),
             "derivatives": CollectorState(name="derivatives"),
+            "external": CollectorState(name="external"),
+            "liquidations": CollectorState(name="liquidations"),
         }
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
@@ -97,6 +100,8 @@ class WorkerManager:
         market_collector: BinanceMarketCollector | None = None
         news_collector: NewsCollector | None = None
         derivatives_collector: BinanceDerivativesCollector | None = None
+        external_collector: ExternalMarketCollectorManager | None = None
+        liquidation_collector: LiquidationCollector | None = None
         if name == "market":
             market_collector = BinanceMarketCollector()
             state.set_subscription(streams=market_collector.subscribed_streams, websocket_url=market_collector.stream_url)
@@ -116,6 +121,25 @@ class WorkerManager:
                 "symbols": derivatives_collector.symbols,
                 "endpoints": derivatives_collector.endpoints,
             }
+        elif name == "external":
+            external_collector = ExternalMarketCollectorManager()
+            state.details = {"collectors": list(external_collector.collectors)}
+            if not external_collector.any_enabled:
+                state.running = False
+                state.warning = "No external market collectors enabled"
+                state.mark_error(state.warning)
+                return state.as_dict()
+        elif name == "liquidations":
+            liquidation_collector = LiquidationCollector()
+            state.set_subscription(
+                streams=[f"{symbol.lower()}@forceOrder" for symbol in liquidation_collector.symbols],
+                websocket_url=liquidation_collector.stream_url,
+            )
+            if not liquidation_collector.enabled:
+                state.running = False
+                state.warning = "ENABLE_LIQUIDATION_COLLECTOR=false"
+                state.mark_error(state.warning)
+                return state.as_dict()
 
         state.running = True
 
@@ -127,6 +151,10 @@ class WorkerManager:
                     await (news_collector or NewsCollector()).run(stop_event, state)
                 elif name == "derivatives":
                     await (derivatives_collector or BinanceDerivativesCollector()).run(stop_event, state)
+                elif name == "external":
+                    await (external_collector or ExternalMarketCollectorManager()).run(stop_event, state)
+                elif name == "liquidations":
+                    await (liquidation_collector or LiquidationCollector()).run(stop_event, state)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - defensive worker boundary

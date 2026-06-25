@@ -40,6 +40,27 @@
     ["trader_crowd_score", "trader_crowd_score"],
     ["crowd_risk_score", "crowd_risk_score"],
     ["derivatives_recency_weight", "derivatives_recency_weight"],
+    ["fear_greed_value", "fear_greed_value"],
+    ["fear_greed_change_1d", "fear_greed_change_1d"],
+    ["global_market_cap_change_24h", "global_market_cap_change_24h"],
+    ["total_volume_change_24h", "total_volume_change_24h"],
+    ["btc_dominance", "btc_dominance"],
+    ["btc_dominance_change", "btc_dominance_change"],
+    ["liquidation_long_usd_5m", "liquidation_long_usd_5m"],
+    ["liquidation_short_usd_5m", "liquidation_short_usd_5m"],
+    ["liquidation_total_usd_5m", "liquidation_total_usd_5m"],
+    ["liquidation_imbalance_5m", "liquidation_imbalance_5m"],
+    ["liquidation_spike_score", "liquidation_spike_score"],
+    ["usdt_price_deviation", "usdt_price_deviation"],
+    ["usdc_price_deviation", "usdc_price_deviation"],
+    ["stablecoin_depeg_risk", "stablecoin_depeg_risk"],
+    ["stablecoin_supply_change_1d", "stablecoin_supply_change_1d"],
+    ["macro_risk_score", "macro_risk_score"],
+    ["regulation_risk_score", "regulation_risk_score"],
+    ["security_risk_score", "security_risk_score"],
+    ["etf_bullish_score", "etf_bullish_score"],
+    ["world_risk_score", "world_risk_score"],
+    ["market_regime_score", "market_regime_score"],
   ];
 
   const $ = (id) => document.getElementById(id);
@@ -229,6 +250,18 @@
       setText("candleMetric", number(data.counts?.candles, 0));
       setText("newsMetric", number(data.counts?.news, 0));
       setText("experienceMetric", number(data.counts?.experiences, 0));
+      const coverage = data.coverage || {};
+      setText("coverageCandles", number(coverage.candles, 0));
+      setText("coverageNews", number(coverage.news, 0));
+      setText("coverageSentiment", number(coverage.sentiment, 0));
+      setText("coverageDerivatives", number(coverage.derivatives, 0));
+      setText("coverageLiquidations", number(coverage.liquidations, 0));
+      setText("coverageFearGreed", number(coverage.fear_greed, 0));
+      setText("coverageGlobalMarket", number(coverage.global_market, 0));
+      setText("coverageStablecoinRisk", number(coverage.stablecoin_risk, 0));
+      setText("coverageMacroRisk", number(coverage.macro_risk, 0));
+      setText("coverageLabeledRows", `${number(coverage.labeled_rows, 0)} / ${pct(coverage.label_coverage_pct || 0, 1)}`);
+      setClass("coverageLabeledRows", Number(coverage.labeled_rows || 0) > 0 ? "positive" : "warning");
 
       setText("featureCount", number(data.counts?.features, 0));
       setText("trainingCandleCount", number(data.counts?.candles, 0));
@@ -251,6 +284,7 @@
       setText("marketDiagnostics", JSON.stringify(data.market, null, 2));
       setText("newsDiagnostics", JSON.stringify(data.news?.providers || data.news, null, 2));
       setText("derivativesDiagnostics", JSON.stringify(data.derivatives || {}, null, 2));
+      setText("externalDiagnostics", JSON.stringify(data.external || {}, null, 2));
       setText("autoDiagnostics", JSON.stringify(data.auto_trader, null, 2));
       const trading = data.trading || {};
       setText("strategyTradeCount", number(trading.strategy_trades, 0));
@@ -356,7 +390,9 @@
       const derivativesContext = data.derivatives_context || [];
       const derivativesBox = $("featureDerivativesContext");
       if (derivativesBox) {
-        derivativesBox.innerHTML = derivativesContext.length ? derivativesContext.map((item) => `
+        const externalContext = data.external_context || [];
+        const mergedContext = [...derivativesContext, ...externalContext];
+        derivativesBox.innerHTML = mergedContext.length ? mergedContext.map((item) => `
           <div class="news-context-item">
             <strong>${escapeHtml(item.data_type || "-")}</strong>
             <p>${escapeHtml(JSON.stringify(item.payload || {}))}</p>
