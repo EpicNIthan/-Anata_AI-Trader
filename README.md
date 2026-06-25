@@ -234,17 +234,20 @@ ENABLE_DERIVATIVES_COLLECTOR=false
 DERIVATIVES_POLL_INTERVAL_SECONDS=300
 DERIVATIVES_PERIOD=5m
 DERIVATIVES_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT
-RAW_PAYLOAD_RETENTION_HOURS=24
-LIVE_UPDATE_RETENTION_HOURS=12
-ACCOUNT_EQUITY_RETENTION_DAYS=7
-RAW_NEWS_TEXT_RETENTION_DAYS=7
+RAILWAY_DATA_FACTORY_MODE=true
+DATA_LIFECYCLE_INTERVAL_SECONDS=86400
+OPERATIONAL_RETENTION_DAYS=2
+RAW_PAYLOAD_RETENTION_HOURS=6
+LIVE_UPDATE_RETENTION_HOURS=6
+ACCOUNT_EQUITY_RETENTION_DAYS=2
+RAW_NEWS_TEXT_RETENTION_DAYS=3
 KEEP_CLOSED_CANDLES_DAYS=365
 KEEP_TRAINING_FEATURES_DAYS=365
 KEEP_EXPERIENCE_DAYS=365
 RAW_NEWS_RETENTION_DAYS=30
-RAW_EXTERNAL_EVENT_RETENTION_DAYS=7
-RAW_TICK_RETENTION_DAYS=7
-DIAGNOSTIC_RETENTION_DAYS=7
+RAW_EXTERNAL_EVENT_RETENTION_DAYS=1
+RAW_TICK_RETENTION_DAYS=1
+DIAGNOSTIC_RETENTION_DAYS=2
 EXTERNAL_DATA_RETENTION_DAYS=365
 TRAINING_FEATURE_RETENTION_DAYS=365
 EXPERIENCE_RETENTION_DAYS=365
@@ -446,14 +449,13 @@ Recommended normal loop:
 
 Data lifecycle rules:
 
-- `live_candle_updates` is short-term chart data and is upserted by symbol/timeframe/open time.
-- `candles` stores closed candles for long-term training.
-- `training_features` stores compact numeric feature rows for model training/export.
-- Raw ticks, live updates, old diagnostic rows, old raw news text, and old raw payloads are cleaned or compacted by the daily lifecycle job.
-- Public external data such as derivatives flow is kept longer as compact numeric/payload rows, while old raw payloads are compacted.
-- Training exports read compact features first, so raw logs can be compacted after features are built and archived.
+- Railway defaults to `RAILWAY_DATA_FACTORY_MODE=true`.
+- Useful training memory is `candles`, `news_articles`, `news_sentiment`, `external_data_events`, `training_features`, and `experience_buffer`.
+- Operational/debug data is short-lived: live chart updates, raw payloads, debug `features`, `ai_decisions`, `paper_trades`, and dense `account_equity` rows are trimmed daily.
+- Finished-day useful data is deleted from Railway only after you download bundles with `--delete-finished-from-railway`.
+- The unfinished/current day remains in Railway so collection continues nonstop.
 - The dashboard `DB Storage` tab shows total DB size, largest tables, raw/JSON estimates, last cleanup, and buttons for `Compact DB` or `Archive + Compact`.
-- `POST /api/db/compact` strips bulky raw/debug fields but keeps closed candles, `training_features`, `experience_buffer`, `model_versions`, and `paper_trades`.
+- `POST /api/db/compact` strips bulky raw/debug fields and trims operational tables while keeping compact training memory.
 
 ## Training Workflow
 

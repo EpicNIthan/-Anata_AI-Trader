@@ -190,6 +190,7 @@ def compact_database(
     training_feature_cutoff = _cutoff(days=training_feature_days)
     experience_cutoff = _cutoff(days=experience_days)
     raw_news_cutoff = _cutoff(days=raw_news_days)
+    operational_cutoff = _cutoff(days=settings.operational_retention_days)
 
     archived: dict[str, Any] | None = None
     if archive_before_delete:
@@ -283,6 +284,50 @@ def compact_database(
             .values(market_state=None, news_state=None, feature_payload=None, raw_payload=None)
         )
     )
+    old_feature_ids = select(Feature.id).where(Feature.as_of < operational_cutoff)
+    old_trade_ids = select(PaperTrade.id).where(PaperTrade.created_at < operational_cutoff)
+    if settings.railway_data_factory_mode:
+        detached_old_experience_decisions = _rowcount(
+            session.execute(
+                update(ExperienceRecord)
+                .where(ExperienceRecord.created_at < operational_cutoff)
+                .values(ai_decision_id=None)
+            )
+        )
+        detached_old_decision_features = _rowcount(
+            session.execute(
+                update(AiDecision)
+                .where(AiDecision.feature_id.in_(old_feature_ids))
+                .values(feature_id=None)
+            )
+        )
+        detached_old_decision_trades = _rowcount(
+            session.execute(
+                update(AiDecision)
+                .where(AiDecision.trade_id.in_(old_trade_ids))
+                .values(trade_id=None)
+            )
+        )
+        detached_old_experience_features = _rowcount(
+            session.execute(
+                update(ExperienceRecord)
+                .where(ExperienceRecord.feature_id.in_(old_feature_ids))
+                .values(feature_id=None)
+            )
+        )
+        detached_old_training_feature_sources = _rowcount(
+            session.execute(
+                update(TrainingFeature)
+                .where(TrainingFeature.source_feature_id.in_(old_feature_ids))
+                .values(source_feature_id=None)
+            )
+        )
+    else:
+        detached_old_experience_decisions = 0
+        detached_old_decision_features = 0
+        detached_old_decision_trades = 0
+        detached_old_experience_features = 0
+        detached_old_training_feature_sources = 0
     compacted_old_ai_decisions = _rowcount(
         session.execute(
             update(AiDecision)
@@ -317,6 +362,34 @@ def compact_database(
     )
     compacted_features = _compact_features(session, raw_payload_cutoff)
     compacted_training_features = _compact_training_features(session, training_feature_cutoff)
+    if settings.railway_data_factory_mode:
+        session.flush()
+        session.expunge_all()
+        deleted_old_ai_decisions = _rowcount(
+            session.execute(
+                delete(AiDecision)
+                .where(AiDecision.created_at < operational_cutoff)
+                .execution_options(synchronize_session=False)
+            )
+        )
+        deleted_old_paper_trades = _rowcount(
+            session.execute(
+                delete(PaperTrade)
+                .where(PaperTrade.created_at < operational_cutoff)
+                .execution_options(synchronize_session=False)
+            )
+        )
+        deleted_old_features = _rowcount(
+            session.execute(
+                delete(Feature)
+                .where(Feature.as_of < operational_cutoff)
+                .execution_options(synchronize_session=False)
+            )
+        )
+    else:
+        deleted_old_ai_decisions = 0
+        deleted_old_paper_trades = 0
+        deleted_old_features = 0
     session.commit()
     return {
         "ran_at": datetime.now(timezone.utc).isoformat(),
@@ -332,6 +405,8 @@ def compact_database(
             "effective_training_feature_retention_days": training_feature_days,
             "effective_experience_retention_days": experience_days,
             "effective_raw_news_retention_days": raw_news_days,
+            "operational_retention_days": settings.operational_retention_days,
+            "railway_data_factory_mode": settings.railway_data_factory_mode,
         },
         "archived": archived,
         "deleted": {
@@ -343,6 +418,9 @@ def compact_database(
             "old_news_sentiment": deleted_old_news_sentiment,
             "old_training_features": deleted_old_training_features,
             "old_experiences": deleted_old_experiences,
+            "old_ai_decisions": deleted_old_ai_decisions,
+            "old_paper_trades": deleted_old_paper_trades,
+            "old_debug_features": deleted_old_features,
             "account_equity": deleted_account_equity,
             "external_data_events": deleted_external_events,
         },
@@ -360,6 +438,11 @@ def compact_database(
             "external_data_raw_payload": compacted_external_events,
             "features_debug_payload": compacted_features,
             "training_features_final_ai_input": compacted_training_features,
+            "experience_ai_decision_links_detached": detached_old_experience_decisions,
+            "ai_decision_feature_links_detached": detached_old_decision_features,
+            "ai_decision_trade_links_detached": detached_old_decision_trades,
+            "experience_feature_links_detached": detached_old_experience_features,
+            "training_feature_source_links_detached": detached_old_training_feature_sources,
         },
     }
 
@@ -370,6 +453,9 @@ def cleanup_old_data(session: Session) -> dict[str, Any]:
 
 def retention_config() -> dict[str, Any]:
     return {
+        "railway_data_factory_mode": settings.railway_data_factory_mode,
+        "data_lifecycle_interval_seconds": settings.data_lifecycle_interval_seconds,
+        "operational_retention_days": settings.operational_retention_days,
         "raw_payload_retention_hours": settings.raw_payload_retention_hours,
         "live_update_retention_hours": settings.live_update_retention_hours,
         "account_equity_retention_days": settings.account_equity_retention_days,

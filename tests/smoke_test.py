@@ -651,23 +651,83 @@ def main() -> None:
             compact_candle.raw_payload = {"large": "x" * 4096}
             compact_candle.raw = {"large": "x" * 4096}
             compact_candle.updated_at = datetime.now(timezone.utc) - timedelta(hours=2)
+            old_operational_time = datetime.now(timezone.utc) - timedelta(days=3)
+            old_debug_feature = Feature(
+                symbol="BTCUSDT",
+                schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
+                source_name="old_debug_feature",
+                as_of=old_operational_time,
+                payload={"values": {"price_change": 0.01}},
+                raw_payload={"debug": "drop"},
+            )
+            session.add(old_debug_feature)
+            session.flush()
+            old_training_feature = TrainingFeature(
+                source_feature_id=old_debug_feature.id,
+                symbol="BTCUSDT",
+                schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
+                source_name="old_training_memory",
+                as_of=old_operational_time,
+                feature_values={"price_change": 0.01, "target_trade_quality_score": 0.1},
+                payload={"values": {"price_change": 0.01, "target_trade_quality_score": 0.1}},
+            )
+            old_decision = AiDecision(
+                symbol="BTCUSDT",
+                strategy_name="old-debug",
+                feature_id=old_debug_feature.id,
+                feature_schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
+                action="HOLD",
+                confidence=0.1,
+                reason="old operational row",
+                created_at=old_operational_time,
+            )
+            session.add_all([old_training_feature, old_decision])
+            session.flush()
+            old_experience = ExperienceRecord(
+                ai_decision_id=old_decision.id,
+                feature_id=old_debug_feature.id,
+                symbol="BTCUSDT",
+                feature_schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
+                action="HOLD",
+                confidence=0.1,
+                result={"status": "HELD"},
+                reward=0.0,
+                created_at=old_operational_time,
+            )
+            session.add(old_experience)
+            session.flush()
             closed_candles_before_compact = session.scalar(select(func.count(Candle.id)).where(Candle.is_closed.is_(True))) or 0
             training_features_before_compact = session.scalar(select(func.count(TrainingFeature.id))) or 0
             model_versions_before_compact = session.scalar(select(func.count(ModelVersion.id))) or 0
             compact_candle_id = compact_candle.id
+            old_debug_feature_id = old_debug_feature.id
+            old_training_feature_id = old_training_feature.id
+            old_decision_id = old_decision.id
+            old_experience_id = old_experience.id
             session.commit()
         compact = client.post("/api/db/compact", json={}, auth=auth)
         assert compact.status_code == 200, compact.text
         compact_payload = compact.json()["last_cleanup"]
         assert compact_payload["compacted"]["candles_raw_fields"] >= 1, compact.text
+        assert compact_payload["deleted"]["old_debug_features"] >= 1, compact.text
+        assert compact_payload["deleted"]["old_ai_decisions"] >= 1, compact.text
         with SessionLocal() as session:
             closed_candles_after_compact = session.scalar(select(func.count(Candle.id)).where(Candle.is_closed.is_(True))) or 0
             training_features_after_compact = session.scalar(select(func.count(TrainingFeature.id))) or 0
             model_versions_after_compact = session.scalar(select(func.count(ModelVersion.id))) or 0
             compacted_candle = session.get(Candle, compact_candle_id)
+            compacted_training_feature = session.get(TrainingFeature, old_training_feature_id)
+            compacted_experience = session.get(ExperienceRecord, old_experience_id)
             assert compacted_candle is not None
             assert compacted_candle.raw_payload is None
             assert compacted_candle.raw is None
+            assert session.get(Feature, old_debug_feature_id) is None
+            assert session.get(AiDecision, old_decision_id) is None
+            assert compacted_training_feature is not None
+            assert compacted_training_feature.source_feature_id is None
+            assert compacted_experience is not None
+            assert compacted_experience.ai_decision_id is None
+            assert compacted_experience.feature_id is None
         assert closed_candles_after_compact == closed_candles_before_compact
         assert training_features_after_compact == training_features_before_compact
         assert model_versions_after_compact == model_versions_before_compact

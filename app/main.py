@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     settings.model_dir.mkdir(parents=True, exist_ok=True)
     manager = WorkerManager()
     auto_trader = AutoTraderService()
-    data_lifecycle = DataLifecycleService()
+    data_lifecycle = DataLifecycleService(interval_seconds=settings.data_lifecycle_interval_seconds)
     training_service = TrainingService()
     app.state.worker_manager = manager
     app.state.auto_trader = auto_trader
