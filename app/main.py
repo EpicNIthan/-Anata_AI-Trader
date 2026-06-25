@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from app.api.raw_data_maintenance import router as raw_data_maintenance_router
 from app.api.routes import router as api_router
 from app.api.webhooks import router as webhook_router
 from app.collectors.runtime import WorkerManager
@@ -71,6 +72,7 @@ static_dir = Path("app/dashboard/static")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 app.include_router(webhook_router)
 app.include_router(api_router)
+app.include_router(raw_data_maintenance_router)
 app.include_router(dashboard_router)
 
 
