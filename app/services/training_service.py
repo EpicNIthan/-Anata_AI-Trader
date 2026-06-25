@@ -14,7 +14,6 @@ from app.db.session import SessionLocal
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION
 from app.training.dataset_accelerator import build_accelerated_dataset
 from app.training.export_dataset import parse_since_date
-from app.training.train_price_model import train_price_model
 
 SERVER_TRAINING_DISABLED_MESSAGE = "Server training is disabled. Download dataset and train locally."
 
@@ -134,6 +133,8 @@ async def train_model_job(payload: dict[str, Any]) -> dict[str, Any]:
     use_all_data = bool(payload.get("use_all_data", True))
     epochs = min(max(int(payload.get("epochs") or 500), 1), 20_000)
     learning_rate = float(payload.get("learning_rate") or 0.05)
+    from app.training.train_price_model import train_price_model
+
     model_path = await asyncio.to_thread(
         train_price_model,
         dataset_path,

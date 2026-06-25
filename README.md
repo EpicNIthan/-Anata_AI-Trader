@@ -29,11 +29,13 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Optional Hugging Face sentiment dependencies are intentionally separate so Railway does not need heavy packages by default:
+Optional local Hugging Face sentiment dependencies are intentionally separate so Railway does not need heavy packages by default:
 
 ```powershell
 python -m pip install -r requirements-hf.txt
 ```
+
+Do not install `requirements-hf.txt` on small Railway containers. Railway should use `HF_SENTIMENT_BACKEND=api` with `HF_API_TOKEN` instead, otherwise local `torch`/`transformers` can run the deployment out of memory.
 
 Powerful local training dependencies are also separate. Install them on your laptop, not Railway:
 
@@ -305,6 +307,14 @@ HF_SENTIMENT_BACKEND=api
 HF_API_TOKEN=hf_your_token_here
 NEWS_SENTIMENT_MODEL=mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis
 ```
+
+For Railway memory safety:
+
+- Keep `HF_SENTIMENT_BACKEND=api`, not `local`.
+- Do not add `torch`, `transformers`, `lightgbm`, or `xgboost` to Railway default requirements.
+- Keep `ENABLE_SERVER_TRAINING=false`.
+- Train on your laptop with `requirements-local-training.txt`.
+- Default Railway requirements are intentionally lean. Uploaded sklearn `.joblib` models may need extra inference dependencies or a larger Railway plan; if unavailable, the app safely falls back to the rule-based strategy.
 
 Then check:
 
