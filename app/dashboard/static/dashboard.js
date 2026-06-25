@@ -803,6 +803,55 @@
     }
   }
 
+  async function finishRawDataDay() {
+    const output = $("dbStorageActionResult") || $("dbActionResult");
+    if (output) output.textContent = "Writing finished_data folder for previous UTC day...";
+    try {
+      const data = await api("/api/raw-data/finish-day", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const manifest = data.manifest || {};
+      if (output) output.textContent = `Finished raw folder: ${data.folder || "-"} rows ${JSON.stringify(manifest.row_counts || {})}`;
+      await refreshStorageDiagnostics();
+    } catch (error) {
+      if (output) output.textContent = `Finish raw data failed: ${error.message}`;
+    }
+  }
+
+  async function exportRawData() {
+    const output = $("dbStorageActionResult") || $("dbActionResult");
+    if (output) output.textContent = "Creating raw data archive...";
+    try {
+      const data = await api("/api/raw-data/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ use_all_data: true }),
+      });
+      const manifest = data.manifest || {};
+      if (output) {
+        output.innerHTML = `Raw archive ready: <a href="${escapeHtml(data.download_url)}" target="_blank" rel="noopener">${escapeHtml(data.archive_id)}</a>\nRows ${escapeHtml(JSON.stringify(manifest.row_counts || {}))}`;
+      }
+    } catch (error) {
+      if (output) output.textContent = `Export raw data failed: ${error.message}`;
+    }
+  }
+
+  function showPipelineGuide() {
+    const output = $("dbStorageActionResult") || $("dbActionResult");
+    const command = [
+      "python scripts/run_full_training_pipeline.py",
+      "--url https://anataai-trader-production.up.railway.app",
+      "--token YOUR_ADMIN_TOKEN",
+      "--since-date 2026-06-26",
+      "--output-dir datasets/pipeline_runs",
+      "--activate-if-pass",
+      "--start-paper-trader-if-pass",
+    ].join(" ");
+    if (output) output.textContent = command;
+  }
+
   async function archiveData() {
     const output = $("dbActionResult");
     if (output) output.textContent = "Archiving...";
@@ -880,6 +929,9 @@
     $("compactDbButton")?.addEventListener("click", () => compactDatabase(false));
     $("compactArchiveDbButton")?.addEventListener("click", () => compactDatabase(true));
     $("collectionReportButton")?.addEventListener("click", refreshCollectionReport);
+    $("finishRawDataButton")?.addEventListener("click", finishRawDataDay);
+    $("exportRawDataButton")?.addEventListener("click", exportRawData);
+    $("pipelineGuideButton")?.addEventListener("click", showPipelineGuide);
     $("buildDailyBundlesButton")?.addEventListener("click", buildDailyBundles);
     $("cleanupFinishedBundlesButton")?.addEventListener("click", cleanupFinishedBundles);
     $("archiveDataButton")?.addEventListener("click", archiveData);

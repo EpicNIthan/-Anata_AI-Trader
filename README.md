@@ -457,6 +457,88 @@ Data lifecycle rules:
 - The dashboard `DB Storage` tab shows total DB size, largest tables, raw/JSON estimates, last cleanup, and buttons for `Compact DB` or `Archive + Compact`.
 - `POST /api/db/compact` strips bulky raw/debug fields and trims operational tables while keeping compact training memory.
 
+## Full Data -> Train -> Upload Pipeline
+
+Railway stays lightweight: it collects raw/relevant data, exports it, runs paper trading, and runs active model inference only. Your laptop stores the long-term raw archive and does heavy news conversion/training.
+
+Every daily lifecycle run writes the previous UTC day to:
+
+```text
+finished_data/YYYY-MM-DD/
+```
+
+That folder contains compressed candles, raw news JSONL, sentiment, external/trader-flow data, features, training features, paper trades, AI decisions, experience rows, equity, model versions, training runs, and `manifest.json`. The most important file is `news_articles.jsonl.gz`; it keeps full `raw_text` so your PC can convert news into better numeric features later. The app does not delete `finished_data` automatically.
+
+PowerShell setup:
+
+```powershell
+$Url = "https://anataai-trader-production.up.railway.app"
+$Token = "YOUR_ADMIN_TOKEN"
+```
+
+Download one day of raw data:
+
+```powershell
+python scripts/download_raw_data.py --url $Url --token $Token --date 2026-06-26 --output datasets/raw_data_2026-06-26.zip
+```
+
+Download all raw news only:
+
+```powershell
+python scripts/download_raw_data.py --url $Url --token $Token --news-only --use-all-data --output datasets/raw_news_all.zip
+```
+
+Prepare training data locally from raw data:
+
+```powershell
+python scripts/prepare_training_data.py --input datasets/raw_data_2026-06-26.zip --output-dir datasets/processed
+```
+
+Train and package the best local model:
+
+```powershell
+python scripts/train_best_model.py --dataset datasets/processed/YOUR_PROCESSED_DATASET.csv.gz --target target_trade_quality_score
+```
+
+Run the full one-command pipeline:
+
+```powershell
+python scripts/run_full_training_pipeline.py `
+  --url $Url `
+  --token $Token `
+  --since-date 2026-06-26 `
+  --output-dir datasets/pipeline_runs `
+  --activate-if-pass `
+  --start-paper-trader-if-pass
+```
+
+Upload and activate manually if you trained separately:
+
+```powershell
+python scripts/upload_model.py --url $Url --token $Token --package models/model_package_VERSION.zip
+python scripts/activate_model.py --url $Url --token $Token --model-id MODEL_ID
+```
+
+Start the paper trader after activation:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "$Url/api/auto-trader/start" -Headers @{"x-admin-token"=$Token}
+```
+
+Raw-data API endpoints:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "$Url/api/raw-data/finish-day" -Headers @{"x-admin-token"=$Token;"Content-Type"="application/json"} -Body "{}"
+Invoke-RestMethod -Method Post -Uri "$Url/api/raw-data/export" -Headers @{"x-admin-token"=$Token;"Content-Type"="application/json"} -Body '{"use_all_data":true}'
+```
+
+Safety rules:
+
+- All trading remains paper-only.
+- Failed models are uploaded/activated only if you explicitly force the workflow; default scripts do not activate failed models.
+- The local converter prevents future leakage by using only news/external context published before each training row time.
+- Heavy model training stays on your PC; Railway does not need heavy training dependencies by default.
+
 ## Training Workflow
 
 Features are stored as versioned JSON payloads. The current schema is `price-news-market-v4`; `price-news-v3`, `price-news-v2`, and `price-news-v1` remain available for older models. Missing future values default to `0` or `null` so older models keep running when new data sources are added.

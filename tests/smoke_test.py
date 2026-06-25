@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import io
 import os
 import shutil
 import subprocess
@@ -322,6 +323,24 @@ def main() -> None:
             imported_sentiment = session.scalar(select(NewsSentiment).where(NewsSentiment.article_id == first_article.id).limit(1))
             assert imported_sentiment is not None
             assert imported_sentiment.model_name == "smoke-local-news-model"
+
+        raw_day = datetime.now(timezone.utc).date().isoformat()
+        finish_raw_day = client.post("/api/raw-data/finish-day", json={"date": raw_day}, auth=auth)
+        assert finish_raw_day.status_code == 200, finish_raw_day.text
+        assert "manifest" in finish_raw_day.json(), finish_raw_day.text
+        raw_export = client.post("/api/raw-data/export", json={"use_all_data": True, "news_only": True}, auth=auth)
+        assert raw_export.status_code == 200, raw_export.text
+        raw_payload = raw_export.json()
+        assert raw_payload["archive_id"].endswith(".zip"), raw_export.text
+        assert raw_payload["manifest"]["row_counts"]["news_articles"] > 0, raw_export.text
+        raw_download = client.get(raw_payload["download_url"], auth=auth)
+        assert raw_download.status_code == 200, raw_download.text
+        with zipfile.ZipFile(io.BytesIO(raw_download.content)) as archive:
+            news_member = next(name for name in archive.namelist() if name.endswith("news_articles.jsonl.gz"))
+            raw_news_text = gzip.decompress(archive.read(news_member)).decode("utf-8")
+            raw_news_row = json.loads(raw_news_text.splitlines()[0])
+            assert "raw_text" in raw_news_row, raw_news_row
+            assert raw_news_row["raw_text"], raw_news_row
 
         collector_status = client.get("/api/collectors/status", auth=auth)
         assert collector_status.status_code == 200, collector_status.text
@@ -835,6 +854,12 @@ def main() -> None:
     bundle_dir = Path("datasets/daily_bundles")
     if bundle_dir.exists():
         shutil.rmtree(bundle_dir)
+    raw_export_dir = Path("datasets/raw_exports")
+    if raw_export_dir.exists():
+        shutil.rmtree(raw_export_dir)
+    finished_data_dir = Path("finished_data")
+    if finished_data_dir.exists():
+        shutil.rmtree(finished_data_dir)
     archive_dir = Path("_smoke_archives")
     if archive_dir.exists():
         archive_dir.rmdir()

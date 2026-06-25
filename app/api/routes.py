@@ -54,6 +54,7 @@ from app.services.data_bundles import (
     list_daily_bundles,
 )
 from app.services.db_diagnostics import database_diagnostics
+from app.services.raw_data_export import create_raw_data_archive, finish_daily_raw_data, raw_data_archive_path
 from app.services.training_service import SERVER_TRAINING_DISABLED_MESSAGE, train_model_job
 from app.training.dataset_accelerator import build_accelerated_dataset
 from app.training.export_dataset import export_dataset, parse_since_date
@@ -1179,6 +1180,34 @@ def data_bundles_cleanup_finished(
     _: None = Depends(require_admin),
 ) -> dict[str, Any]:
     return cleanup_finished_after_download(session)
+
+
+@router.post("/raw-data/finish-day")
+def raw_data_finish_day(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    return finish_daily_raw_data(session, day=payload.get("date") or payload.get("day"))
+
+
+@router.post("/raw-data/export")
+def raw_data_export(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    return create_raw_data_archive(session, payload or {})
+
+
+@router.get("/raw-data/download/{archive_id}")
+def raw_data_download(archive_id: str, _: None = Depends(require_admin)) -> FileResponse:
+    try:
+        path = raw_data_archive_path(archive_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Raw data archive not found") from exc
+    return FileResponse(path, filename=path.name, media_type="application/zip")
 
 
 @router.get("/db/diagnostics")

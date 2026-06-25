@@ -589,11 +589,32 @@ class DataLifecycleService:
             self.state.running = False
 
     def run_cleanup_once(self) -> dict[str, Any]:
+        daily_raw_export: dict[str, Any] | None = None
         with SessionLocal() as session:
-            result = cleanup_old_data(session)
+            try:
+                from app.services.raw_data_export import finish_daily_raw_data
+
+                daily_raw_export = finish_daily_raw_data(session)
+            except Exception as exc:  # pragma: no cover - defensive lifecycle boundary
+                logger.exception("Daily raw data export failed before compact cleanup")
+                daily_raw_export = {
+                    "status": "error",
+                    "message": "Daily raw data export failed before compact cleanup.",
+                    "error": str(exc),
+                }
+            if daily_raw_export.get("status") == "ok":
+                result = cleanup_old_data(session)
+                result["daily_raw_export"] = daily_raw_export
+            else:
+                result = {
+                    "ran_at": datetime.now(timezone.utc).isoformat(),
+                    "mode": "skipped",
+                    "message": "Compact cleanup skipped because daily raw data export failed.",
+                    "daily_raw_export": daily_raw_export,
+                }
         self.state.last_run_at = datetime.now(timezone.utc).isoformat()
         self.state.last_cleanup = result
-        self.state.last_error = None
+        self.state.last_error = None if daily_raw_export is None or daily_raw_export.get("status") == "ok" else daily_raw_export.get("error")
         return self.status()
 
     def compact_once(

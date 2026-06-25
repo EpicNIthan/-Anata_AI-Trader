@@ -7,6 +7,7 @@ trading_lab.db
 _smoke_trading_lab.db
 models/
 datasets/
+finished_data/
 local_data/
 .pytest_cache/
 *.log
