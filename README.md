@@ -415,6 +415,9 @@ python scripts/sync_daily_bundles.py --url $Url --token $Token --days 7 --delete
 
 # If Railway returns 502 during bundle build, wait for redeploy and try smaller first:
 python scripts/sync_daily_bundles.py --url $Url --token $Token --days 1
+
+# If it still fails, compact Railway first and build only the compact training-useful tables:
+python scripts/sync_daily_bundles.py --url $Url --token $Token --days 1 --compact-first
 ```
 
 Each daily bundle contains only useful training data:

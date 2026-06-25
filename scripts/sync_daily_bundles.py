@@ -89,16 +89,29 @@ def main() -> None:
     parser.add_argument("--no-unfinished", action="store_true", help="Do not include today's unfinished bundle.")
     parser.add_argument("--no-extract", action="store_true", help="Keep zip files only.")
     parser.add_argument("--delete-finished-from-railway", action="store_true")
+    parser.add_argument(
+        "--tables",
+        default="candles,news_articles,news_sentiment,external_data_events,training_features,experience_buffer",
+        help="Comma-separated tables to bundle. Default is the compact training-useful set.",
+    )
+    parser.add_argument("--compact-first", action="store_true", help="Run Railway compact cleanup before building bundles.")
     args = parser.parse_args()
 
     manifest: dict = {"files": [], "cleanup": None}
     try:
+        if args.compact_first:
+            manifest["compact_first"] = _json_api(args.url, args.token, "/api/db/compact", method="POST", body={}, timeout=args.timeout)
         build = _json_api(
             args.url,
             args.token,
             "/api/data/bundles/build",
             method="POST",
-            body={"since_date": args.since_date, "days": args.days, "include_unfinished": not args.no_unfinished},
+            body={
+                "since_date": args.since_date,
+                "days": args.days,
+                "include_unfinished": not args.no_unfinished,
+                "tables": args.tables,
+            },
             timeout=args.timeout,
         )
         manifest["build"] = build
@@ -129,7 +142,7 @@ def main() -> None:
         elif "HTTP 502" in str(exc) or "Bad Gateway" in str(exc):
             print("Railway returned 502 while building bundles.")
             print("Most likely the old deployment ran out of memory or Railway is still redeploying.")
-            print("Wait for the latest deployment, then retry. If it still fails, use --days 1 first.")
+            print("Wait for the latest deployment, then retry. If it still fails, use --days 1 --compact-first.")
         else:
             print(f"Bundle sync failed: {exc}")
         raise SystemExit(1) from exc

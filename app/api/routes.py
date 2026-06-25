@@ -1145,11 +1145,17 @@ def data_bundles_build(
     _: None = Depends(require_admin),
 ) -> dict[str, Any]:
     payload = payload or {}
+    tables = payload.get("tables")
+    if isinstance(tables, str):
+        tables = [item.strip() for item in tables.split(",") if item.strip()]
+    if tables is not None and not isinstance(tables, list):
+        raise HTTPException(status_code=400, detail="tables must be a list or comma-separated string")
     return build_daily_bundles(
         session,
         since_date=parse_since_date(payload.get("since_date")),
         days=int(payload["days"]) if payload.get("days") is not None else None,
         include_unfinished=bool(payload.get("include_unfinished", True)),
+        tables=tables,
     )
 
 

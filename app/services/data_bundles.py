@@ -51,6 +51,15 @@ BUNDLE_TABLES = [
     BundleTable("paper_trades", PaperTrade, PaperTrade.created_at),
     BundleTable("account_equity", AccountEquity, AccountEquity.timestamp),
 ]
+BUNDLE_TABLES_BY_NAME = {table.name: table for table in BUNDLE_TABLES}
+DEFAULT_TRAINING_BUNDLE_TABLES = [
+    "candles",
+    "news_articles",
+    "news_sentiment",
+    "external_data_events",
+    "training_features",
+    "experience_buffer",
+]
 
 
 def _utc_day(value: datetime) -> datetime:
@@ -131,10 +140,21 @@ def _write_table(session: Session, path: Path, table: BundleTable, start: dateti
 def _zip_dir(source_dir: Path, output_path: Path) -> None:
     if output_path.exists():
         output_path.unlink()
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    # The member CSV files are already gzip-compressed, so ZIP_STORED saves Railway CPU/memory.
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for path in sorted(source_dir.rglob("*")):
             if path.is_file():
                 archive.write(path, path.relative_to(source_dir.parent))
+
+
+def _selected_tables(tables: list[str] | None = None) -> list[BundleTable]:
+    names = tables or DEFAULT_TRAINING_BUNDLE_TABLES
+    selected = []
+    for name in names:
+        table = BUNDLE_TABLES_BY_NAME.get(str(name).strip())
+        if table is not None:
+            selected.append(table)
+    return selected or [BUNDLE_TABLES_BY_NAME[name] for name in DEFAULT_TRAINING_BUNDLE_TABLES]
 
 
 def build_daily_bundles(
@@ -143,9 +163,11 @@ def build_daily_bundles(
     since_date: datetime | None = None,
     days: int | None = None,
     include_unfinished: bool = True,
+    tables: list[str] | None = None,
 ) -> dict[str, Any]:
     BUNDLE_ROOT.mkdir(parents=True, exist_ok=True)
     current_day = _now_day()
+    selected_tables = _selected_tables(tables)
     bundles = []
     for day in _date_range(session, since_date=since_date, days=days):
         status = "unfinished" if day >= current_day else "finished"
@@ -158,7 +180,7 @@ def build_daily_bundles(
         bundle_dir.mkdir(parents=True, exist_ok=True)
         table_exports = {}
         total_rows = 0
-        for table in BUNDLE_TABLES:
+        for table in selected_tables:
             table_exports[table.name] = _write_table(session, bundle_dir / f"{table.name}.csv.gz", table, day, end)
             total_rows += int(table_exports[table.name]["rows"])
         manifest = {
@@ -169,6 +191,7 @@ def build_daily_bundles(
             "end": end.isoformat(),
             "total_rows": total_rows,
             "tables": table_exports,
+            "table_names": [table.name for table in selected_tables],
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         (bundle_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
