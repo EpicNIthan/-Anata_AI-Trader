@@ -175,7 +175,7 @@
     const requestedTimeframe = state.timeframe;
     const seriesKey = `${requestedSymbol}:${requestedTimeframe}`;
     try {
-      const candles = await api(`/api/market/candles?symbol=${encodeURIComponent(requestedSymbol)}&timeframe=${encodeURIComponent(requestedTimeframe)}&limit=300`);
+      const candles = await api(`/api/market/candles?symbol=${encodeURIComponent(requestedSymbol)}&timeframe=${encodeURIComponent(requestedTimeframe)}&limit=150`);
       if (requestId !== state.chartRequestId || requestedSymbol !== state.symbol || requestedTimeframe !== state.timeframe) return;
 
       if (!candles.length) {
@@ -823,16 +823,18 @@
   }
 
   async function tickFast() {
-    await Promise.all([refreshSummary(), refreshChart()]);
+    await refreshSummary();
   }
 
   function start() {
     wireEvents();
-    setTimeout(setupChart, 300);
+    setupChart();
     tickFast();
-    refreshActiveTab();
+    setTimeout(refreshChart, 1200);
+    setTimeout(refreshActiveTab, 1800);
     setInterval(tickFast, 5000);
-    setInterval(refreshActiveTab, 10000);
+    setInterval(refreshChart, 15000);
+    setInterval(refreshActiveTab, 15000);
   }
 
   if (document.readyState === "loading") {
