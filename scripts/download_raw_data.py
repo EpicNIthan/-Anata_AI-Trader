@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import zipfile
 from pathlib import Path
 from urllib import error, request
 
@@ -65,6 +66,15 @@ def _compact_options(args: argparse.Namespace) -> dict:
     return {key: value for key, value in payload.items() if value is not None}
 
 
+def _zip_manifest(path: Path) -> dict:
+    with zipfile.ZipFile(path) as archive:
+        manifest_names = [name for name in archive.namelist() if name.endswith("manifest.json")]
+        if not manifest_names:
+            raise RuntimeError("Downloaded ZIP does not contain manifest.json; cleanup was not attempted.")
+        with archive.open(manifest_names[0]) as handle:
+            return json.loads(handle.read().decode("utf-8"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download raw Anata trading data from Railway.")
     parser.add_argument("--url", required=True)
@@ -82,22 +92,41 @@ def main() -> None:
     parser.add_argument("--include-experience", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-models", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--symbols", default=None, help="Comma-separated symbols, for example BTCUSDT,ETHUSDT.")
+    parser.add_argument(
+        "--cleanup-after-download",
+        action="store_true",
+        help="After the ZIP is written and manifest is verified, delete Railway export files/finished_data for this range.",
+    )
+    parser.add_argument(
+        "--delete-railway-db-rows",
+        action="store_true",
+        help="With --cleanup-after-download, also delete matching raw DB rows from Railway after successful PC download.",
+    )
+    parser.add_argument(
+        "--delete-all-finished-data",
+        action="store_true",
+        help="With --cleanup-after-download, delete all finished_data folders on Railway, not only the selected date folder.",
+    )
+    parser.add_argument("--keep-railway-archive", action="store_true", help="Do not delete the temporary raw export ZIP from Railway.")
+    parser.add_argument("--keep-railway-finished-data", action="store_true", help="Do not delete finished_data folders from Railway.")
     args = parser.parse_args()
 
     try:
+        export_options = _compact_options(args)
         export = _json_api(
             args.url,
             args.token,
             "/api/raw-data/export",
             method="POST",
-            body=_compact_options(args),
+            body=export_options,
             timeout=args.timeout,
         )
         archive_id = export["archive_id"]
         output = args.output or Path("datasets") / archive_id
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(_api(args.url, args.token, f"/api/raw-data/download/{archive_id}", timeout=args.timeout))
-        manifest = export.get("manifest") or {}
+        local_manifest = _zip_manifest(output)
+        manifest = export.get("manifest") or local_manifest
         result = {
             "status": "ok",
             "output": str(output),
@@ -108,7 +137,27 @@ def main() -> None:
             "time_range": manifest.get("time_range", {}),
             "symbols": manifest.get("symbols", []),
             "warnings": manifest.get("warnings", []),
+            "cleanup": None,
         }
+        if args.cleanup_after_download:
+            cleanup_body = {
+                **export_options,
+                "archive_id": archive_id,
+                "delete_archive": not args.keep_railway_archive,
+                "delete_finished_data": not args.keep_railway_finished_data,
+                "delete_all_finished_data": args.delete_all_finished_data,
+                "delete_db_rows": args.delete_railway_db_rows,
+                "local_manifest_verified": True,
+                "local_file_size_bytes": output.stat().st_size,
+            }
+            result["cleanup"] = _json_api(
+                args.url,
+                args.token,
+                "/api/raw-data/cleanup-downloaded",
+                method="POST",
+                body=cleanup_body,
+                timeout=args.timeout,
+            )
         print(json.dumps(result, indent=2))
     except Exception as exc:
         if _is_timeout(exc):
@@ -122,4 +171,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
