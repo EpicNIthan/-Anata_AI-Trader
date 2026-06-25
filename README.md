@@ -399,6 +399,40 @@ Invoke-RestMethod -Uri "$Url/api/data/collection-report" -Headers @{"x-admin-tok
 
 The dashboard `DB Storage` tab also has a `Collection Report` button. It shows current rows, label coverage, news providers, sentiment models, and the next data-quality improvements.
 
+Simplest daily bundle workflow:
+
+Railway can package useful training data into one folder per UTC day. A complete 24-hour day is marked `finished`; the current day is marked `unfinished`. After your laptop downloads the finished bundles, Railway can delete the finished DB rows and keep only the unfinished current day.
+
+```powershell
+$Url = "https://anataai-trader-production.up.railway.app"
+$Token = "YOUR_ADMIN_TOKEN"
+
+# Download daily zip folders into local_data/daily_bundles/.
+python scripts/sync_daily_bundles.py --url $Url --token $Token --days 7
+
+# Download, then delete finished Railway data. Today's unfinished day remains collecting.
+python scripts/sync_daily_bundles.py --url $Url --token $Token --days 7 --delete-finished-from-railway
+```
+
+Each daily bundle contains only useful training data:
+
+- `candles.csv.gz` closed training-quality candles.
+- `news_articles.csv.gz` raw news for local news AI.
+- `news_sentiment.csv.gz` current sentiment scores.
+- `external_data_events.csv.gz` trader-flow, macro, liquidation, fear/greed, stablecoin context.
+- `features.csv.gz` and `training_features.csv.gz`.
+- `experience_buffer.csv.gz`, `ai_decisions.csv.gz`, `paper_trades.csv.gz`, and `account_equity.csv.gz`.
+
+Recommended normal loop:
+
+1. Railway collects nonstop.
+2. Download daily bundles to your PC.
+3. Delete finished Railway data, keep unfinished day.
+4. Train locally using all folders in `local_data/daily_bundles/`.
+5. Upload model package as candidate.
+6. Activate the model.
+7. Choose `Bot` or `Trained AI` in the dashboard paper runner. Both modes still collect data for later training.
+
 Data lifecycle rules:
 
 - `live_candle_updates` is short-term chart data and is upserted by symbol/timeframe/open time.

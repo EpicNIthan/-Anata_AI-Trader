@@ -47,6 +47,12 @@ from app.features.feature_builder import FeatureBuilder
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, values_from_feature
 from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
+from app.services.data_bundles import (
+    build_daily_bundles,
+    bundle_download_path,
+    cleanup_finished_after_download,
+    list_daily_bundles,
+)
 from app.services.db_diagnostics import database_diagnostics
 from app.services.training_service import SERVER_TRAINING_DISABLED_MESSAGE, train_model_job
 from app.training.dataset_accelerator import build_accelerated_dataset
@@ -860,6 +866,19 @@ async def stop_auto_trader(request: Request, _: None = Depends(require_admin)) -
     return await _auto_trader(request).stop()
 
 
+@router.post("/auto-trader/mode")
+def set_auto_trader_mode(
+    request: Request,
+    payload: dict[str, Any] | None = Body(default=None),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    try:
+        return _auto_trader(request).set_strategy_mode(str(payload.get("mode") or "bot"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/auto-trader/status")
 def auto_trader_status(request: Request) -> dict[str, Any]:
     return _auto_trader(request).status()
@@ -1117,6 +1136,43 @@ def data_collection_report(session: Session = Depends(get_session), include_stor
         "improve_next": recommendations,
         "storage": storage,
     }
+
+
+@router.post("/data/bundles/build")
+def data_bundles_build(
+    payload: dict[str, Any] | None = Body(default=None),
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    payload = payload or {}
+    return build_daily_bundles(
+        session,
+        since_date=parse_since_date(payload.get("since_date")),
+        days=int(payload["days"]) if payload.get("days") is not None else None,
+        include_unfinished=bool(payload.get("include_unfinished", True)),
+    )
+
+
+@router.get("/data/bundles")
+def data_bundles_list(_: None = Depends(require_admin)) -> dict[str, Any]:
+    return list_daily_bundles()
+
+
+@router.get("/data/bundles/download/{bundle_id}")
+def data_bundle_download(bundle_id: str, _: None = Depends(require_admin)) -> FileResponse:
+    try:
+        path = bundle_download_path(bundle_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Bundle not found") from exc
+    return FileResponse(path, filename=path.name, media_type="application/zip")
+
+
+@router.post("/data/bundles/cleanup-finished")
+def data_bundles_cleanup_finished(
+    session: Session = Depends(get_session),
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
+    return cleanup_finished_after_download(session)
 
 
 @router.get("/db/diagnostics")

@@ -86,6 +86,7 @@ def main() -> None:
     uploaded_model_file: Path | None = None
     sentiment_upload_path: Path | None = None
     archive_paths: list[Path] = []
+    bundle_paths: list[Path] = []
     if db_path.exists():
         db_path.unlink()
     with engine.begin() as conn:
@@ -569,6 +570,12 @@ def main() -> None:
         auto_start = client.post("/api/auto-trader/start", auth=auth)
         assert auto_start.status_code == 200, auto_start.text
         assert auto_start.json()["running"] is True, auto_start.text
+        mode_model = client.post("/api/auto-trader/mode", json={"mode": "model"}, auth=auth)
+        assert mode_model.status_code == 200, mode_model.text
+        assert mode_model.json()["strategy_mode"] == "model", mode_model.text
+        mode_bot = client.post("/api/auto-trader/mode", json={"mode": "bot"}, auth=auth)
+        assert mode_bot.status_code == 200, mode_bot.text
+        assert mode_bot.json()["strategy_mode"] == "bot", mode_bot.text
 
         auto_status = {}
         for _ in range(20):
@@ -715,6 +722,22 @@ def main() -> None:
         assert dry_run.returncode == 0, dry_run.stderr or dry_run.stdout
         assert '"labeled_rows": 0' not in dry_run.stdout, dry_run.stdout
 
+        bundles_build = client.post("/api/data/bundles/build", json={"days": 2, "include_unfinished": True}, auth=auth)
+        assert bundles_build.status_code == 200, bundles_build.text
+        assert bundles_build.json()["bundles"], bundles_build.text
+        bundles_list = client.get("/api/data/bundles", auth=auth)
+        assert bundles_list.status_code == 200, bundles_list.text
+        first_bundle = bundles_list.json()["bundles"][0]
+        bundle_download = client.get(first_bundle["download_url"], auth=auth)
+        assert bundle_download.status_code == 200, bundle_download.text
+        assert len(bundle_download.content) > 0, bundles_list.text
+        cleanup_finished = client.post("/api/data/bundles/cleanup-finished", auth=auth)
+        assert cleanup_finished.status_code == 200, cleanup_finished.text
+        assert cleanup_finished.json()["kept_unfinished_day"] is True, cleanup_finished.text
+        bundle_root = Path("datasets/daily_bundles")
+        if bundle_root.exists():
+            bundle_paths = list(bundle_root.glob("*"))
+
         auto_stop = client.post("/api/auto-trader/stop", auth=auth)
         assert auto_stop.status_code == 200, auto_stop.text
         assert auto_stop.json()["running"] is False, auto_stop.text
@@ -744,6 +767,14 @@ def main() -> None:
     for archive_path in archive_paths:
         if archive_path.exists():
             archive_path.unlink()
+    for bundle_path in bundle_paths:
+        if bundle_path.is_dir():
+            shutil.rmtree(bundle_path)
+        elif bundle_path.exists():
+            bundle_path.unlink()
+    bundle_dir = Path("datasets/daily_bundles")
+    if bundle_dir.exists():
+        shutil.rmtree(bundle_dir)
     archive_dir = Path("_smoke_archives")
     if archive_dir.exists():
         archive_dir.rmdir()

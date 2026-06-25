@@ -85,6 +85,13 @@
   const number = (value, digits = 2) => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits }) : "-";
   const pct = (value, digits = 2) => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(digits)}%` : "-";
   const mb = (value) => Number.isFinite(Number(value)) ? `${Number(value).toFixed(2)} MB` : "-";
+  const bytes = (value) => {
+    const size = Number(value);
+    if (!Number.isFinite(size)) return "-";
+    if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(2)} MB`;
+    if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${size.toFixed(0)} B`;
+  };
   const when = (value) => value ? new Date(value).toLocaleString() : "-";
   const cls = (value) => Number(value) >= 0 ? "positive" : "negative";
   const featureValue = (value) => Number.isFinite(Number(value)) ? Number(value).toFixed(6) : escapeHtml(value ?? "-");
@@ -303,6 +310,8 @@
       setText("derivativesDiagnostics", JSON.stringify(data.derivatives || {}, null, 2));
       setText("externalDiagnostics", JSON.stringify(data.external || {}, null, 2));
       setText("autoDiagnostics", JSON.stringify(data.auto_trader, null, 2));
+      const modeSelect = $("autoTraderModeSelect");
+      if (modeSelect && data.auto_trader?.strategy_mode) modeSelect.value = data.auto_trader.strategy_mode;
       const trading = data.trading || {};
       setText("strategyTradeCount", number(trading.strategy_trades, 0));
       setText("explorationTradeCount", number(trading.exploration_trades, 0));
@@ -312,7 +321,8 @@
       setText("tradeWarning", trading.latest_warning || "");
       setText("lastStrategyReason", lastAction.reason ? `Reason: ${lastAction.reason}` : "");
       setText("holdReasons", (trading.hold_reasons || []).map((item) => `${when(item.time)} ${item.symbol} ${item.action}/${item.status}: ${item.reason || "-"}`).join("\n"));
-      setText("tradeFlowMode", data.auto_trader?.exploration_enabled ? `explore ${pct(data.auto_trader?.exploration_rate || 0, 1)}` : "strategy");
+      const runnerMode = data.auto_trader?.strategy_mode === "model" ? "trained AI" : "bot";
+      setText("tradeFlowMode", data.auto_trader?.exploration_enabled ? `${runnerMode} + explore ${pct(data.auto_trader?.exploration_rate || 0, 1)}` : runnerMode);
     } catch (error) {
       setText("marketStatus", "Error");
       setClass("marketStatus", "warning");
@@ -498,6 +508,27 @@
     }
   }
 
+  async function refreshDailyBundles() {
+    const body = $("dailyBundlesBody");
+    if (!body) return;
+    try {
+      const data = await api("/api/data/bundles");
+      const rows = data.bundles || [];
+      body.innerHTML = rows.length ? rows.map((row) => `
+        <tr>
+          <td>${escapeHtml(row.bundle_id)}</td>
+          <td>${escapeHtml(row.day || "-")}</td>
+          <td>${escapeHtml(row.status || "-")}</td>
+          <td>${number(row.total_rows || 0, 0)}</td>
+          <td>${bytes(row.size_bytes)}</td>
+          <td><a href="${escapeHtml(row.download_url)}">Download</a></td>
+        </tr>
+      `).join("") : `<tr><td colspan="6" class="empty">No daily bundles yet</td></tr>`;
+    } catch (error) {
+      body.innerHTML = `<tr><td colspan="6" class="empty">Bundle list failed: ${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
   async function refreshModels() {
     const body = $("modelsBody");
     if (!body) return;
@@ -588,7 +619,7 @@
       else if (state.activeTab === "training") {
         await Promise.all([refreshModels(), refreshLabelStatus()]);
       } else if (state.activeTab === "storage") {
-        await Promise.all([refreshStorageDiagnostics(), refreshCollectionReport()]);
+        await Promise.all([refreshStorageDiagnostics(), refreshCollectionReport(), refreshDailyBundles()]);
       } else if (state.activeTab === "diagnostics") {
         await refreshDbDiagnostics();
       }
@@ -605,6 +636,24 @@
   async function autoTraderAction(action) {
     await api(`/api/auto-trader/${action}`, { method: "POST" });
     await refreshSummary();
+  }
+
+  async function setAutoTraderMode() {
+    const select = $("autoTraderModeSelect");
+    const output = $("signalResult");
+    const mode = select?.value || "bot";
+    if (output) output.textContent = `Switching paper runner to ${mode}...`;
+    try {
+      const data = await api("/api/auto-trader/mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      if (output) output.textContent = `Paper runner mode: ${data.strategy_mode}`;
+      await refreshSummary();
+    } catch (error) {
+      if (output) output.textContent = `Mode switch failed: ${error.message}`;
+    }
   }
 
   async function sendSignal(payload) {
@@ -688,33 +737,6 @@
     }
   }
 
-  async function trainModel() {
-    const output = $("exportResult") || $("dbActionResult");
-    if (output) output.textContent = "Training model from compact features. This can take a little while...";
-    try {
-      const data = await api("/api/training/train-model", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          build_dataset: true,
-          days: 14,
-          max_rows_per_symbol: 5000,
-          lookback: 60,
-          stride: 5,
-          replay_limit: 20000,
-          backfill: true,
-          use_all_data: true,
-        }),
-      });
-      if (output) output.textContent = data.status === "started" ? "Training started in background. You can keep using the dashboard." : JSON.stringify(data, null, 2);
-      await refreshSummary();
-      await refreshFeatures();
-      await refreshDbDiagnostics();
-    } catch (error) {
-      if (output) output.textContent = `Train model failed: ${error.message}`;
-    }
-  }
-
   async function runCleanup() {
     const output = $("dbActionResult");
     if (output) output.textContent = "Cleaning...";
@@ -746,6 +768,38 @@
       await refreshSummary();
     } catch (error) {
       if (output) output.textContent = `Compact failed: ${error.message}`;
+    }
+  }
+
+  async function buildDailyBundles() {
+    const output = $("dbStorageActionResult") || $("dbActionResult");
+    if (output) output.textContent = "Building daily bundles...";
+    try {
+      const data = await api("/api/data/bundles/build", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ days: 7, include_unfinished: true }),
+      });
+      if (output) output.textContent = `Built ${data.bundles?.length || 0} daily bundles. Download them before cleanup.`;
+      await refreshDailyBundles();
+      await refreshCollectionReport();
+    } catch (error) {
+      if (output) output.textContent = `Build bundles failed: ${error.message}`;
+    }
+  }
+
+  async function cleanupFinishedBundles() {
+    const output = $("dbStorageActionResult") || $("dbActionResult");
+    if (output) output.textContent = "Deleting finished Railway data...";
+    try {
+      const data = await api("/api/data/bundles/cleanup-finished", { method: "POST" });
+      if (output) output.textContent = `Deleted finished data. Kept unfinished day. ${JSON.stringify(data.deleted_rows || {})}`;
+      await refreshDailyBundles();
+      await refreshStorageDiagnostics();
+      await refreshCollectionReport();
+      await refreshSummary();
+    } catch (error) {
+      if (output) output.textContent = `Cleanup finished bundles failed: ${error.message}`;
     }
   }
 
@@ -815,9 +869,9 @@
     });
     $("newsProviderFilter")?.addEventListener("change", refreshNews);
     $("signalForm")?.addEventListener("submit", submitSignal);
+    $("saveAutoTraderModeButton")?.addEventListener("click", setAutoTraderMode);
     $("buildDatasetButton")?.addEventListener("click", buildTrainingDataset);
     $("buildLabelsButton")?.addEventListener("click", buildLabels);
-    $("trainModelButton")?.addEventListener("click", trainModel);
     $("exportDatasetButton")?.addEventListener("click", () => exportDataset("exportResult"));
     $("exportLabeledDatasetButton")?.addEventListener("click", () => exportDataset("exportResult"));
     $("refreshModelsButton")?.addEventListener("click", refreshModels);
@@ -826,6 +880,8 @@
     $("compactDbButton")?.addEventListener("click", () => compactDatabase(false));
     $("compactArchiveDbButton")?.addEventListener("click", () => compactDatabase(true));
     $("collectionReportButton")?.addEventListener("click", refreshCollectionReport);
+    $("buildDailyBundlesButton")?.addEventListener("click", buildDailyBundles);
+    $("cleanupFinishedBundlesButton")?.addEventListener("click", cleanupFinishedBundles);
     $("archiveDataButton")?.addEventListener("click", archiveData);
     $("reprocessSentimentButton")?.addEventListener("click", reprocessSentiment);
     document.querySelectorAll("[data-worker]").forEach((button) => button.addEventListener("click", () => collectorAction(button.dataset.worker, button.dataset.action)));

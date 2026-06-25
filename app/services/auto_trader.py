@@ -40,6 +40,7 @@ class AutoTraderState:
     last_decision: dict[str, Any] | None = None
     model_strategy_enabled: bool = False
     model_fallback_reason: str | None = None
+    strategy_mode: str = "bot"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,6 +64,7 @@ class AutoTraderService:
             exploration_enabled=settings.exploration_mode and settings.is_paper_mode,
             exploration_rate=settings.exploration_rate,
             model_strategy_enabled=settings.auto_trader_use_trained_model,
+            strategy_mode="model" if settings.auto_trader_use_trained_model else "bot",
         )
         self._rng = random.Random()
         self._task: asyncio.Task[None] | None = None
@@ -87,6 +89,20 @@ class AutoTraderService:
                 "max_entry_fee_pct_of_equity": settings.risk_max_entry_fee_pct_of_equity,
             },
         }
+
+    def set_strategy_mode(self, mode: str) -> dict[str, Any]:
+        normalized = mode.strip().lower()
+        if normalized in {"ai", "trained", "trained-model", "existing-model"}:
+            normalized = "model"
+        if normalized in {"rule", "rule-based", "strategy"}:
+            normalized = "bot"
+        if normalized not in {"bot", "model"}:
+            raise ValueError("strategy mode must be bot or model")
+        self.state.strategy_mode = normalized
+        self.state.model_strategy_enabled = normalized == "model"
+        if normalized == "bot":
+            self.state.model_fallback_reason = None
+        return self.status()
 
     async def start(self) -> dict[str, Any]:
         if self._task and not self._task.done():
@@ -172,8 +188,9 @@ class AutoTraderService:
         )
         fallback_decision = RuleBasedStrategy().decide(feature)
         model_strategy = PriceModelStrategy()
-        model_decision = model_strategy.decide(session, feature) if settings.auto_trader_use_trained_model else None
-        if settings.auto_trader_use_trained_model and model_decision is None:
+        use_model = self.state.strategy_mode == "model"
+        model_decision = model_strategy.decide(session, feature) if use_model else None
+        if use_model and model_decision is None:
             self.state.model_fallback_reason = model_strategy.last_fallback_reason
         elif model_decision:
             self.state.model_fallback_reason = None
