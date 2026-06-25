@@ -50,6 +50,10 @@ def main() -> None:
     parser.add_argument("--start-paper-trader-if-pass", action="store_true")
     parser.add_argument("--target", default="target_trade_quality_score")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--news-converter", choices=["smart", "finbert", "cryptobert", "rule-based"], default="smart")
+    parser.add_argument("--cleanup-railway-after-download", action="store_true", help="Delete Railway raw export files/finished_data after local ZIP verification.")
+    parser.add_argument("--delete-railway-db-rows", action="store_true", help="With cleanup, delete matching raw DB rows from Railway after verified PC download.")
+    parser.add_argument("--delete-all-finished-data", action="store_true", help="With cleanup, delete every finished_data folder on Railway.")
     args = parser.parse_args()
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -78,6 +82,12 @@ def main() -> None:
         download_command += ["--until-date", args.until_date]
     if args.use_all_data:
         download_command += ["--use-all-data"]
+    if args.cleanup_railway_after_download:
+        download_command += ["--cleanup-after-download"]
+    if args.delete_railway_db_rows:
+        download_command += ["--delete-railway-db-rows"]
+    if args.delete_all_finished_data:
+        download_command += ["--delete-all-finished-data"]
     manifest["steps"]["download_raw_data"] = _run_step(download_command, name="Download raw data")
 
     prepared = _run_step(
@@ -88,6 +98,8 @@ def main() -> None:
             str(raw_zip),
             "--output-dir",
             str(run_dir / "processed"),
+            "--news-converter",
+            args.news_converter,
         ],
         name="Prepare training data",
     )
@@ -162,4 +174,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
