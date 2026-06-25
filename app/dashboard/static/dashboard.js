@@ -470,6 +470,34 @@
     }
   }
 
+  async function refreshCollectionReport() {
+    const output = $("collectionReportBox");
+    if (!output) return;
+    try {
+      const data = await api("/api/data/collection-report");
+      const counts = data.counts || {};
+      const coverage = data.coverage || {};
+      const collecting = data.collecting_now || {};
+      const improve = data.improve_next || [];
+      output.textContent = [
+        "Railway role: temporary data factory",
+        `Candles: ${number(counts.candles || 0, 0)} (${number(coverage.candle_days || 0, 2)} days)`,
+        `News: ${number(counts.news || 0, 0)} (${number(coverage.news_days || 0, 2)} days)`,
+        `Sentiment rows: ${number(counts.sentiment || 0, 0)}`,
+        `Training features: ${number(counts.training_features || 0, 0)}`,
+        `Labeled rows: ${number(coverage.labeled_rows || 0, 0)} (${pct(coverage.label_coverage_pct || 0, 1)})`,
+        `Experiences: ${number(counts.experiences || 0, 0)}`,
+        `News providers: ${JSON.stringify(collecting.news || {})}`,
+        `Sentiment models: ${JSON.stringify(collecting.sentiment_models || {})}`,
+        "",
+        "Improve next:",
+        ...improve.map((item) => `- ${item}`),
+      ].join("\n");
+    } catch (error) {
+      output.textContent = `Collection report failed: ${error.message}`;
+    }
+  }
+
   async function refreshModels() {
     const body = $("modelsBody");
     if (!body) return;
@@ -560,7 +588,7 @@
       else if (state.activeTab === "training") {
         await Promise.all([refreshModels(), refreshLabelStatus()]);
       } else if (state.activeTab === "storage") {
-        await refreshStorageDiagnostics();
+        await Promise.all([refreshStorageDiagnostics(), refreshCollectionReport()]);
       } else if (state.activeTab === "diagnostics") {
         await refreshDbDiagnostics();
       }
@@ -714,6 +742,7 @@
       if (output) output.textContent = `Compact done. Deleted ${JSON.stringify(cleanup.deleted || {})}; compacted ${JSON.stringify(cleanup.compacted || {})}`;
       await refreshDbDiagnostics();
       await refreshStorageDiagnostics();
+      await refreshCollectionReport();
       await refreshSummary();
     } catch (error) {
       if (output) output.textContent = `Compact failed: ${error.message}`;
@@ -796,6 +825,7 @@
     $("runCleanupButton")?.addEventListener("click", runCleanup);
     $("compactDbButton")?.addEventListener("click", () => compactDatabase(false));
     $("compactArchiveDbButton")?.addEventListener("click", () => compactDatabase(true));
+    $("collectionReportButton")?.addEventListener("click", refreshCollectionReport);
     $("archiveDataButton")?.addEventListener("click", archiveData);
     $("reprocessSentimentButton")?.addEventListener("click", reprocessSentiment);
     document.querySelectorAll("[data-worker]").forEach((button) => button.addEventListener("click", () => collectorAction(button.dataset.worker, button.dataset.action)));

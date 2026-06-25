@@ -164,16 +164,32 @@ def compact_database(
     *,
     archive_before_delete: bool = False,
     archive_tables: list[str] | None = None,
+    factory_mode: bool = False,
+    keep_recent_days: int | None = None,
 ) -> dict[str, Any]:
-    raw_payload_cutoff = _cutoff(hours=settings.raw_payload_retention_hours)
-    live_cutoff = _cutoff(hours=settings.live_update_retention_hours)
-    raw_tick_cutoff = _cutoff(days=settings.raw_tick_retention_days)
-    raw_external_event_cutoff = _cutoff(days=settings.raw_external_event_retention_days)
-    raw_news_text_cutoff = _cutoff(days=settings.raw_news_text_retention_days)
-    account_equity_cutoff = _cutoff(days=settings.account_equity_retention_days)
-    external_data_cutoff = _cutoff(days=settings.external_data_retention_days)
-    closed_candle_cutoff = _cutoff(days=settings.keep_closed_candles_days)
-    training_feature_cutoff = _cutoff(days=settings.training_feature_retention_days)
+    raw_payload_hours = 0 if factory_mode else settings.raw_payload_retention_hours
+    live_update_hours = 0 if factory_mode else settings.live_update_retention_hours
+    raw_news_text_days = 0 if factory_mode else settings.raw_news_text_retention_days
+    raw_tick_days = 0 if factory_mode else settings.raw_tick_retention_days
+    raw_external_days = keep_recent_days if factory_mode and keep_recent_days is not None else settings.raw_external_event_retention_days
+    account_equity_days = min(1, keep_recent_days) if factory_mode and keep_recent_days is not None else settings.account_equity_retention_days
+    external_data_days = keep_recent_days if factory_mode and keep_recent_days is not None else settings.external_data_retention_days
+    closed_candle_days = keep_recent_days if factory_mode and keep_recent_days is not None else settings.keep_closed_candles_days
+    training_feature_days = keep_recent_days if factory_mode and keep_recent_days is not None else settings.training_feature_retention_days
+    experience_days = keep_recent_days if factory_mode and keep_recent_days is not None else settings.experience_retention_days
+    raw_news_days = keep_recent_days if factory_mode and keep_recent_days is not None else settings.raw_news_retention_days
+
+    raw_payload_cutoff = _cutoff(hours=raw_payload_hours)
+    live_cutoff = _cutoff(hours=live_update_hours)
+    raw_tick_cutoff = _cutoff(days=raw_tick_days)
+    raw_external_event_cutoff = _cutoff(days=raw_external_days)
+    raw_news_text_cutoff = _cutoff(days=raw_news_text_days)
+    account_equity_cutoff = _cutoff(days=account_equity_days)
+    external_data_cutoff = _cutoff(days=external_data_days)
+    closed_candle_cutoff = _cutoff(days=closed_candle_days)
+    training_feature_cutoff = _cutoff(days=training_feature_days)
+    experience_cutoff = _cutoff(days=experience_days)
+    raw_news_cutoff = _cutoff(days=raw_news_days)
 
     archived: dict[str, Any] | None = None
     if archive_before_delete:
@@ -203,6 +219,15 @@ def compact_database(
         deleted_raw_ticks = _rowcount(session.execute(delete(MarketTick)))
     deleted_old_closed_candles = _rowcount(
         session.execute(delete(Candle).where(Candle.is_closed.is_(True), Candle.open_time < closed_candle_cutoff))
+    )
+    old_news_article_ids = select(NewsArticle.id).where(NewsArticle.created_at < raw_news_cutoff)
+    deleted_old_news_sentiment = _rowcount(session.execute(delete(NewsSentiment).where(NewsSentiment.article_id.in_(old_news_article_ids))))
+    deleted_old_news_articles = _rowcount(session.execute(delete(NewsArticle).where(NewsArticle.created_at < raw_news_cutoff)))
+    deleted_old_training_features = _rowcount(
+        session.execute(delete(TrainingFeature).where(TrainingFeature.as_of < training_feature_cutoff))
+    )
+    deleted_old_experiences = _rowcount(
+        session.execute(delete(ExperienceRecord).where(ExperienceRecord.created_at < experience_cutoff))
     )
     compacted_candles = _rowcount(
         session.execute(
@@ -296,13 +321,28 @@ def compact_database(
     return {
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "mode": "compact",
-        "retention": retention_config(),
+        "factory_mode": factory_mode,
+        "keep_recent_days": keep_recent_days,
+        "retention": retention_config()
+        | {
+            "effective_raw_payload_retention_hours": raw_payload_hours,
+            "effective_live_update_retention_hours": live_update_hours,
+            "effective_raw_news_text_retention_days": raw_news_text_days,
+            "effective_closed_candle_retention_days": closed_candle_days,
+            "effective_training_feature_retention_days": training_feature_days,
+            "effective_experience_retention_days": experience_days,
+            "effective_raw_news_retention_days": raw_news_days,
+        },
         "archived": archived,
         "deleted": {
             "live_candle_updates": deleted_live_updates,
             "legacy_live_candles": deleted_legacy_live_candles,
             "market_ticks": deleted_raw_ticks,
             "old_closed_candles": deleted_old_closed_candles,
+            "old_news_articles": deleted_old_news_articles,
+            "old_news_sentiment": deleted_old_news_sentiment,
+            "old_training_features": deleted_old_training_features,
+            "old_experiences": deleted_old_experiences,
             "account_equity": deleted_account_equity,
             "external_data_events": deleted_external_events,
         },
@@ -475,12 +515,16 @@ class DataLifecycleService:
         *,
         archive_before_delete: bool = False,
         archive_tables: list[str] | None = None,
+        factory_mode: bool = False,
+        keep_recent_days: int | None = None,
     ) -> dict[str, Any]:
         with SessionLocal() as session:
             result = compact_database(
                 session,
                 archive_before_delete=archive_before_delete,
                 archive_tables=archive_tables,
+                factory_mode=factory_mode,
+                keep_recent_days=keep_recent_days,
             )
         self.state.last_run_at = datetime.now(timezone.utc).isoformat()
         self.state.last_cleanup = result

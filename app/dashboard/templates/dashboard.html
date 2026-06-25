@@ -301,8 +301,10 @@
           <div class="panel-tools">
             <button id="compactDbButton" class="primary">Compact DB</button>
             <button id="compactArchiveDbButton" class="secondary">Archive + Compact</button>
+            <button id="collectionReportButton" class="secondary">Collection Report</button>
             <output id="dbStorageActionResult"></output>
           </div>
+          <pre id="collectionReportBox" class="log-box compact-log"></pre>
           <table>
             <thead><tr><th>Table</th><th>Rows</th><th>MB</th><th>Raw/JSON MB</th><th>Oldest</th><th>Newest</th></tr></thead>
             <tbody id="dbStorageBody"><tr><td colspan="6" class="empty">Loading storage diagnostics</td></tr></tbody>
@@ -328,6 +330,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v14"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v15"></script>
   </body>
 </html>

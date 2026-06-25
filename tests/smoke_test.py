@@ -536,6 +536,10 @@ def main() -> None:
         db_storage = client.get("/api/db/storage", auth=auth)
         assert db_storage.status_code == 200, db_storage.text
         assert "rows_by_table" in db_storage.json(), db_storage.text
+        collection_report = client.get("/api/data/collection-report?include_storage=true", auth=auth)
+        assert collection_report.status_code == 200, collection_report.text
+        assert "improve_next" in collection_report.json(), collection_report.text
+        assert collection_report.json()["counts"]["candles"] > 0, collection_report.text
         storage_status = client.get("/api/storage/status", auth=auth)
         assert storage_status.status_code == 200, storage_status.text
         assert "top_largest_tables" in storage_status.json(), storage_status.text
@@ -660,6 +664,9 @@ def main() -> None:
         assert closed_candles_after_compact == closed_candles_before_compact
         assert training_features_after_compact == training_features_before_compact
         assert model_versions_after_compact == model_versions_before_compact
+        factory_compact = client.post("/api/db/compact", json={"factory_mode": True, "keep_recent_days": 365}, auth=auth)
+        assert factory_compact.status_code == 200, factory_compact.text
+        assert factory_compact.json()["last_cleanup"]["factory_mode"] is True, factory_compact.text
 
         cleanup = client.post("/api/db/cleanup", auth=auth)
         assert cleanup.status_code == 200, cleanup.text

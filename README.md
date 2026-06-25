@@ -367,6 +367,38 @@ python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-typ
 
 This loop can be repeated: collect more data on Railway, download raw news/dataset again, score/train on your laptop, upload a new candidate model, activate only after metrics look good.
 
+Simple laptop data-factory workflow:
+
+Railway should be treated as a temporary collector, not your long-term warehouse. Your PC keeps the permanent archive under `local_data/`, and Railway keeps collecting fresh data after cleanup.
+
+```powershell
+$Url = "https://anataai-trader-production.up.railway.app"
+$Token = "YOUR_ADMIN_TOKEN"
+
+# Download raw news, labeled training dataset, and a collection report into local_data/YYYYMMDD_HHMMSS/.
+python scripts/sync_laptop_data.py --url $Url --token $Token --since-date 2026-06-24
+
+# Same download, then compact Railway only after the files are written successfully.
+python scripts/sync_laptop_data.py --url $Url --token $Token --since-date 2026-06-24 --clear-railway-after-download --railway-keep-days 7
+```
+
+The sync folder contains:
+
+- `training_dataset.csv.gz` for local model training.
+- `raw_news.csv.gz` for heavier local news-to-number processing.
+- `collection_report_before.json` showing what Railway collected.
+- `manifest.json` with file sizes, row counts, export IDs, and cleanup result.
+
+Use `local_data/` as your laptop data lake. Keep every dated folder. When training, combine the older local datasets with the newest download so the model learns from all history while Railway only stores recent working data.
+
+To see what Railway is collecting right now:
+
+```powershell
+Invoke-RestMethod -Uri "$Url/api/data/collection-report" -Headers @{"x-admin-token"=$Token}
+```
+
+The dashboard `DB Storage` tab also has a `Collection Report` button. It shows current rows, label coverage, news providers, sentiment models, and the next data-quality improvements.
+
 Data lifecycle rules:
 
 - `live_candle_updates` is short-term chart data and is upserted by symbol/timeframe/open time.

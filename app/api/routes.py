@@ -7,7 +7,7 @@ import json
 import logging
 import shutil
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -513,6 +513,24 @@ def _aware_dt(value: datetime | None) -> datetime | None:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def _table_count(session: Session, model: Any) -> int:
+    return int(session.scalar(select(func.count(model.id))) or 0)
+
+
+def _latest_model_time(session: Session, model: Any, column: Any) -> datetime | None:
+    return session.scalar(select(func.max(column)))
+
+
+def _days_covered(oldest: datetime | None, newest: datetime | None) -> float:
+    if oldest is None or newest is None:
+        return 0.0
+    old = _aware_dt(oldest)
+    new = _aware_dt(newest)
+    if old is None or new is None:
+        return 0.0
+    return round(max((new - old).total_seconds() / 86400, 0.0), 2)
+
+
 def _fast_market_snapshot(session: Session, collector_state: dict[str, Any] | None = None) -> dict[str, Any]:
     latest_by_symbol: list[dict[str, Any]] = []
     latest_time: datetime | None = None
@@ -630,6 +648,50 @@ def _data_coverage(session: Session) -> dict[str, Any]:
         "label_warning": label_info.get("warning"),
         "feature_schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
     }
+
+
+def _collection_recommendations(
+    *,
+    counts: dict[str, int],
+    labels: dict[str, Any],
+    storage: dict[str, Any] | None,
+    latest_candle: datetime | None,
+    latest_news: datetime | None,
+    provider_counts: dict[str, int],
+    sentiment_models: dict[str, int],
+) -> list[str]:
+    recommendations: list[str] = []
+    now = datetime.now(timezone.utc)
+    candle_age = (now - _aware_dt(latest_candle)).total_seconds() if latest_candle else None
+    news_age = (now - _aware_dt(latest_news)).total_seconds() if latest_news else None
+    if counts.get("candles", 0) < 10_000:
+        recommendations.append("Keep collecting closed candles. More symbols and more days help the model see different market regimes.")
+    if candle_age is None or candle_age > 600:
+        recommendations.append("Market candles look stale. Check market collector/backfill before exporting a new dataset.")
+    if counts.get("news", 0) == 0:
+        recommendations.append("News is empty. Enable RSS and GDELT collectors before training a news-aware model.")
+    if news_age is None or news_age > 6 * 3600:
+        recommendations.append("Latest news is old. Run the news collector once or check RSS/GDELT status.")
+    if not provider_counts.get("rss"):
+        recommendations.append("RSS news has no rows. RSS is the best free real-time-ish crypto news source right now.")
+    if not provider_counts.get("gdelt"):
+        recommendations.append("GDELT has no rows. Fixing it improves macro/world-risk features.")
+    if counts.get("sentiment", 0) < max(1, int(counts.get("news", 0) * 0.7)):
+        recommendations.append("Many news rows do not have sentiment yet. Download raw news, score on laptop, then upload sentiment.")
+    if sentiment_models and all("rule-based" in name or "fallback" in name for name in sentiment_models):
+        recommendations.append("Sentiment is still mostly rule-based. Use laptop Hugging Face scoring for stronger news numbers.")
+    if (labels.get("rows_with_target_trade_quality_score") or 0) == 0 and counts.get("training_features", 0) > 0:
+        recommendations.append("Training features exist but labels are missing. Build labels after enough future candles are available.")
+    if (labels.get("label_coverage_pct") or 0) < 50 and counts.get("training_features", 0) > 1000:
+        recommendations.append("Label coverage is low. Build labels or export an older date range with enough future candles.")
+    if counts.get("experiences", 0) < 500:
+        recommendations.append("Experience rows are still low. More paper-trading cycles will help evaluate action-result behavior.")
+    total_mb = ((storage or {}).get("database_total") or {}).get("mb") if storage else None
+    if total_mb and total_mb > 300:
+        recommendations.append("Railway DB is getting large. Run laptop sync with --clear-railway-after-download.")
+    if not recommendations:
+        recommendations.append("Data pipeline looks usable. Next best step is laptop scoring/training and candidate model evaluation.")
+    return recommendations
 
 
 def _decision_source(row: AiDecision) -> str:
@@ -940,6 +1002,123 @@ async def liquidations_run_once(
     return result.__dict__
 
 
+@router.get("/data/collection-report")
+def data_collection_report(session: Session = Depends(get_session), include_storage: bool = False) -> dict[str, Any]:
+    label_info = label_status(session)
+    candle_count = _table_count(session, Candle)
+    news_count = _table_count(session, NewsArticle)
+    sentiment_count = _table_count(session, NewsSentiment)
+    feature_count = _table_count(session, Feature)
+    training_feature_count = _table_count(session, TrainingFeature)
+    experience_count = _table_count(session, ExperienceRecord)
+    external_count = _table_count(session, ExternalDataEvent)
+    trade_count = _table_count(session, PaperTrade)
+    latest_candle_time = _latest_model_time(session, Candle, Candle.open_time)
+    oldest_candle_time = session.scalar(select(func.min(Candle.open_time)))
+    latest_news_time = _latest_model_time(session, NewsArticle, NewsArticle.published_at)
+    oldest_news_time = session.scalar(select(func.min(NewsArticle.published_at)))
+    latest_training_feature_time = _latest_model_time(session, TrainingFeature, TrainingFeature.as_of)
+    provider_counts = {
+        str(source_name or "unknown"): int(count)
+        for source_name, count in session.execute(
+            select(NewsArticle.source_name, func.count(NewsArticle.id)).group_by(NewsArticle.source_name)
+        ).all()
+    }
+    sentiment_models = {
+        str(model_name or "unknown"): int(count)
+        for model_name, count in session.execute(
+            select(NewsSentiment.model_name, func.count(NewsSentiment.id)).group_by(NewsSentiment.model_name)
+        ).all()
+    }
+    external_counts = {
+        str(source_name or "unknown"): int(count)
+        for source_name, count in session.execute(
+            select(ExternalDataEvent.source_name, func.count(ExternalDataEvent.id)).group_by(ExternalDataEvent.source_name)
+        ).all()
+    }
+    candle_groups = [
+        {
+            "symbol": symbol,
+            "timeframe": interval,
+            "quality": "closed_training" if is_closed else "live_only",
+            "rows": int(count),
+            "oldest": _dt(oldest),
+            "newest": _dt(newest),
+        }
+        for symbol, interval, is_closed, count, oldest, newest in session.execute(
+            select(
+                Candle.symbol,
+                Candle.interval,
+                Candle.is_closed,
+                func.count(Candle.id),
+                func.min(Candle.open_time),
+                func.max(Candle.open_time),
+            )
+            .group_by(Candle.symbol, Candle.interval, Candle.is_closed)
+            .order_by(Candle.symbol, Candle.interval, Candle.is_closed.desc())
+        ).all()
+    ]
+    counts = {
+        "candles": candle_count,
+        "news": news_count,
+        "sentiment": sentiment_count,
+        "features": feature_count,
+        "training_features": training_feature_count,
+        "experiences": experience_count,
+        "external_data_events": external_count,
+        "paper_trades": trade_count,
+    }
+    storage = database_diagnostics(session, include_raw_estimates=True) if include_storage else None
+    recommendations = _collection_recommendations(
+        counts=counts,
+        labels=label_info,
+        storage=storage,
+        latest_candle=latest_candle_time,
+        latest_news=latest_news_time,
+        provider_counts=provider_counts,
+        sentiment_models=sentiment_models,
+    )
+    return {
+        "railway_role": "temporary data factory: collect, build/export datasets, run paper inference; laptop stores long-term data and trains heavy models",
+        "pc_role": "long-term data lake and heavy training machine",
+        "counts": counts,
+        "coverage": {
+            "candle_days": _days_covered(oldest_candle_time, latest_candle_time),
+            "news_days": _days_covered(oldest_news_time, latest_news_time),
+            "latest_candle_time": _dt(latest_candle_time),
+            "latest_news_time": _dt(latest_news_time),
+            "latest_training_feature_time": _dt(latest_training_feature_time),
+            "label_coverage_pct": label_info.get("label_coverage_pct", 0.0),
+            "labeled_rows": label_info.get("rows_with_target_trade_quality_score", 0),
+        },
+        "collecting_now": {
+            "market_closed_candles": "training-quality OHLCV rows in candles where is_closed=true",
+            "live_chart_candles": "short-term in-progress rows in live_candle_updates",
+            "news": provider_counts,
+            "sentiment_models": sentiment_models,
+            "external_context": external_counts,
+            "paper_experience": "ai_decisions, experience_buffer, paper_trades, positions, account_equity",
+        },
+        "candles_by_symbol_timeframe": candle_groups,
+        "labels": label_info,
+        "recommended_laptop_folders": {
+            "raw_news": "local_data/<run>/raw_news.csv.gz",
+            "training_dataset": "local_data/<run>/training_dataset.csv.gz",
+            "reports": "local_data/<run>/collection_report_before.json",
+            "models": "models/",
+            "packages": "model_packages/",
+        },
+        "simple_workflow": [
+            "Run scripts/sync_laptop_data.py from your laptop.",
+            "Confirm local_data/<run>/manifest.json has nonzero dataset/news rows.",
+            "Use --clear-railway-after-download to compact Railway only after the files are downloaded.",
+            "Train locally from all saved local_data folders, upload candidate model, activate only after metrics look good.",
+        ],
+        "improve_next": recommendations,
+        "storage": storage,
+    }
+
+
 @router.get("/db/diagnostics")
 def db_diagnostics(session: Session = Depends(get_session), include_raw_estimates: bool = False) -> dict[str, Any]:
     return database_diagnostics(session, include_raw_estimates=include_raw_estimates)
@@ -1013,6 +1192,8 @@ def db_compact(
     return _data_lifecycle(request).compact_once(
         archive_before_delete=bool(payload.get("archive_before_delete", False)),
         archive_tables=tables,
+        factory_mode=bool(payload.get("factory_mode", False)),
+        keep_recent_days=int(payload["keep_recent_days"]) if payload.get("keep_recent_days") is not None else None,
     )
 
 
