@@ -10,6 +10,8 @@ from app.config import settings
 from app.db.models import AccountEquity, Candle, LiveCandleUpdate, PaperTrade, Position
 from app.trading.risk_manager import RiskManager
 
+BROKER_TAKER_FEE_RATE = 0.0004
+
 
 @dataclass(frozen=True)
 class ExecutionResult:
@@ -128,7 +130,9 @@ class PaperEngine:
         notional = max_notional
         margin_required = min(margin_required or (notional / max(leverage, 1.0)), account.cash_balance)
         quantity = notional / price
-        fee = notional * settings.paper_fee_rate
+        fee_rate = self._paper_fee_rate()
+        fee = self._paper_fee(notional, fee_rate)
+        realized_pnl = -fee
         if quantity <= 0:
             return ExecutionResult("REJECTED", "Computed quantity was zero.")
         if margin_required + fee > account.cash_balance:
@@ -149,6 +153,7 @@ class PaperEngine:
                 leverage=leverage,
                 stop_loss=stop_loss if stop_loss is not None else self._default_stop_loss(price, side),
                 take_profit=take_profit if take_profit is not None else self._default_take_profit(price, side),
+                realized_pnl=realized_pnl,
                 status="OPEN",
             )
             self.session.add(position)
@@ -163,6 +168,7 @@ class PaperEngine:
             existing_position.margin_used = existing_margin + margin_required
             existing_position.notional = combined_quantity * existing_position.entry_price
             existing_position.leverage = leverage
+            existing_position.realized_pnl += realized_pnl
             existing_position.stop_loss = stop_loss or existing_position.stop_loss or self._default_stop_loss(
                 existing_position.entry_price,
                 side,
@@ -182,13 +188,15 @@ class PaperEngine:
             price=price,
             notional=notional,
             fee=fee,
-            realized_pnl=0.0,
+            realized_pnl=realized_pnl,
             status="FILLED",
             reason=reason,
             raw_payload={
                 "paper_leverage": leverage,
                 "margin_required": margin_required,
-                "fee_rate": settings.paper_fee_rate,
+                "gross_pnl": 0.0,
+                "fee_rate": fee_rate,
+                "fee_model": "binance_usdm_futures_taker_style",
                 "intent": "open" if existing_position is None else "increase",
             },
         )
@@ -203,7 +211,7 @@ class PaperEngine:
         self.session.refresh(trade)
         return ExecutionResult(
             "FILLED",
-            f"Paper {side} {action} filled at {leverage:g}x using ${margin_required:,.2f} margin.",
+            f"Paper {side} {action} filled at {leverage:g}x using ${margin_required:,.2f} margin and ${fee:,.4f} fee.",
             trade_id=trade.id,
             balance=equity_row.cash_balance,
             equity=equity_row.equity,
@@ -226,7 +234,8 @@ class PaperEngine:
         original_quantity = existing_position.quantity
         close_quantity = min(requested_quantity or original_quantity, original_quantity)
         proceeds = close_quantity * price
-        fee = proceeds * settings.paper_fee_rate
+        fee_rate = self._paper_fee_rate()
+        fee = self._paper_fee(proceeds, fee_rate)
         gross_pnl = self._gross_pnl(existing_position.side, existing_position.entry_price, price, close_quantity)
         realized_pnl = gross_pnl - fee
         account = self._latest_account(create=True)
@@ -261,7 +270,8 @@ class PaperEngine:
                 "paper_leverage": existing_position.leverage or settings.paper_leverage,
                 "released_margin": released_margin,
                 "gross_pnl": gross_pnl,
-                "fee_rate": settings.paper_fee_rate,
+                "fee_rate": fee_rate,
+                "fee_model": "binance_usdm_futures_taker_style",
                 "requested_action": requested_action,
                 "intent": "close",
             },
@@ -275,7 +285,7 @@ class PaperEngine:
         self.session.refresh(trade)
         return ExecutionResult(
             "FILLED",
-            f"Paper {existing_position.side.upper()} closed; released ${released_margin:,.2f} margin.",
+            f"Paper {existing_position.side.upper()} closed; released ${released_margin:,.2f} margin and paid ${fee:,.4f} fee.",
             trade_id=trade.id,
             balance=equity_row.cash_balance,
             equity=equity_row.equity,
@@ -363,6 +373,14 @@ class PaperEngine:
         if side.upper() == "SHORT":
             return (entry_price - exit_price) * quantity
         return (exit_price - entry_price) * quantity
+
+    def _paper_fee_rate(self) -> float:
+        return settings.paper_fee_rate if settings.paper_fee_rate > 0 else BROKER_TAKER_FEE_RATE
+
+    def _paper_fee(self, notional: float, fee_rate: float) -> float:
+        if notional <= 0 or fee_rate <= 0:
+            return 0.0
+        return round(notional * fee_rate, 10)
 
     def _closing_trade_action(self, side: str, requested_action: str) -> str:
         if requested_action == "CLOSE":
