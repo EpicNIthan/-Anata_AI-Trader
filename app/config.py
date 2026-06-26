@@ -150,7 +150,7 @@ class Settings:
     enable_market_collector: bool = field(default_factory=lambda: _bool("ENABLE_MARKET_COLLECTOR", True))
     enable_news_collector: bool = field(default_factory=lambda: _bool("ENABLE_NEWS_COLLECTOR", True))
     auto_trader_enabled: bool = field(default_factory=lambda: _bool("AUTO_TRADER_ENABLED", True))
-    auto_trader_use_trained_model: bool = field(default_factory=lambda: _bool("AUTO_TRADER_USE_TRAINED_MODEL", True))
+    auto_trader_use_trained_model: bool = field(default_factory=lambda: _bool("AUTO_TRADER_USE_TRAINED_MODEL", False))
     auto_trader_interval_seconds: int = field(default_factory=lambda: _int("AUTO_TRADER_INTERVAL_SECONDS", 60))
     auto_trader_symbols: list[str] = field(default_factory=lambda: _csv(os.getenv("AUTO_TRADER_SYMBOLS"), DEFAULT_SYMBOLS))
     paper_trade_timeframe: str = os.getenv("PAPER_TRADE_TIMEFRAME", "1m")
