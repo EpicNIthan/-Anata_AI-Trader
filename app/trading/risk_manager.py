@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -35,9 +36,12 @@ class RiskManager:
         equity: float,
         requested_notional: float | None,
         existing_position: Position | None,
+        requested_leverage: float | None = None,
+        requested_margin_pct: float | None = None,
     ) -> RiskResult:
         normalized_action = action.upper()
         intent, side = self._intent(normalized_action, existing_position)
+        has_ai_plan = requested_leverage is not None or requested_margin_pct is not None
 
         if intent == "hold":
             return RiskResult(True, "Hold action does not create market exposure.", 0.0, intent=intent)
@@ -59,6 +63,17 @@ class RiskManager:
                 allocation_pct=0.0,
                 intent=intent,
                 side=existing_position.side.upper(),
+            )
+
+        if has_ai_plan:
+            return self._evaluate_ai_plan(
+                intent=intent,
+                side=side,
+                cash_balance=cash_balance,
+                equity=equity,
+                requested_notional=requested_notional,
+                requested_leverage=requested_leverage,
+                requested_margin_pct=requested_margin_pct,
             )
 
         if confidence < settings.risk_min_confidence:
@@ -112,6 +127,57 @@ class RiskManager:
             side=side,
         )
 
+    def _evaluate_ai_plan(
+        self,
+        *,
+        intent: str,
+        side: str | None,
+        cash_balance: float,
+        equity: float,
+        requested_notional: float | None,
+        requested_leverage: float | None,
+        requested_margin_pct: float | None,
+    ) -> RiskResult:
+        leverage = self._planned_leverage(requested_leverage)
+        if leverage is None:
+            return RiskResult(False, "AI trade plan rejected: leverage must be finite and positive.", 0.0, intent=intent, side=side)
+        if leverage > settings.paper_max_leverage:
+            return RiskResult(
+                False,
+                f"AI trade plan rejected: leverage {leverage:g}x is above max executable {settings.paper_max_leverage:g}x.",
+                0.0,
+                intent=intent,
+                side=side,
+            )
+        allocation_pct = self._planned_margin_pct(requested_margin_pct)
+        if allocation_pct is None:
+            return RiskResult(False, "AI trade plan rejected: margin_pct must be finite and positive.", 0.0, intent=intent, side=side)
+        if allocation_pct > 1.0:
+            return RiskResult(False, "AI trade plan rejected: margin_pct cannot exceed 100% of equity.", 0.0, intent=intent, side=side)
+        max_margin = min(
+            cash_balance / (1.0 + settings.paper_fee_rate * leverage),
+            equity * allocation_pct,
+        )
+        max_notional = max_margin * leverage
+        if requested_notional is not None:
+            max_notional = min(max_notional, requested_notional)
+            max_margin = max_notional / leverage
+        if max_notional <= 0:
+            return RiskResult(False, "AI trade plan rejected: no cash is available for execution.", 0.0, intent=intent, side=side)
+        return RiskResult(
+            True,
+            (
+                f"AI trade plan accepted for {side} paper futures: "
+                f"{allocation_pct:.2%} margin at {leverage:g}x."
+            ),
+            max_notional,
+            margin_required=max_margin,
+            leverage=leverage,
+            allocation_pct=allocation_pct,
+            intent=intent,
+            side=side,
+        )
+
     def _intent(self, action: str, existing_position: Position | None) -> tuple[str, str | None]:
         if action == "HOLD":
             return "hold", None
@@ -147,6 +213,24 @@ class RiskManager:
         confidence_scale = max(0.0, min(1.0, (confidence - settings.risk_min_confidence) / span))
         return max(0.0, min(settings.risk_max_trade_size_pct, settings.risk_max_trade_size_pct * confidence_scale))
 
+    def _planned_leverage(self, value: float | None) -> float | None:
+        try:
+            leverage = float(value if value is not None else settings.paper_leverage)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(leverage) or leverage <= 0:
+            return None
+        return leverage
+
+    def _planned_margin_pct(self, value: float | None) -> float | None:
+        try:
+            margin_pct = float(value if value is not None else settings.risk_max_trade_size_pct)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(margin_pct) or margin_pct <= 0:
+            return None
+        return margin_pct
+
     def _daily_realized_pnl(self) -> float:
         now = datetime.now(timezone.utc)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -160,7 +244,7 @@ class RiskManager:
     def _cooldown_active(self, equity: float) -> bool:
         if settings.risk_cooldown_minutes <= 0:
             return False
-        since = datetime.now(timezone.utc) - timedelta(minutes=settings.risk_cooldown_minutes)
+        since = datetime.now(timezone.utc) - timedelta(minutes=max(settings.risk_cooldown_minutes, 0))
         latest_loss = self.session.scalar(
             select(PaperTrade)
             .where(PaperTrade.created_at >= since, PaperTrade.realized_pnl < 0)
