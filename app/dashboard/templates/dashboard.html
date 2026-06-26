@@ -290,11 +290,6 @@
             <thead><tr><th>Status</th><th>Model ID</th><th>Version</th><th>Type</th><th>Schema</th><th>Metrics</th><th>Created</th><th>Action</th></tr></thead>
             <tbody id="modelsBody"><tr><td colspan="8" class="empty">Loading models</td></tr></tbody>
           </table>
-          <button id="buildDatasetButton" class="primary">Build Training Dataset</button>
-          <button id="buildLabelsButton" class="secondary">Build Labels</button>
-          <button id="exportDatasetButton" class="primary">Export Dataset</button>
-          <button id="exportLabeledDatasetButton" class="primary">Export Labeled Dataset</button>
-          <pre id="exportResult" class="log-box"></pre>
         </section>
 
         <section id="tab-storage" class="tab-panel">
@@ -306,22 +301,6 @@
             <div><span>Retention</span><strong id="dbRetentionSummary">-</strong></div>
           </div>
           <p id="dbStorageWarning" class="warning"></p>
-          <div class="panel-tools">
-            <button id="compactDbButton" class="primary">Compact DB</button>
-            <button id="compactArchiveDbButton" class="secondary">Archive + Compact</button>
-            <button id="collectionReportButton" class="secondary">Collection Report</button>
-            <button id="finishRawDataButton" class="secondary">Run Daily Finish Data Export</button>
-            <button id="exportRawDataButton" class="primary">Export Raw Data</button>
-            <button id="pipelineGuideButton" class="secondary">Full Local Pipeline Command</button>
-            <button id="buildDailyBundlesButton" class="primary">Build Daily Bundles</button>
-            <button id="cleanupFinishedBundlesButton" class="secondary">Delete Finished After Download</button>
-            <output id="dbStorageActionResult"></output>
-          </div>
-          <pre id="collectionReportBox" class="log-box compact-log"></pre>
-          <table>
-            <thead><tr><th>Bundle</th><th>Day</th><th>Status</th><th>Rows</th><th>Size</th><th>Download</th></tr></thead>
-            <tbody id="dailyBundlesBody"><tr><td colspan="6" class="empty">No bundles loaded</td></tr></tbody>
-          </table>
           <table>
             <thead><tr><th>Table</th><th>Rows</th><th>MB</th><th>Raw/JSON MB</th><th>Oldest</th><th>Newest</th></tr></thead>
             <tbody id="dbStorageBody"><tr><td colspan="6" class="empty">Loading storage diagnostics</td></tr></tbody>
@@ -329,12 +308,6 @@
         </section>
 
         <section id="tab-diagnostics" class="tab-panel">
-          <div class="panel-tools">
-            <button id="runCleanupButton" class="primary">Run Cleanup</button>
-            <button id="archiveDataButton" class="secondary">Archive Data</button>
-            <button id="exportDatasetDiagnosticsButton" class="secondary">Export Dataset</button>
-            <output id="dbActionResult"></output>
-          </div>
           <div class="diagnostics-grid">
             <pre id="marketDiagnostics" class="log-box"></pre>
             <pre id="newsDiagnostics" class="log-box"></pre>
@@ -347,6 +320,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v17"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v18"></script>
   </body>
 </html>
