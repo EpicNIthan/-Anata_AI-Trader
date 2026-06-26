@@ -30,6 +30,12 @@ SYMBOL_KEYWORDS = {
 }
 
 
+class NewsProviderCooldown(Exception):
+    def __init__(self, message: str, *, cooldown_seconds: int) -> None:
+        super().__init__(message)
+        self.cooldown_seconds = cooldown_seconds
+
+
 def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -280,7 +286,14 @@ class GdeltProvider(BaseNewsProvider):
         response = await client.get(url)
         self._last_response_code = response.status_code
         response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            preview = response.text[:160].replace("\n", " ").strip()
+            raise NewsProviderCooldown(
+                f"GDELT returned HTTP 200 with non-JSON/empty body. Cooling down. Body preview: {preview or '<empty>'}",
+                cooldown_seconds=max(self.min_interval_seconds, 900),
+            ) from exc
         articles: list[NormalizedArticle] = []
         for item in payload.get("articles", []):
             title = item.get("title") or ""
@@ -490,7 +503,11 @@ class NewsCollector:
                     status.last_error = provider.last_warning
                     total_saved += saved
                 except Exception as exc:
-                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                    if isinstance(exc, NewsProviderCooldown):
+                        _set_provider_cooldown(provider.provider, exc.cooldown_seconds)
+                        status.last_error = str(exc)
+                        logger.warning("News provider cooldown: %s (%s)", provider.provider, status.last_error)
+                    elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
                         cooldown_seconds = max(provider.min_interval_seconds, 900)
                         _set_provider_cooldown(provider.provider, cooldown_seconds)
                         status.last_error = (
@@ -628,4 +645,4 @@ class NewsCollector:
     @staticmethod
     def _is_warning(message: str) -> bool:
         lowered = message.lower()
-        return "rate limit" in lowered or "429" in lowered or "cooling down" in lowered
+        return "rate limit" in lowered or "429" in lowered or "cooling down" in lowered or "non-json" in lowered
