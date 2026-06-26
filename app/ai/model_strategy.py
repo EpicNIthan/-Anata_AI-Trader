@@ -61,6 +61,7 @@ class PriceModelStrategy:
         confidence = self._confidence(predicted_return, required_edge)
         values = values_from_feature(feature, feature_columns)
         last_close = values.get("last_close")
+        trade_plan = self._trade_plan(confidence=confidence, predicted_return=predicted_return)
 
         prediction = {
             "model_id": model.model_id,
@@ -70,6 +71,7 @@ class PriceModelStrategy:
             "predicted_return": predicted_return,
             "required_edge_after_fees": required_edge,
             "confidence": confidence,
+            "trade_plan": trade_plan,
         }
 
         if abs(predicted_return) < required_edge:
@@ -81,6 +83,7 @@ class PriceModelStrategy:
                         "Trained model edge is too small after fees "
                         f"({predicted_return:.4%} prediction vs {required_edge:.4%} required)."
                     ),
+                    max_hold_seconds=trade_plan["max_hold_seconds"],
                 ),
                 model,
                 prediction,
@@ -93,11 +96,14 @@ class PriceModelStrategy:
                 action=action,
                 confidence=confidence,
                 reason=(
-                    f"Trained model predicts {predicted_return:.4%} {side.lower()} edge "
-                    f"after feature schema {model.feature_schema_version}."
+                    f"Trained model trade plan: {predicted_return:.4%} {side.lower()} edge, "
+                    f"{trade_plan['margin_pct']:.2%} margin, {trade_plan['leverage']:.2f}x leverage."
                 ),
-                stop_loss=self._price_level(last_close, side, stop=True),
+                stop_loss=self._price_level(last_close, side, stop=True, predicted_return=predicted_return),
                 take_profit=self._price_level(last_close, side, stop=False, predicted_return=predicted_return),
+                margin_pct=trade_plan["margin_pct"],
+                leverage=trade_plan["leverage"],
+                max_hold_seconds=trade_plan["max_hold_seconds"],
             ),
             model,
             prediction,
@@ -164,6 +170,23 @@ class PriceModelStrategy:
         scale = abs(predicted_return) / max(required_edge * 4.0, 1e-9)
         return max(settings.risk_min_confidence, min(0.95, 0.55 + scale * 0.40))
 
+    def _trade_plan(self, *, confidence: float, predicted_return: float) -> dict[str, float | int]:
+        confidence_span = max(1.0 - settings.risk_min_confidence, 1e-9)
+        confidence_scale = max(0.0, min(1.0, (confidence - settings.risk_min_confidence) / confidence_span))
+        edge_scale = max(0.0, min(1.0, abs(predicted_return) / 0.02))
+        plan_scale = max(confidence_scale, edge_scale * 0.65)
+        max_margin_pct = min(max(settings.risk_max_trade_size_pct, 0.01), 1.0)
+        margin_pct = max(0.0025, max_margin_pct * plan_scale)
+        max_leverage = max(settings.paper_max_leverage, settings.paper_min_leverage, 1.0)
+        min_leverage = min(max(settings.paper_min_leverage, 1.0), max_leverage)
+        leverage = min_leverage + (max_leverage - min_leverage) * plan_scale
+        max_hold_seconds = int(900 + (settings.auto_max_hold_seconds - 900) * max(0.0, 1.0 - edge_scale))
+        return {
+            "margin_pct": margin_pct,
+            "leverage": leverage,
+            "max_hold_seconds": max_hold_seconds,
+        }
+
     def _price_level(
         self,
         price: Any,
@@ -179,10 +202,10 @@ class PriceModelStrategy:
         if mark <= 0:
             return None
         if stop:
-            offset = settings.auto_default_stop_loss_pct
+            offset = max(settings.auto_default_stop_loss_pct, min(0.08, abs(predicted_return) * 0.75))
             multiplier = 1.0 - offset if side == "LONG" else 1.0 + offset
             return round(mark * multiplier, 8)
 
-        offset = max(settings.auto_default_take_profit_pct, abs(predicted_return) * 1.5)
+        offset = max(settings.auto_default_take_profit_pct, min(0.20, abs(predicted_return) * 2.5))
         multiplier = 1.0 + offset if side == "LONG" else 1.0 - offset
         return round(mark * multiplier, 8)
