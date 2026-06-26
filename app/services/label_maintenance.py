@@ -29,7 +29,7 @@ class LabelMaintenanceState:
 class LabelMaintenanceService:
     """Build training labels automatically as future closed candles become available."""
 
-    def __init__(self, *, interval_seconds: int = 900, batch_limit: int = 50_000) -> None:
+    def __init__(self, *, interval_seconds: int = 900, batch_limit: int = 5_000) -> None:
         self.interval_seconds = max(interval_seconds, 60)
         self.batch_limit = max(batch_limit, 100)
         self.state = LabelMaintenanceState(interval_seconds=self.interval_seconds)
