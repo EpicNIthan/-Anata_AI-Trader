@@ -490,15 +490,24 @@ class NewsCollector:
                     status.last_error = provider.last_warning
                     total_saved += saved
                 except Exception as exc:
-                    logger.exception("News provider failed: %s", provider.provider)
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
-                        _set_provider_cooldown(provider.provider, max(provider.min_interval_seconds, 900))
+                        cooldown_seconds = max(provider.min_interval_seconds, 900)
+                        _set_provider_cooldown(provider.provider, cooldown_seconds)
                         status.last_error = (
                             f"{provider.provider.upper()} rate limit (HTTP 429). "
-                            f"Cooling down for {max(provider.min_interval_seconds, 900)}s."
+                            f"Cooling down for {cooldown_seconds}s."
+                        )
+                        logger.warning("News provider rate-limited: %s (%s)", provider.provider, status.last_error)
+                    elif isinstance(exc, httpx.HTTPStatusError):
+                        status.last_error = _sanitize_error(exc)
+                        logger.warning(
+                            "News provider returned HTTP %s: %s",
+                            exc.response.status_code,
+                            provider.provider,
                         )
                     else:
                         status.last_error = _sanitize_error(exc)
+                        logger.exception("News provider failed: %s", provider.provider)
                 finally:
                     status.running = False
                     self._apply_provider_diagnostics(status, provider)
