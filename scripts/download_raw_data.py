@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import socket
+import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,6 +62,8 @@ def _compact_options(args: argparse.Namespace) -> dict:
     if args.finished_only:
         until_date = until_date or _finished_cutoff_iso(args.finished_older_than_hours)
         use_all_data = False
+    if args.daily_files:
+        use_all_data = True if not args.date and not args.since_date and not args.until_date else use_all_data
     payload = {
         "date": args.date,
         "since_date": args.since_date,
@@ -74,6 +77,7 @@ def _compact_options(args: argparse.Namespace) -> dict:
         "include_models": args.include_models,
         "finished_only": args.finished_only,
         "finished_older_than_hours": args.finished_older_than_hours if args.finished_only else None,
+        "daily_files": args.daily_files,
     }
     if args.symbols:
         payload["symbols"] = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
@@ -82,11 +86,32 @@ def _compact_options(args: argparse.Namespace) -> dict:
 
 def _zip_manifest(path: Path) -> dict:
     with zipfile.ZipFile(path) as archive:
-        manifest_names = [name for name in archive.namelist() if name.endswith("manifest.json")]
+        manifest_names = [name for name in archive.namelist() if name.endswith("manifest.json") or name.endswith("daily_manifest.json")]
         if not manifest_names:
             raise RuntimeError("Downloaded ZIP does not contain manifest.json; cleanup was not attempted.")
-        with archive.open(manifest_names[0]) as handle:
+        manifest_name = sorted(manifest_names, key=lambda name: (not name.endswith("daily_manifest.json"), name))[0]
+        with archive.open(manifest_name) as handle:
             return json.loads(handle.read().decode("utf-8"))
+
+
+def _split_daily_archive(archive_path: Path, output_dir: Path) -> dict[str, object]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="anata_daily_raw_") as temp_dir:
+        temp_root = Path(temp_dir)
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(temp_root)
+        root = temp_root / "daily_raw_data"
+        if not root.exists():
+            raise RuntimeError("Daily archive did not contain daily_raw_data folder.")
+        for day_folder in sorted(path for path in root.iterdir() if path.is_dir()):
+            output_path = output_dir / f"raw_{day_folder.name}.zip"
+            with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                for path in sorted(day_folder.rglob("*")):
+                    if path.is_file():
+                        archive.write(path, path.relative_to(day_folder))
+            written.append(str(output_path))
+    return {"daily_file_count": len(written), "daily_files": written}
 
 
 def main() -> None:
@@ -94,11 +119,13 @@ def main() -> None:
     parser.add_argument("--url", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=Path("datasets/raw_days"))
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--date", default=None)
     parser.add_argument("--since-date", default=None)
     parser.add_argument("--until-date", default=None)
     parser.add_argument("--use-all-data", action="store_true")
+    parser.add_argument("--daily-files", action="store_true", help="Download all selected data split into one local raw_YYYY-MM-DD.zip per day, including current under-24h day.")
     parser.add_argument(
         "--finished-only",
         action="store_true",
@@ -138,10 +165,11 @@ def main() -> None:
 
     try:
         export_options = _compact_options(args)
+        export_path = "/api/raw-data/export-daily" if args.daily_files else "/api/raw-data/export"
         export = _json_api(
             args.url,
             args.token,
-            "/api/raw-data/export",
+            export_path,
             method="POST",
             body=export_options,
             timeout=args.timeout,
@@ -150,27 +178,36 @@ def main() -> None:
         if args.output is None and args.finished_only:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             output = Path("datasets") / "raw_finished" / f"raw_finished_until_{stamp}.zip"
+        elif args.output is None and args.daily_files:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            output = args.output_dir / f"raw_daily_bundle_{stamp}.zip"
         else:
             output = args.output or Path("datasets") / archive_id
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(_api(args.url, args.token, f"/api/raw-data/download/{archive_id}", timeout=args.timeout))
         local_manifest = _zip_manifest(output)
         manifest = export.get("manifest") or local_manifest
+        split_result = _split_daily_archive(output, args.output_dir) if args.daily_files else None
         result = {
             "status": "ok",
             "output": str(output),
             "file_size_bytes": output.stat().st_size,
             "archive_id": archive_id,
-            "row_counts": manifest.get("row_counts", {}),
+            "row_counts": manifest.get("row_counts", manifest.get("total_row_counts", {})),
             "file_sizes": manifest.get("file_sizes", {}),
             "time_range": manifest.get("time_range", {}),
             "symbols": manifest.get("symbols", []),
             "warnings": manifest.get("warnings", []),
+            "daily_split": split_result,
             "cleanup": None,
         }
         if args.cleanup_after_download:
+            cleanup_options = dict(export_options)
+            if args.daily_files and args.delete_railway_db_rows:
+                cleanup_options["until_date"] = _finished_cutoff_iso(args.finished_older_than_hours)
+                cleanup_options["use_all_data"] = False
             cleanup_body = {
-                **export_options,
+                **cleanup_options,
                 "archive_id": archive_id,
                 "delete_archive": not args.keep_railway_archive,
                 "delete_finished_data": not args.keep_railway_finished_data,
@@ -190,7 +227,7 @@ def main() -> None:
         print(json.dumps(result, indent=2))
     except Exception as exc:
         if _is_timeout(exc):
-            print("Raw data export timed out. Retry with --date YYYY-MM-DD, --news-only, --finished-only, or a smaller --since-date range.")
+            print("Raw data export timed out. Retry with --date YYYY-MM-DD, --news-only, --finished-only, --daily-files, or a smaller --since-date range.")
         elif "HTTP 502" in str(exc) or "Bad Gateway" in str(exc):
             print("Railway returned 502 while exporting raw data. Wait for redeploy/restart, then retry a smaller range.")
         else:
