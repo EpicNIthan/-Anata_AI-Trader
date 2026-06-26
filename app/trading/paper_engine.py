@@ -11,6 +11,8 @@ from app.db.models import AccountEquity, Candle, LiveCandleUpdate, PaperTrade, P
 from app.trading.risk_manager import RiskManager
 
 BROKER_TAKER_FEE_RATE = 0.0004
+DUST_QUANTITY = 1e-8
+DUST_NOTIONAL = 0.01
 
 
 @dataclass(frozen=True)
@@ -127,14 +129,25 @@ class PaperEngine:
         existing_position: Position | None,
     ) -> ExecutionResult:
         account = self._latest_account(create=True)
+        if price <= 0:
+            return ExecutionResult("REJECTED", "Execution price must be positive.", balance=account.cash_balance, equity=account.equity)
         notional = max_notional
+        if notional < settings.min_paper_trade_notional:
+            return ExecutionResult(
+                "REJECTED",
+                f"Paper trade notional ${notional:,.4f} is below the ${settings.min_paper_trade_notional:,.2f} minimum.",
+                balance=account.cash_balance,
+                equity=account.equity,
+            )
         margin_required = min(margin_required or (notional / max(leverage, 1.0)), account.cash_balance)
         quantity = notional / price
         fee_rate = self._paper_fee_rate()
         fee = self._paper_fee(notional, fee_rate)
         realized_pnl = -fee
-        if quantity <= 0:
-            return ExecutionResult("REJECTED", "Computed quantity was zero.")
+        if quantity <= DUST_QUANTITY:
+            return ExecutionResult("REJECTED", "Computed quantity was dust-sized.", balance=account.cash_balance, equity=account.equity)
+        if fee <= 0:
+            return ExecutionResult("REJECTED", "Computed fee was zero; paper trade is too small.", balance=account.cash_balance, equity=account.equity)
         if margin_required + fee > account.cash_balance:
             return ExecutionResult("REJECTED", "Not enough paper cash for margin plus fee.")
 
@@ -231,15 +244,33 @@ class PaperEngine:
             account = self._latest_account(create=True)
             return ExecutionResult("REJECTED", "No open paper futures position exists to close.", balance=account.cash_balance, equity=account.equity)
 
-        original_quantity = existing_position.quantity
+        account = self._latest_account(create=True)
+        original_quantity = max(existing_position.quantity or 0.0, 0.0)
+        margin_before = existing_position.margin_used or self._fallback_margin(existing_position)
+        if original_quantity <= DUST_QUANTITY:
+            return self._close_dust_position(
+                symbol=symbol,
+                price=price,
+                position=existing_position,
+                account=account,
+                margin_before=margin_before,
+            )
+
         close_quantity = min(requested_quantity or original_quantity, original_quantity)
         proceeds = close_quantity * price
+        if close_quantity <= DUST_QUANTITY or proceeds <= DUST_NOTIONAL:
+            return self._close_dust_position(
+                symbol=symbol,
+                price=price,
+                position=existing_position,
+                account=account,
+                margin_before=margin_before,
+            )
+
         fee_rate = self._paper_fee_rate()
         fee = self._paper_fee(proceeds, fee_rate)
         gross_pnl = self._gross_pnl(existing_position.side, existing_position.entry_price, price, close_quantity)
         realized_pnl = gross_pnl - fee
-        account = self._latest_account(create=True)
-        margin_before = existing_position.margin_used or self._fallback_margin(existing_position)
         released_margin = margin_before * (close_quantity / original_quantity) if original_quantity else margin_before
         cash_after = account.cash_balance + released_margin + gross_pnl - fee
 
@@ -287,6 +318,32 @@ class PaperEngine:
             "FILLED",
             f"Paper {existing_position.side.upper()} closed; released ${released_margin:,.2f} margin and paid ${fee:,.4f} fee.",
             trade_id=trade.id,
+            balance=equity_row.cash_balance,
+            equity=equity_row.equity,
+        )
+
+    def _close_dust_position(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        position: Position,
+        account: AccountEquity,
+        margin_before: float,
+    ) -> ExecutionResult:
+        released_margin = max(margin_before, 0.0)
+        position.quantity = 0.0
+        position.current_price = price
+        position.margin_used = 0.0
+        position.notional = 0.0
+        position.unrealized_pnl = 0.0
+        position.status = "CLOSED"
+        position.closed_at = datetime.now(timezone.utc)
+        equity_row = self._record_equity(account.cash_balance + released_margin, price_by_symbol={symbol: price})
+        self.session.commit()
+        return ExecutionResult(
+            "HELD",
+            f"Ignored dust paper position for {symbol}; no zero-quantity trade was recorded.",
             balance=equity_row.cash_balance,
             equity=equity_row.equity,
         )
