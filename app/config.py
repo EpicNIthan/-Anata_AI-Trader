@@ -160,7 +160,7 @@ class Settings:
     paper_max_leverage: float = field(default_factory=lambda: _float("PAPER_MAX_LEVERAGE", 125.0))
     paper_confidence_leverage_enabled: bool = field(default_factory=lambda: _bool("PAPER_CONFIDENCE_LEVERAGE_ENABLED", True))
     risk_max_entry_fee_pct_of_equity: float = field(default_factory=lambda: _float("RISK_MAX_ENTRY_FEE_PCT_OF_EQUITY", 0.01))
-    risk_max_trade_size_pct: float = field(default_factory=lambda: _float("RISK_MAX_TRADE_SIZE_PCT", 0.50))
+    risk_max_trade_size_pct: float = field(default_factory=lambda: _float("RISK_MAX_TRADE_SIZE_PCT", 0.10))
     risk_max_daily_loss_pct: float = field(default_factory=lambda: _float("RISK_MAX_DAILY_LOSS_PCT", 0.05))
     risk_max_open_positions: int = field(default_factory=lambda: _int("RISK_MAX_OPEN_POSITIONS", 10))
     risk_min_confidence: float = field(default_factory=lambda: _float("RISK_MIN_CONFIDENCE", 0.55))
