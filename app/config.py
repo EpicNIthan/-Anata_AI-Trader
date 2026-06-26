@@ -47,7 +47,14 @@ def _secret(name: str) -> str | None:
     if value in (None, ""):
         return None
     cleaned = value.strip()
-    placeholders = {"your_news_api_key", "your_real_key_here", "your_api_key_here", "change_me"}
+    placeholders = {
+        "your_news_api_key",
+        "your_real_key_here",
+        "your_api_key_here",
+        "your_huggingface_token",
+        "hf_your_token_here",
+        "change_me",
+    }
     if cleaned.lower() in placeholders:
         return None
     return cleaned
@@ -65,9 +72,7 @@ def _database_url() -> str:
 @dataclass(frozen=True)
 class Settings:
     database_url: str = field(default_factory=_database_url)
-    binance_symbols: list[str] = field(
-        default_factory=lambda: _csv(os.getenv("BINANCE_SYMBOLS"), DEFAULT_SYMBOLS)
-    )
+    binance_symbols: list[str] = field(default_factory=lambda: _csv(os.getenv("BINANCE_SYMBOLS"), DEFAULT_SYMBOLS))
     binance_interval: str = os.getenv("BINANCE_INTERVAL", "1m")
     store_live_candle_updates: bool = field(default_factory=lambda: _bool("STORE_LIVE_CANDLE_UPDATES", True))
     store_market_ticks: bool = field(default_factory=lambda: _bool("STORE_MARKET_TICKS", False))
@@ -75,31 +80,30 @@ class Settings:
     binance_ws_base_url: str = os.getenv("BINANCE_WS_BASE_URL", "wss://data-stream.binance.vision")
     binance_futures_rest_base_url: str = os.getenv("BINANCE_FUTURES_REST_BASE_URL", "https://fapi.binance.com")
     binance_futures_ws_base_url: str = os.getenv("BINANCE_FUTURES_WS_BASE_URL", "wss://fstream.binance.com")
+
+    # Collector defaults are production/data-factory friendly so Railway does not need a huge variable list.
     derivatives_enabled: bool = field(default_factory=lambda: _bool("DERIVATIVES_ENABLED", True))
-    enable_derivatives_collector: bool = field(default_factory=lambda: _bool("ENABLE_DERIVATIVES_COLLECTOR"))
+    enable_derivatives_collector: bool = field(default_factory=lambda: _bool("ENABLE_DERIVATIVES_COLLECTOR", True))
     derivatives_poll_interval_seconds: int = field(default_factory=lambda: _int("DERIVATIVES_POLL_INTERVAL_SECONDS", 300))
     derivatives_period: str = os.getenv("DERIVATIVES_PERIOD", "5m")
-    derivatives_symbols: list[str] = field(
-        default_factory=lambda: _csv(os.getenv("DERIVATIVES_SYMBOLS"), DEFAULT_SYMBOLS)
-    )
-    enable_fear_greed_collector: bool = field(default_factory=lambda: _bool("ENABLE_FEAR_GREED_COLLECTOR", False))
-    enable_global_market_collector: bool = field(default_factory=lambda: _bool("ENABLE_GLOBAL_MARKET_COLLECTOR", False))
+    derivatives_symbols: list[str] = field(default_factory=lambda: _csv(os.getenv("DERIVATIVES_SYMBOLS"), DEFAULT_SYMBOLS))
+    enable_fear_greed_collector: bool = field(default_factory=lambda: _bool("ENABLE_FEAR_GREED_COLLECTOR", True))
+    enable_global_market_collector: bool = field(default_factory=lambda: _bool("ENABLE_GLOBAL_MARKET_COLLECTOR", True))
     enable_liquidation_collector: bool = field(default_factory=lambda: _bool("ENABLE_LIQUIDATION_COLLECTOR", False))
     enable_stablecoin_risk_collector: bool = field(
-        default_factory=lambda: _bool("ENABLE_STABLECOIN_RISK_COLLECTOR", _bool("ENABLE_STABLECOIN_COLLECTOR", False))
+        default_factory=lambda: _bool("ENABLE_STABLECOIN_RISK_COLLECTOR", _bool("ENABLE_STABLECOIN_COLLECTOR", True))
     )
-    enable_macro_risk_collector: bool = field(default_factory=lambda: _bool("ENABLE_MACRO_RISK_COLLECTOR", False))
+    enable_macro_risk_collector: bool = field(default_factory=lambda: _bool("ENABLE_MACRO_RISK_COLLECTOR", True))
     external_collector_interval_seconds: int = field(default_factory=lambda: _int("EXTERNAL_COLLECTOR_INTERVAL_SECONDS", 300))
     liquidation_rollup_seconds: int = field(default_factory=lambda: _int("LIQUIDATION_ROLLUP_SECONDS", 60))
     liquidation_symbols: list[str] = field(default_factory=lambda: _csv(os.getenv("LIQUIDATION_SYMBOLS"), "BTCUSDT,ETHUSDT"))
     store_raw_liquidations: bool = field(default_factory=lambda: _bool("STORE_RAW_LIQUIDATIONS", False))
     store_raw_external_events: bool = field(default_factory=lambda: _bool("STORE_RAW_EXTERNAL_EVENTS", False))
     coingecko_demo_api_key: str | None = field(default_factory=lambda: _secret("COINGECKO_DEMO_API_KEY"))
+
     news_api_key: str | None = field(default_factory=lambda: _secret("NEWS_API_KEY"))
     news_provider_url: str = os.getenv("NEWS_PROVIDER_URL", "https://newsapi.org/v2/everything")
-    news_providers: list[str] = field(
-        default_factory=lambda: _csv(os.getenv("NEWS_PROVIDER") or os.getenv("NEWS_PROVIDERS"), "rss,gdelt,newsapi")
-    )
+    news_providers: list[str] = field(default_factory=lambda: _csv(os.getenv("NEWS_PROVIDER") or os.getenv("NEWS_PROVIDERS"), "rss,gdelt,newsapi"))
     rss_news_enabled: bool = field(default_factory=lambda: _bool("RSS_NEWS_ENABLED", True))
     rss_feeds: list[str] = field(
         default_factory=lambda: _csv_raw(
@@ -109,26 +113,20 @@ class Settings:
     )
     rss_request_user_agent: str = os.getenv("RSS_REQUEST_USER_AGENT", "AnataAITrader/1.0 RSS reader")
     news_query: str = os.getenv("NEWS_QUERY", "crypto OR bitcoin OR ethereum OR macro economy")
-    news_poll_seconds: int = field(
-        default_factory=lambda: _int("NEWS_POLL_INTERVAL_SECONDS", _int("NEWS_POLL_SECONDS", 300))
-    )
-    news_sentiment_model: str = os.getenv(
-        "NEWS_SENTIMENT_MODEL",
-        "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis",
-    )
+    news_poll_seconds: int = field(default_factory=lambda: _int("NEWS_POLL_INTERVAL_SECONDS", _int("NEWS_POLL_SECONDS", 120)))
+    news_sentiment_model: str = os.getenv("NEWS_SENTIMENT_MODEL", "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis")
     enable_hf_sentiment: bool = field(default_factory=lambda: _bool("ENABLE_HF_SENTIMENT", False))
     hf_sentiment_backend: str = os.getenv("HF_SENTIMENT_BACKEND", "api").lower()
     hf_api_token: str | None = (
-        os.getenv("HF_API_TOKEN")
-        or os.getenv("HUGGINGFACE_API_TOKEN")
-        or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        _secret("HF_API_TOKEN") or _secret("HUGGINGFACE_API_TOKEN") or _secret("HUGGINGFACEHUB_API_TOKEN")
     )
     hf_api_timeout_seconds: int = field(default_factory=lambda: _int("HF_API_TIMEOUT_SECONDS", 20))
     gdelt_enabled: bool = field(default_factory=lambda: _bool("GDELT_ENABLED", True))
     gdelt_poll_interval_seconds: int = field(default_factory=lambda: _int("GDELT_POLL_INTERVAL_SECONDS", 900))
     gdelt_max_records: int = field(default_factory=lambda: _int("GDELT_MAX_RECORDS", 20))
     newsapi_enabled: bool = field(default_factory=lambda: _bool("NEWSAPI_ENABLED", False))
-    news_mock_fallback_enabled: bool = field(default_factory=lambda: _bool("NEWS_MOCK_FALLBACK_ENABLED"))
+    news_mock_fallback_enabled: bool = field(default_factory=lambda: _bool("NEWS_MOCK_FALLBACK_ENABLED", False))
+
     paper_start_balance: float = field(default_factory=lambda: _float("PAPER_START_BALANCE", 10000.0))
     model_dir: Path = field(default_factory=lambda: Path(os.getenv("MODEL_DIR", "./models")))
     trading_mode: str = os.getenv("TRADING_MODE", "paper").lower()
@@ -145,18 +143,16 @@ class Settings:
     training_max_rows: int = field(default_factory=lambda: _int("TRAINING_MAX_ROWS", 250_000))
     training_timeout_seconds: int = field(default_factory=lambda: _int("TRAINING_TIMEOUT_SECONDS", 900))
     training_cpu_safe_mode: bool = field(default_factory=lambda: _bool("TRAINING_CPU_SAFE_MODE", True))
-    training_disable_collectors_during_heavy_job: bool = field(
-        default_factory=lambda: _bool("TRAINING_DISABLE_COLLECTORS_DURING_HEAVY_JOB", True)
-    )
+    training_disable_collectors_during_heavy_job: bool = field(default_factory=lambda: _bool("TRAINING_DISABLE_COLLECTORS_DURING_HEAVY_JOB", True))
     training_background_only: bool = field(default_factory=lambda: _bool("TRAINING_BACKGROUND_ONLY", True))
-    enable_market_collector: bool = field(default_factory=lambda: _bool("ENABLE_MARKET_COLLECTOR"))
-    enable_news_collector: bool = field(default_factory=lambda: _bool("ENABLE_NEWS_COLLECTOR"))
-    auto_trader_enabled: bool = field(default_factory=lambda: _bool("AUTO_TRADER_ENABLED"))
+
+    # Paper bot defaults live here. Railway only needs to override these when you intentionally want a different mode.
+    enable_market_collector: bool = field(default_factory=lambda: _bool("ENABLE_MARKET_COLLECTOR", True))
+    enable_news_collector: bool = field(default_factory=lambda: _bool("ENABLE_NEWS_COLLECTOR", True))
+    auto_trader_enabled: bool = field(default_factory=lambda: _bool("AUTO_TRADER_ENABLED", True))
     auto_trader_use_trained_model: bool = field(default_factory=lambda: _bool("AUTO_TRADER_USE_TRAINED_MODEL", True))
     auto_trader_interval_seconds: int = field(default_factory=lambda: _int("AUTO_TRADER_INTERVAL_SECONDS", 60))
-    auto_trader_symbols: list[str] = field(
-        default_factory=lambda: _csv(os.getenv("AUTO_TRADER_SYMBOLS"), DEFAULT_SYMBOLS)
-    )
+    auto_trader_symbols: list[str] = field(default_factory=lambda: _csv(os.getenv("AUTO_TRADER_SYMBOLS"), DEFAULT_SYMBOLS))
     paper_trade_timeframe: str = os.getenv("PAPER_TRADE_TIMEFRAME", "1m")
     paper_fee_rate: float = field(default_factory=lambda: _float("PAPER_FEE_RATE", 0.0004))
     paper_leverage: float = field(default_factory=lambda: _float("PAPER_LEVERAGE", 10.0))
@@ -166,7 +162,7 @@ class Settings:
     risk_max_entry_fee_pct_of_equity: float = field(default_factory=lambda: _float("RISK_MAX_ENTRY_FEE_PCT_OF_EQUITY", 0.01))
     risk_max_trade_size_pct: float = field(default_factory=lambda: _float("RISK_MAX_TRADE_SIZE_PCT", 0.50))
     risk_max_daily_loss_pct: float = field(default_factory=lambda: _float("RISK_MAX_DAILY_LOSS_PCT", 0.05))
-    risk_max_open_positions: int = field(default_factory=lambda: _int("RISK_MAX_OPEN_POSITIONS", 3))
+    risk_max_open_positions: int = field(default_factory=lambda: _int("RISK_MAX_OPEN_POSITIONS", 10))
     risk_min_confidence: float = field(default_factory=lambda: _float("RISK_MIN_CONFIDENCE", 0.55))
     risk_cooldown_minutes: int = field(default_factory=lambda: _int("RISK_COOLDOWN_MINUTES", 30))
     strategy_min_edge_after_fees: float = field(default_factory=lambda: _float("STRATEGY_MIN_EDGE_AFTER_FEES", 0.001))
@@ -178,9 +174,11 @@ class Settings:
     auto_default_stop_loss_pct: float = field(default_factory=lambda: _float("AUTO_DEFAULT_STOP_LOSS_PCT", 0.01))
     auto_default_take_profit_pct: float = field(default_factory=lambda: _float("AUTO_DEFAULT_TAKE_PROFIT_PCT", 0.02))
     auto_fast_profit_exit_pct: float = field(default_factory=lambda: _float("AUTO_FAST_PROFIT_EXIT_PCT", 0.006))
+    # Exploration creates random paper actions. Keep it off by default so collected data is cleaner.
     exploration_mode: bool = field(default_factory=lambda: _bool("EXPLORATION_MODE", False))
     exploration_rate: float = field(default_factory=lambda: _float("EXPLORATION_RATE", 0.05))
     min_paper_trade_notional: float = field(default_factory=lambda: _float("MIN_PAPER_TRADE_NOTIONAL", 50.0))
+
     railway_data_factory_mode: bool = field(default_factory=lambda: _bool("RAILWAY_DATA_FACTORY_MODE", True))
     data_lifecycle_interval_seconds: int = field(default_factory=lambda: _int("DATA_LIFECYCLE_INTERVAL_SECONDS", 86400))
     operational_retention_days: int = field(default_factory=lambda: _int("OPERATIONAL_RETENTION_DAYS", 2))
@@ -196,15 +194,9 @@ class Settings:
     raw_tick_retention_days: int = field(default_factory=lambda: _int("RAW_TICK_RETENTION_DAYS", 1))
     diagnostic_retention_days: int = field(default_factory=lambda: _int("DIAGNOSTIC_RETENTION_DAYS", 2))
     external_data_retention_days: int = field(default_factory=lambda: _int("EXTERNAL_DATA_RETENTION_DAYS", 365))
-    training_feature_retention_days: int = field(
-        default_factory=lambda: _int("TRAINING_FEATURE_RETENTION_DAYS", _int("KEEP_TRAINING_FEATURES_DAYS", 365))
-    )
-    experience_retention_days: int = field(
-        default_factory=lambda: _int("EXPERIENCE_RETENTION_DAYS", _int("KEEP_EXPERIENCE_DAYS", 365))
-    )
-    closed_candle_retention_days: int = field(
-        default_factory=lambda: _int("CLOSED_CANDLE_RETENTION_DAYS", _int("KEEP_CLOSED_CANDLES_DAYS", 365))
-    )
+    training_feature_retention_days: int = field(default_factory=lambda: _int("TRAINING_FEATURE_RETENTION_DAYS", _int("KEEP_TRAINING_FEATURES_DAYS", 365)))
+    experience_retention_days: int = field(default_factory=lambda: _int("EXPERIENCE_RETENTION_DAYS", _int("KEEP_EXPERIENCE_DAYS", 365)))
+    closed_candle_retention_days: int = field(default_factory=lambda: _int("CLOSED_CANDLE_RETENTION_DAYS", _int("KEEP_CLOSED_CANDLES_DAYS", 365)))
     archive_dir: Path = field(default_factory=lambda: Path(os.getenv("ARCHIVE_DIR", "./archives")))
     dashboard_username: str | None = field(default_factory=lambda: _secret("DASHBOARD_USERNAME"))
     dashboard_password: str | None = field(default_factory=lambda: _secret("DASHBOARD_PASSWORD"))
