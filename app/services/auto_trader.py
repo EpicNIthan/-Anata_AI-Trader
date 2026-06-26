@@ -86,8 +86,8 @@ class AutoTraderService:
                 "min_leverage": settings.paper_min_leverage,
                 "max_leverage": settings.paper_max_leverage,
                 "max_margin_allocation_pct": settings.risk_max_trade_size_pct,
-                "max_entry_fee_pct_of_equity": settings.risk_max_entry_fee_pct_of_equity,
-                "close_filter": "BUY/SELL/CLOSE opposite-position closes are fee-aware and min-hold protected.",
+                "model_mode": "Trained AI sends its own trade plan; bot position filters are not applied to model decisions.",
+                "close_filter": "Bot/exploration BUY/SELL/CLOSE opposite-position closes are fee-aware and min-hold protected.",
             },
         }
 
@@ -198,11 +198,16 @@ class AutoTraderService:
         base_decision = model_decision.decision if model_decision else fallback_decision
         base_source = "model" if model_decision else "strategy"
         decision, decision_source = self._maybe_explore(session, symbol, base_decision, base_source)
-        managed_decision = self._position_management_decision(session, symbol, decision)
-        if managed_decision:
-            decision, decision_source = managed_decision
-        decision = self._fee_aware_close_decision(session, symbol, decision)
-        duplicate_result = self._duplicate_or_loss_cooldown(session, symbol, decision)
+
+        if decision_source != "model":
+            managed_decision = self._position_management_decision(session, symbol, decision)
+            if managed_decision:
+                decision, decision_source = managed_decision
+            decision = self._fee_aware_close_decision(session, symbol, decision)
+            duplicate_result = self._duplicate_or_loss_cooldown(session, symbol, decision)
+        else:
+            duplicate_result = None
+
         if duplicate_result:
             execution_result = duplicate_result
         else:
@@ -213,6 +218,8 @@ class AutoTraderService:
                 reason=decision.reason,
                 stop_loss=decision.stop_loss,
                 take_profit=decision.take_profit,
+                leverage=decision.leverage if decision_source == "model" else None,
+                margin_pct=decision.margin_pct if decision_source == "model" else None,
                 notional=settings.min_paper_trade_notional if decision_source == "exploration" and decision.action in {"BUY", "SELL"} else None,
             )
 
@@ -222,6 +229,7 @@ class AutoTraderService:
             "trade_id": execution_result.trade_id,
             "balance": execution_result.balance,
             "equity": execution_result.equity,
+            "trade_plan": self._trade_plan_payload(decision) if decision_source == "model" else None,
         }
         execution["decision_source"] = decision_source
         execution["strategy_action"] = fallback_decision.action
@@ -250,7 +258,17 @@ class AutoTraderService:
             "model_action": model_decision.decision.action if model_decision else None,
             "model_version_id": model_decision.model.id if model_decision else None,
             "model_fallback_reason": self.state.model_fallback_reason,
+            "trade_plan": self._trade_plan_payload(decision) if decision_source == "model" else None,
             **execution,
+        }
+
+    def _trade_plan_payload(self, decision: StrategyDecision) -> dict[str, Any]:
+        return {
+            "margin_pct": decision.margin_pct,
+            "leverage": decision.leverage,
+            "stop_loss": decision.stop_loss,
+            "take_profit": decision.take_profit,
+            "max_hold_seconds": decision.max_hold_seconds,
         }
 
     def _maybe_explore(
@@ -333,6 +351,7 @@ class AutoTraderService:
                 "strategy_decision": strategy_decision.model_dump(),
                 "model_prediction": model_decision.prediction if model_decision else None,
                 "model_fallback_reason": self.state.model_fallback_reason if model_decision is None else None,
+                "model_trade_plan_bypassed_bot_filters": decision_source == "model",
                 "exploration": {
                     "enabled": settings.exploration_mode,
                     "rate": settings.exploration_rate,
@@ -351,6 +370,7 @@ class AutoTraderService:
                     "decision_source": decision_source,
                     "ai_decision_id": ai_decision.id,
                     "auto_trader": self.name,
+                    "trade_plan": self._trade_plan_payload(decision) if decision_source == "model" else None,
                 }
         record_experience(session, decision=ai_decision, feature=feature, execution_result=execution)
         session.commit()
