@@ -16,6 +16,7 @@ from app.db.session import create_db_and_tables, ping_database
 from app.logging_config import setup_logging
 from app.services.auto_trader import AutoTraderService
 from app.services.data_lifecycle import DataLifecycleService
+from app.services.label_maintenance import LabelMaintenanceService
 from app.services.training_service import TrainingService
 
 setup_logging()
@@ -28,12 +29,15 @@ async def lifespan(app: FastAPI):
     manager = WorkerManager()
     auto_trader = AutoTraderService()
     data_lifecycle = DataLifecycleService(interval_seconds=settings.data_lifecycle_interval_seconds)
+    label_maintenance = LabelMaintenanceService()
     training_service = TrainingService()
     app.state.worker_manager = manager
     app.state.auto_trader = auto_trader
     app.state.data_lifecycle = data_lifecycle
+    app.state.label_maintenance = label_maintenance
     app.state.training_service = training_service
     await data_lifecycle.start()
+    await label_maintenance.start()
     if settings.enable_market_collector:
         await manager.start("market")
     if settings.enable_news_collector:
@@ -56,6 +60,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await label_maintenance.stop()
         await data_lifecycle.stop()
         await auto_trader.stop()
         await manager.stop_all()
