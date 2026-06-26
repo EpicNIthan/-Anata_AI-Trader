@@ -102,10 +102,10 @@ DIAGNOSTIC_RETENTION_DAYS
 
 - Market collector: enabled by default.
 - News collector: enabled by default.
-- Derivatives collector: enabled by default.
+- Derivatives collector: enabled by default, with cooldown when Binance Futures returns HTTP 451 from Railway.
 - Fear/Greed, global market, stablecoin risk, and macro risk collectors: enabled by default.
 - Paper auto trader: enabled by default.
-- Auto trader uses trained model when available and falls back to the indicator-style paper strategy.
+- Paper runner starts in Bot mode by default. Switch to Trained AI in the dashboard only after uploading and activating a model you trust.
 - Exploration mode is intentionally off by default because it creates random/noisy paper trades.
 - Server training is disabled by default; train on your PC.
 - Raw ticks are disabled by default because they grow too fast.
