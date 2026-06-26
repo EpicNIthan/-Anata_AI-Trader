@@ -206,6 +206,9 @@ class AutoTraderService:
             decision = self._fee_aware_close_decision(session, symbol, decision)
             duplicate_result = self._duplicate_or_loss_cooldown(session, symbol, decision)
         else:
+            ai_exit = self._ai_plan_exit_decision(session, symbol)
+            if ai_exit:
+                decision = ai_exit
             duplicate_result = None
 
         if duplicate_result:
@@ -270,6 +273,30 @@ class AutoTraderService:
             "take_profit": decision.take_profit,
             "max_hold_seconds": decision.max_hold_seconds,
         }
+
+    def _ai_plan_exit_decision(self, session, symbol: str) -> StrategyDecision | None:
+        position = session.scalar(
+            select(Position)
+            .where(Position.symbol == symbol, Position.status == "OPEN")
+            .order_by(desc(Position.opened_at))
+            .limit(1)
+        )
+        if position is None:
+            return None
+        mark_price = self._latest_price(session, symbol) or position.current_price or position.entry_price
+        if position.stop_loss and self._stop_loss_hit(position.side, mark_price, position.stop_loss):
+            return StrategyDecision(
+                action="CLOSE",
+                confidence=1.0,
+                reason=f"AI plan exit: stored stop loss hit at {mark_price:.8f} vs {position.stop_loss:.8f}.",
+            )
+        if position.take_profit and self._take_profit_hit(position.side, mark_price, position.take_profit):
+            return StrategyDecision(
+                action="CLOSE",
+                confidence=1.0,
+                reason=f"AI plan exit: stored take profit hit at {mark_price:.8f} vs {position.take_profit:.8f}.",
+            )
+        return None
 
     def _maybe_explore(
         self,
