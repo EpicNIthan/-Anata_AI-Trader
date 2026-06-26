@@ -120,6 +120,44 @@ def _directional_accuracy(predictions, actual) -> float:
     return float(((predictions > 0) == (actual > 0)).mean())
 
 
+def _data_readiness(labeled_rows: int, dataset_days: float) -> dict[str, Any]:
+    if labeled_rows < 1000 or dataset_days < 1:
+        rank = "D"
+        use = "pipeline test only"
+    elif labeled_rows < 20000 or dataset_days < 3:
+        rank = "C-"
+        use = "early experiment; do not activate unless safety checks pass"
+    elif labeled_rows < 75000 or dataset_days < 7:
+        rank = "C/B-"
+        use = "experiment model; compare against Bot carefully"
+    elif labeled_rows < 250000 or dataset_days < 14:
+        rank = "B"
+        use = "first serious paper-test candidate"
+    else:
+        rank = "A"
+        use = "stronger paper-test candidate, still not live-money proof"
+    return {"rank": rank, "use": use, "labeled_rows": labeled_rows, "dataset_days": dataset_days}
+
+
+def _failure_advice(candidates: list[dict[str, Any]], dataset_days: float) -> list[str]:
+    advice = [
+        "Training completed, but no model was packaged because every candidate failed safety checks.",
+        "Keep Paper Runner on Bot and keep collecting more days before activating Trained AI.",
+    ]
+    if dataset_days < 3:
+        advice.append("24 hours is enough to test the pipeline, but usually too short for a reliable trading model. Aim for 3-7 days for the next attempt.")
+    if candidates:
+        best = max(candidates, key=lambda item: item.get("metrics", {}).get("net_return_after_fees", -999.0))
+        metrics = best.get("metrics", {})
+        if metrics.get("net_return_after_fees", 0) <= 0:
+            advice.append("The best candidate still had negative net return after fees, so uploading it would teach Railway to trade badly.")
+        if metrics.get("max_drawdown", 0) >= 0.15:
+            advice.append("Drawdown was too high; the model is overtrading or learning a weak/unstable pattern.")
+        if metrics.get("number_of_trades", 0) > metrics.get("test_rows", 0) * 0.50:
+            advice.append("The model traded too often. Retry later with a higher edge, for example --min-edge 0.003 or --min-edge 0.005.")
+    return advice
+
+
 def _feature_importance(model: Any, feature_columns: list[str]) -> dict[str, float]:
     values = getattr(model, "feature_importances_", None)
     if values is None:
@@ -175,6 +213,7 @@ def main() -> None:
     feature_columns = _feature_columns(train_frame, args.target)
     if not feature_columns:
         raise SystemExit("No numeric feature columns found.")
+    dataset_days = float((train_frame["as_of"].max() - train_frame["as_of"].min()).total_seconds() / 86400.0)
     split = max(1, int(len(train_frame) * (1.0 - min(max(args.test_size, 0.05), 0.50))))
     if split >= len(train_frame):
         raise SystemExit("Not enough rows for time-based test split.")
@@ -237,17 +276,22 @@ def main() -> None:
         default=None,
     )
     result: dict[str, Any] = {
-        "status": "no_model_selected",
+        "status": "trained_failed_safety_checks" if candidates else "no_model_selected",
         "dataset": str(args.dataset),
         "target": args.target,
         "return_column": return_column,
         "train_rows": int(len(training)),
         "test_rows": int(len(test)),
+        "total_labeled_rows": int(len(train_frame)),
+        "dataset_days": dataset_days,
         "feature_columns": len(feature_columns),
+        "data_readiness": _data_readiness(int(len(train_frame)), dataset_days),
         "baseline": baseline_metrics,
         "candidates": candidates,
         "skipped_models": skipped,
-        "message": "No candidate passed safety checks. Nothing was packaged or uploaded.",
+        "failed_safety_checks": True,
+        "next_steps": _failure_advice(candidates, dataset_days),
+        "message": "Training completed, but no model passed safety checks. Nothing was packaged or uploaded.",
     }
     if best is None:
         print(json.dumps(result, indent=2, default=str))
@@ -277,17 +321,20 @@ def main() -> None:
             "rule_based_baseline": baseline_metrics,
             "train_rows": int(len(training)),
             "total_labeled_rows": int(len(train_frame)),
+            "dataset_days": dataset_days,
         },
         "feature_importance": _feature_importance(final_model, feature_columns),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     metadata_path = args.out_dir / f"model_{version}.json"
-    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     package_path = _package_model(model_path, metadata, args.out_dir)
     result.update(
         {
             "status": "passed",
             "message": "Best model passed safety checks and was packaged as a candidate. Upload/activate explicitly.",
+            "failed_safety_checks": False,
+            "next_steps": ["Upload the model package, then activate it from the dashboard Training tab."],
             "best_model": best,
             "model": str(model_path),
             "metadata": str(metadata_path),
@@ -300,4 +347,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
