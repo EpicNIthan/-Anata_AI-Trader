@@ -126,6 +126,7 @@ def main() -> None:
     parser.add_argument("--until-date", default=None)
     parser.add_argument("--use-all-data", action="store_true")
     parser.add_argument("--daily-files", action="store_true", help="Download all selected data split into one local raw_YYYY-MM-DD.zip per day, including current under-24h day.")
+    parser.add_argument("--keep-daily-bundle", action="store_true", help="Keep the temporary local raw_daily_bundle_*.zip after daily files are written.")
     parser.add_argument(
         "--finished-only",
         action="store_true",
@@ -188,10 +189,15 @@ def main() -> None:
         local_manifest = _zip_manifest(output)
         manifest = export.get("manifest") or local_manifest
         split_result = _split_daily_archive(output, args.output_dir) if args.daily_files else None
+        bundle_removed = False
+        if args.daily_files and not args.keep_daily_bundle and split_result and output.exists():
+            output.unlink()
+            bundle_removed = True
         result = {
             "status": "ok",
-            "output": str(output),
-            "file_size_bytes": output.stat().st_size,
+            "output": None if bundle_removed else str(output),
+            "bundle_removed_after_split": bundle_removed,
+            "file_size_bytes": 0 if bundle_removed else output.stat().st_size,
             "archive_id": archive_id,
             "row_counts": manifest.get("row_counts", manifest.get("total_row_counts", {})),
             "file_sizes": manifest.get("file_sizes", {}),
@@ -214,7 +220,7 @@ def main() -> None:
                 "delete_all_finished_data": args.delete_all_finished_data,
                 "delete_db_rows": args.delete_railway_db_rows,
                 "local_manifest_verified": True,
-                "local_file_size_bytes": output.stat().st_size,
+                "local_file_size_bytes": sum(Path(path).stat().st_size for path in (split_result or {}).get("daily_files", [])) if split_result else output.stat().st_size,
             }
             result["cleanup"] = _json_api(
                 args.url,
