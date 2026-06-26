@@ -87,6 +87,7 @@ class AutoTraderService:
                 "max_leverage": settings.paper_max_leverage,
                 "max_margin_allocation_pct": settings.risk_max_trade_size_pct,
                 "max_entry_fee_pct_of_equity": settings.risk_max_entry_fee_pct_of_equity,
+                "close_filter": "BUY/SELL/CLOSE opposite-position closes are fee-aware and min-hold protected.",
             },
         }
 
@@ -392,7 +393,7 @@ class AutoTraderService:
                 StrategyDecision(
                     action="CLOSE",
                     confidence=1.0,
-                    reason=f"Risk exit: stop loss hit at {mark_price:.8f} <= {stop_loss:.8f}.",
+                    reason=f"Risk exit: stop loss hit at {mark_price:.8f} vs {stop_loss:.8f}.",
                 ),
                 "risk-exit",
             )
@@ -414,7 +415,7 @@ class AutoTraderService:
                     StrategyDecision(
                         action="CLOSE",
                         confidence=0.95,
-                        reason=f"Take profit hit at {mark_price:.8f} >= {take_profit:.8f} after {age_seconds / 60:.1f} minutes.",
+                        reason=f"Take profit hit at {mark_price:.8f} after {age_seconds / 60:.1f} minutes.",
                     ),
                     "position-management",
                 )
@@ -430,12 +431,12 @@ class AutoTraderService:
                     ),
                     "position-management",
                 )
-        if settings.auto_max_hold_seconds > 0 and age_seconds >= settings.auto_max_hold_seconds and net_pnl >= 0:
+        if settings.auto_max_hold_seconds > 0 and age_seconds >= settings.auto_max_hold_seconds and net_profit_pct >= settings.auto_close_min_net_profit_pct:
             return (
                 StrategyDecision(
                     action="CLOSE",
                     confidence=0.80,
-                    reason=f"Time exit: max hold reached with non-negative net PnL (${net_pnl:.4f}).",
+                    reason=f"Time exit: max hold reached with enough net profit (${net_pnl:.4f}).",
                 ),
                 "position-management",
             )
@@ -447,7 +448,8 @@ class AutoTraderService:
         symbol: str,
         decision: StrategyDecision,
     ) -> StrategyDecision:
-        if decision.action.upper() not in {"SELL", "CLOSE"}:
+        action = decision.action.upper()
+        if action not in {"BUY", "SELL", "CLOSE"}:
             return decision
         existing_position = session.scalar(
             select(Position)
@@ -457,6 +459,11 @@ class AutoTraderService:
         )
         if existing_position is None:
             return decision
+        position_side = existing_position.side.upper()
+        requested_side = "LONG" if action == "BUY" else ("SHORT" if action == "SELL" else position_side)
+        is_close = action == "CLOSE" or requested_side != position_side
+        if not is_close:
+            return decision
         mark_price = self._latest_price(session, symbol) or existing_position.current_price or existing_position.entry_price
         gross_pnl = self._position_gross_pnl(existing_position, mark_price)
         close_notional = existing_position.quantity * mark_price
@@ -465,17 +472,13 @@ class AutoTraderService:
         net_profit = gross_pnl - close_fee
         net_profit_pct = net_profit / close_notional if close_notional else 0.0
         age_seconds = self._position_age_seconds(existing_position)
-        if (
-            gross_pnl > 0
-            and age_seconds < settings.auto_min_hold_seconds
-            and net_profit_pct < settings.auto_fast_profit_exit_pct
-        ):
+        if age_seconds < settings.auto_min_hold_seconds and net_profit_pct < settings.auto_fast_profit_exit_pct:
             return StrategyDecision(
                 action="HOLD",
                 confidence=max(decision.confidence, settings.risk_min_confidence),
                 reason=(
-                    "Weak profit close skipped because minimum hold time is active "
-                    f"({age_seconds:.0f}/{settings.auto_min_hold_seconds}s, net profit {net_profit_pct:.2%})."
+                    "Close skipped because minimum hold time is active and the move is not strong enough "
+                    f"({age_seconds:.0f}/{settings.auto_min_hold_seconds}s, net {net_profit_pct:.2%})."
                 ),
                 stop_loss=decision.stop_loss,
                 take_profit=decision.take_profit,
@@ -487,6 +490,17 @@ class AutoTraderService:
                 reason=(
                     "Close skipped because gross profit is too small after fees "
                     f"(gross ${gross_pnl:.4f}, fee ${close_fee:.4f}, required net ${min_net_profit:.4f})."
+                ),
+                stop_loss=decision.stop_loss,
+                take_profit=decision.take_profit,
+            )
+        if gross_pnl <= 0 and age_seconds < settings.auto_min_hold_seconds:
+            return StrategyDecision(
+                action="HOLD",
+                confidence=max(decision.confidence, settings.risk_min_confidence),
+                reason=(
+                    "Loss close skipped before minimum hold; only stop-loss/max-loss can force a fast risk exit "
+                    f"(age {age_seconds:.0f}s, net PnL ${net_profit:.4f})."
                 ),
                 stop_loss=decision.stop_loss,
                 take_profit=decision.take_profit,
@@ -558,42 +572,39 @@ class AutoTraderService:
             snapshot = PaperEngine(session).snapshot()
             return ExecutionResult(
                 status="REJECTED",
-                message=f"Duplicate {target_side.lower()} entry cooldown is active for this symbol.",
-                balance=snapshot["cash_balance"],
-                equity=snapshot["equity"],
+                message=f"Duplicate {target_side} add skipped; a {action} was already filled this cycle.",
+                balance=snapshot.get("cash_balance"),
+                equity=snapshot.get("equity"),
             )
 
-        if settings.risk_cooldown_minutes > 0:
-            loss_since = now - timedelta(minutes=settings.risk_cooldown_minutes)
-            recent_loss = session.scalar(
-                select(PaperTrade)
-                .where(PaperTrade.created_at >= loss_since, PaperTrade.realized_pnl < 0)
-                .order_by(desc(PaperTrade.created_at))
-                .limit(1)
+        loss_since = now - timedelta(minutes=max(settings.risk_cooldown_minutes, 0))
+        recent_loss = session.scalar(
+            select(PaperTrade)
+            .where(PaperTrade.symbol == symbol, PaperTrade.created_at >= loss_since, PaperTrade.realized_pnl < 0)
+            .order_by(desc(PaperTrade.created_at))
+            .limit(1)
+        )
+        if recent_loss:
+            snapshot = PaperEngine(session).snapshot()
+            return ExecutionResult(
+                status="REJECTED",
+                message=f"Symbol cooldown after recent realized loss (${recent_loss.realized_pnl:.4f}).",
+                balance=snapshot.get("cash_balance"),
+                equity=snapshot.get("equity"),
             )
-            if recent_loss:
-                loss_threshold = max(settings.min_paper_trade_notional * 0.02, 1.0)
-                if abs(float(recent_loss.realized_pnl or 0.0)) >= loss_threshold:
-                    snapshot = PaperEngine(session).snapshot()
-                    return ExecutionResult(
-                        status="REJECTED",
-                        message=(
-                            "Auto trader cooldown is active after a meaningful recent loss "
-                            f"(${recent_loss.realized_pnl:.4f})."
-                        ),
-                        balance=snapshot["cash_balance"],
-                        equity=snapshot["equity"],
-                    )
-
         return None
 
-    def _position_gross_pnl(self, position: Position, mark_price: float) -> float:
-        if position.side.upper() == "SHORT":
-            return (position.entry_price - mark_price) * position.quantity
-        return (mark_price - position.entry_price) * position.quantity
+    def _position_gross_pnl(self, position: Position, price: float) -> float:
+        if position.side.upper() == "LONG":
+            return (price - position.entry_price) * position.quantity
+        return (position.entry_price - price) * position.quantity
 
-    def _stop_loss_hit(self, side: str, mark_price: float, stop_loss: float) -> bool:
-        return mark_price <= stop_loss if side.upper() == "LONG" else mark_price >= stop_loss
+    def _stop_loss_hit(self, side: str, price: float, stop_loss: float) -> bool:
+        if side.upper() == "LONG":
+            return price <= stop_loss
+        return price >= stop_loss
 
-    def _take_profit_hit(self, side: str, mark_price: float, take_profit: float) -> bool:
-        return mark_price >= take_profit if side.upper() == "LONG" else mark_price <= take_profit
+    def _take_profit_hit(self, side: str, price: float, take_profit: float) -> bool:
+        if side.upper() == "LONG":
+            return price >= take_profit
+        return price <= take_profit
