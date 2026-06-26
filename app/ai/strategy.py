@@ -15,6 +15,9 @@ class StrategyDecision:
     reason: str
     stop_loss: float | None = None
     take_profit: float | None = None
+    margin_pct: float | None = None
+    leverage: float | None = None
+    max_hold_seconds: int | None = None
 
     def model_dump(self) -> dict[str, Any]:
         return asdict(self)
