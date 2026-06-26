@@ -325,6 +325,10 @@ def label_status_fast(session: Session, *, schema_version: str = CURRENT_FEATURE
 
 
 def label_status(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHEMA_VERSION) -> dict[str, Any]:
+    return label_status_fast(session, schema_version=schema_version)
+
+
+def label_status_detailed(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHEMA_VERSION) -> dict[str, Any]:
     status = label_status_fast(session, schema_version=schema_version)
     rows = list(session.scalars(select(TrainingFeature).where(TrainingFeature.schema_version == schema_version)))
 
