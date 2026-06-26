@@ -8,7 +8,7 @@ from typing import Any
 
 from app.db.session import SessionLocal
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION
-from app.training.label_builder import build_labels_for_existing_features, label_status
+from app.training.label_builder import build_labels_for_existing_features, label_status_fast
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ class LabelMaintenanceService:
                 force=False,
                 sync_features=True,
             )
-            status = label_status(session)
+            status = label_status_fast(session)
         self.state.last_run_at = datetime.now(timezone.utc).isoformat()
         self.state.last_result = result
         self.state.last_status = status
