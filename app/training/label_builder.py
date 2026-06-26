@@ -262,13 +262,24 @@ def build_labels_for_existing_features(
     }
 
 
-def label_status(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHEMA_VERSION) -> dict[str, Any]:
-    rows = list(session.scalars(select(TrainingFeature).where(TrainingFeature.schema_version == schema_version)))
-    feature_rows = list(session.scalars(select(Feature).where(Feature.schema_version == schema_version)))
+def label_status_fast(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHEMA_VERSION) -> dict[str, Any]:
+    rows = list(
+        session.scalars(
+            select(TrainingFeature).where(TrainingFeature.schema_version == schema_version).order_by(TrainingFeature.as_of)
+        )
+    )
+    feature_count = int(
+        session.scalar(select(func.count(Feature.id)).where(Feature.schema_version == schema_version)) or 0
+    )
     counts = {column: 0 for column in TARGET_COLUMNS}
     labeled_times: list[datetime] = []
     unlabeled_times: list[datetime] = []
+    all_times: list[datetime] = []
+    symbols: set[str] = set()
     for row in rows:
+        if row.as_of:
+            all_times.append(row.as_of)
+        symbols.add(row.symbol)
         values = values_for_training_feature(row)
         for column in TARGET_COLUMNS:
             if values.get(column) not in (None, ""):
@@ -277,6 +288,45 @@ def label_status(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHE
             labeled_times.append(row.as_of)
         else:
             unlabeled_times.append(row.as_of)
+
+    feature_bounds = session.execute(
+        select(func.min(Feature.as_of), func.max(Feature.as_of)).where(Feature.schema_version == schema_version)
+    ).one()
+    for value in feature_bounds:
+        if value:
+            all_times.append(value)
+    feature_symbols = session.scalars(select(Feature.symbol).where(Feature.schema_version == schema_version).distinct()).all()
+    symbols.update(feature_symbols)
+
+    target_count = counts["target_trade_quality_score"]
+    total = len(rows)
+    return {
+        "schema_version": schema_version,
+        "selected_training_target": settings.model_target,
+        "total_feature_rows": feature_count,
+        "total_training_feature_rows": total,
+        "total_training_features": total,
+        "unlabeled_rows": total - target_count,
+        "earliest_feature_time": min(all_times).isoformat() if all_times else None,
+        "latest_feature_time": max(all_times).isoformat() if all_times else None,
+        "symbols_covered": sorted(symbols),
+        "rows_with_target_future_return_5m": counts["target_future_return_5m"],
+        "rows_with_target_future_return_15m": counts["target_future_return_15m"],
+        "rows_with_target_future_return_1h": counts["target_future_return_1h"],
+        "rows_with_target_direction_15m": counts["target_direction_15m"],
+        "rows_with_target_trade_quality_score": target_count,
+        "labeled_rows_by_target": counts,
+        "label_coverage_pct": (target_count / total) if total else 0.0,
+        "label_readiness": "OK" if target_count > 0 else "NOT READY",
+        "latest_labeled_as_of": max(labeled_times).isoformat() if labeled_times else None,
+        "oldest_unlabeled_as_of": min(unlabeled_times).isoformat() if unlabeled_times else None,
+        "warning": "target_trade_quality_score labeled rows = 0" if target_count == 0 else None,
+    }
+
+
+def label_status(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHEMA_VERSION) -> dict[str, Any]:
+    status = label_status_fast(session, schema_version=schema_version)
+    rows = list(session.scalars(select(TrainingFeature).where(TrainingFeature.schema_version == schema_version)))
 
     candle_count_by_symbol = {
         symbol: count
@@ -314,31 +364,8 @@ def label_status(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHE
             "rows_possible": possible,
             "enough_for_any_rows": possible > 0,
         }
-    target_count = counts["target_trade_quality_score"]
-    total = len(rows)
-    all_times = [row.as_of for row in rows if row.as_of] + [row.as_of for row in feature_rows if row.as_of]
-    symbols_covered = sorted({row.symbol for row in rows} | {row.symbol for row in feature_rows})
     return {
-        "schema_version": schema_version,
-        "selected_training_target": settings.model_target,
-        "total_feature_rows": len(feature_rows),
-        "total_training_feature_rows": total,
-        "total_training_features": total,
-        "unlabeled_rows": total - target_count,
-        "earliest_feature_time": min(all_times).isoformat() if all_times else None,
-        "latest_feature_time": max(all_times).isoformat() if all_times else None,
-        "symbols_covered": symbols_covered,
-        "rows_with_target_future_return_5m": counts["target_future_return_5m"],
-        "rows_with_target_future_return_15m": counts["target_future_return_15m"],
-        "rows_with_target_future_return_1h": counts["target_future_return_1h"],
-        "rows_with_target_direction_15m": counts["target_direction_15m"],
-        "rows_with_target_trade_quality_score": target_count,
-        "labeled_rows_by_target": counts,
-        "label_coverage_pct": (target_count / total) if total else 0.0,
-        "label_readiness": "OK" if target_count > 0 else "NOT READY",
-        "latest_labeled_as_of": max(labeled_times).isoformat() if labeled_times else None,
-        "oldest_unlabeled_as_of": min(unlabeled_times).isoformat() if unlabeled_times else None,
+        **status,
         "candle_count_by_symbol": candle_count_by_symbol,
         "enough_future_candles": enough_future,
-        "warning": "target_trade_quality_score labeled rows = 0" if target_count == 0 else None,
     }
