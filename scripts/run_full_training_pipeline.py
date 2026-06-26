@@ -51,6 +51,11 @@ def main() -> None:
     parser.add_argument("--target", default="target_trade_quality_score")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--news-converter", choices=["smart", "finbert", "cryptobert", "rule-based"], default="smart")
+    parser.add_argument(
+        "--model-types",
+        default="sklearn_hist_gradient_boosting",
+        help="Comma-separated model types. Default is Railway-safe.",
+    )
     parser.add_argument("--cleanup-railway-after-download", action="store_true", help="Delete Railway raw export files/finished_data after local ZIP verification.")
     parser.add_argument("--delete-railway-db-rows", action="store_true", help="With cleanup, delete matching raw DB rows from Railway after verified PC download.")
     parser.add_argument("--delete-all-finished-data", action="store_true", help="With cleanup, delete every finished_data folder on Railway.")
@@ -116,6 +121,8 @@ def main() -> None:
             args.target,
             "--out-dir",
             str(run_dir / "models"),
+            "--model-types",
+            args.model_types,
         ],
         name="Train best model",
     )
