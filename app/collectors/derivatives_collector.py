@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -14,6 +14,8 @@ from app.db.models import ExternalDataEvent
 from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
+
+_BINANCE_FUTURES_BLOCKED_UNTIL: datetime | None = None
 
 
 def _dt_from_ms(value: Any, fallback: datetime | None = None) -> datetime:
@@ -27,6 +29,33 @@ def _float(value: Any, default: float | None = None) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _http_status(exc: Exception) -> int | None:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    return None
+
+
+def _futures_blocked_message() -> str | None:
+    global _BINANCE_FUTURES_BLOCKED_UNTIL
+    if not _BINANCE_FUTURES_BLOCKED_UNTIL:
+        return None
+    now = datetime.now(timezone.utc)
+    if now >= _BINANCE_FUTURES_BLOCKED_UNTIL:
+        _BINANCE_FUTURES_BLOCKED_UNTIL = None
+        return None
+    seconds = int((_BINANCE_FUTURES_BLOCKED_UNTIL - now).total_seconds())
+    return (
+        "Binance Futures public API is blocked from this Railway region/IP "
+        f"(HTTP 451). Cooling down for {seconds}s."
+    )
+
+
+def _set_futures_blocked_cooldown(seconds: int = 3600) -> str:
+    global _BINANCE_FUTURES_BLOCKED_UNTIL
+    _BINANCE_FUTURES_BLOCKED_UNTIL = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    return _futures_blocked_message() or "Binance Futures public API is blocked from this Railway region/IP (HTTP 451)."
 
 
 def _ratio_payload(raw: dict[str, Any], *, period: str) -> dict[str, Any]:
@@ -106,7 +135,9 @@ class BinanceDerivativesCollector:
                 result = await self.fetch_once()
                 if state:
                     state.mark_event(result | {"rows_saved": result.get("rows_saved", 0)})
+                    errors = result.get("errors") or {}
                     state.last_error = None
+                    state.warning = "; ".join(list(errors.values())[:3]) if errors else None
             except Exception as exc:
                 logger.exception("Binance derivatives collector failed")
                 if state:
@@ -121,6 +152,18 @@ class BinanceDerivativesCollector:
         errors: dict[str, str] = {}
         per_symbol: dict[str, int] = {}
         url_log: list[str] = []
+        blocked_message = _futures_blocked_message()
+        if blocked_message:
+            return {
+                "source": self.name,
+                "mode": "live",
+                "period": self.period,
+                "symbols": self.symbols,
+                "rows_saved": 0,
+                "per_symbol": {symbol: 0 for symbol in self.symbols},
+                "errors": {"binance_futures": blocked_message},
+                "urls": url_log,
+            }
         if mock:
             with SessionLocal() as session:
                 for symbol in self.symbols:
@@ -139,10 +182,14 @@ class BinanceDerivativesCollector:
                 "urls": url_log,
             }
 
+        blocked = False
         async with httpx.AsyncClient(timeout=20) as client:
             with SessionLocal() as session:
                 for symbol in self.symbols:
                     saved = 0
+                    if blocked:
+                        per_symbol[symbol] = saved
+                        continue
                     for data_type, path in self.endpoints.items():
                         url = f"{self.base_url}{path}"
                         params = self._params(data_type, symbol)
@@ -152,6 +199,12 @@ class BinanceDerivativesCollector:
                             response.raise_for_status()
                             saved += self._store_response(session, symbol, data_type, response.json())
                         except Exception as exc:
+                            if _http_status(exc) == 451:
+                                blocked_message = _set_futures_blocked_cooldown()
+                                logger.warning(blocked_message)
+                                errors["binance_futures"] = blocked_message
+                                blocked = True
+                                break
                             logger.warning("Derivatives fetch failed for %s %s: %s", symbol, data_type, exc)
                             errors[f"{symbol}:{data_type}"] = f"{type(exc).__name__}: {exc}"
                     per_symbol[symbol] = saved
