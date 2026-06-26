@@ -150,10 +150,12 @@ def _write_labels(row: TrainingFeature, labels: dict[str, Any]) -> None:
     row.payload = payload
 
 
-def _sync_features_to_training_features(session: Session, schema_version: str) -> int:
+def _sync_features_to_training_features(session: Session, schema_version: str, *, limit: int | None = None) -> int:
     created = 0
-    feature_rows = session.scalars(select(Feature).where(Feature.schema_version == schema_version)).all()
-    for feature in feature_rows:
+    query = select(Feature).where(Feature.schema_version == schema_version).order_by(Feature.as_of)
+    for feature in session.scalars(query).yield_per(500):
+        if limit and created >= limit:
+            break
         if session.scalar(select(TrainingFeature.id).where(TrainingFeature.source_feature_id == feature.id).limit(1)):
             continue
         values = dict((feature.payload or {}).get("values", {}))
@@ -177,6 +179,8 @@ def _sync_features_to_training_features(session: Session, schema_version: str) -
             )
         )
         created += 1
+        if created % 500 == 0:
+            session.flush()
     if created:
         session.flush()
     return created
@@ -193,25 +197,28 @@ def build_labels_for_existing_features(
     sync_features: bool = True,
 ) -> dict[str, Any]:
     normalized_symbols = [symbol.upper() for symbol in symbols] if symbols else None
-    synced_features = _sync_features_to_training_features(session, schema_version) if sync_features else 0
+    synced_features = _sync_features_to_training_features(session, schema_version, limit=limit) if sync_features else 0
     query = select(TrainingFeature).where(TrainingFeature.schema_version == schema_version)
     if normalized_symbols:
         query = query.where(TrainingFeature.symbol.in_(normalized_symbols))
-    if limit:
-        query = query.limit(max(limit, 1))
-    features = list(session.scalars(query.order_by(TrainingFeature.symbol, TrainingFeature.as_of)))
     candles_by_key: dict[tuple[str, str], list[Candle]] = {}
     times_by_key: dict[tuple[str, str], list[float]] = {}
+    features_seen = 0
+    attempted = 0
     labeled = 0
     skipped_no_future = 0
     skipped_no_candles = 0
     skipped_existing = 0
     per_symbol: dict[str, dict[str, int]] = {}
 
-    for feature in features:
+    for feature in session.scalars(query.order_by(TrainingFeature.symbol, TrainingFeature.as_of)).yield_per(500):
+        features_seen += 1
         if not force and _is_labeled(feature):
             skipped_existing += 1
             continue
+        if limit and attempted >= limit:
+            break
+        attempted += 1
         feature_interval = interval or _interval_for_feature(feature)
         key = (feature.symbol, feature_interval)
         if key not in candles_by_key:
@@ -252,7 +259,8 @@ def build_labels_for_existing_features(
         "schema_version": schema_version,
         "symbols": normalized_symbols or "all",
         "interval": interval or "feature/default",
-        "features_seen": len(features),
+        "features_seen": features_seen,
+        "attempted_unlabeled": attempted,
         "synced_features": synced_features,
         "labeled": labeled,
         "skipped_existing": skipped_existing,
@@ -263,11 +271,6 @@ def build_labels_for_existing_features(
 
 
 def label_status_fast(session: Session, *, schema_version: str = CURRENT_FEATURE_SCHEMA_VERSION) -> dict[str, Any]:
-    rows = list(
-        session.scalars(
-            select(TrainingFeature).where(TrainingFeature.schema_version == schema_version).order_by(TrainingFeature.as_of)
-        )
-    )
     feature_count = int(
         session.scalar(select(func.count(Feature.id)).where(Feature.schema_version == schema_version)) or 0
     )
@@ -276,7 +279,10 @@ def label_status_fast(session: Session, *, schema_version: str = CURRENT_FEATURE
     unlabeled_times: list[datetime] = []
     all_times: list[datetime] = []
     symbols: set[str] = set()
-    for row in rows:
+    total = 0
+    rows_query = select(TrainingFeature).where(TrainingFeature.schema_version == schema_version).order_by(TrainingFeature.as_of)
+    for row in session.scalars(rows_query).yield_per(1000):
+        total += 1
         if row.as_of:
             all_times.append(row.as_of)
         symbols.add(row.symbol)
@@ -299,7 +305,6 @@ def label_status_fast(session: Session, *, schema_version: str = CURRENT_FEATURE
     symbols.update(feature_symbols)
 
     target_count = counts["target_trade_quality_score"]
-    total = len(rows)
     return {
         "schema_version": schema_version,
         "selected_training_target": settings.model_target,
