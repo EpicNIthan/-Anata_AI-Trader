@@ -41,6 +41,8 @@ class PaperEngine:
         price: float | None = None,
         quantity: float | None = None,
         notional: float | None = None,
+        leverage: float | None = None,
+        margin_pct: float | None = None,
     ) -> ExecutionResult:
         if not settings.is_paper_mode:
             return ExecutionResult("REJECTED", "Trading mode is not paper; real order APIs are disabled.")
@@ -64,6 +66,8 @@ class PaperEngine:
             equity=latest_account.equity,
             requested_notional=requested_notional,
             existing_position=existing_position,
+            requested_leverage=leverage,
+            requested_margin_pct=margin_pct,
         )
         if not risk.accepted:
             return ExecutionResult("REJECTED", risk.reason, balance=latest_account.cash_balance, equity=latest_account.equity)
