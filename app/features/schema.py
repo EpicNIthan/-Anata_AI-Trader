@@ -20,6 +20,20 @@ REGIME_FEATURE_COLUMNS = [
     "regime_crowd_pressure",
 ]
 
+SPOT_CONTEXT_FEATURE_COLUMNS = [
+    "spot_price_change_24h",
+    "spot_volume_24h",
+    "spot_quote_volume_24h",
+    "spot_trade_count_24h",
+    "spot_weighted_avg_price",
+    "spot_bid_ask_spread_pct",
+    "spot_orderbook_imbalance",
+    "spot_depth_bid_notional_5",
+    "spot_depth_ask_notional_5",
+    "spot_intraday_range_pct",
+    "spot_activity_score",
+]
+
 FEATURE_COLUMNS_BY_SCHEMA: dict[str, list[str]] = {
     "price-news-v1": [
         "price_change",
@@ -98,6 +112,7 @@ FEATURE_COLUMNS_BY_SCHEMA: dict[str, list[str]] = {
         "trader_crowd_score",
         "crowd_risk_score",
         "derivatives_recency_weight",
+        *SPOT_CONTEXT_FEATURE_COLUMNS,
         "fear_greed_value",
         "fear_greed_change_1d",
         "fear_greed_change_24h",
@@ -167,6 +182,17 @@ DEFAULT_FEATURE_VALUES: dict[str, float | None] = {
     "trader_crowd_score": 0.0,
     "crowd_risk_score": 0.0,
     "derivatives_recency_weight": 0.0,
+    "spot_price_change_24h": 0.0,
+    "spot_volume_24h": 0.0,
+    "spot_quote_volume_24h": 0.0,
+    "spot_trade_count_24h": 0.0,
+    "spot_weighted_avg_price": 0.0,
+    "spot_bid_ask_spread_pct": 0.0,
+    "spot_orderbook_imbalance": 0.0,
+    "spot_depth_bid_notional_5": 0.0,
+    "spot_depth_ask_notional_5": 0.0,
+    "spot_intraday_range_pct": 0.0,
+    "spot_activity_score": 0.0,
     "fear_greed_value": 0.0,
     "fear_greed_change_1d": 0.0,
     "fear_greed_change_24h": 0.0,
@@ -253,16 +279,30 @@ def derived_regime_values(values: dict[str, Any]) -> dict[str, float]:
     crowd_risk = _float_value(values, "crowd_risk_score")
     open_interest_change = abs(_float_value(values, "open_interest_change"))
     funding_rate = abs(_float_value(values, "funding_rate"))
+    spot_spread = abs(_float_value(values, "spot_bid_ask_spread_pct"))
+    spot_imbalance = abs(_float_value(values, "spot_orderbook_imbalance"))
+    spot_range = abs(_float_value(values, "spot_intraday_range_pct"))
+    spot_activity = _float_value(values, "spot_activity_score")
 
     trend_strength = _clip(max(abs(trend), min(abs(candle_5m) * 80.0, 1.0)))
     direction_score = _clip(trend + candle_5m * 40.0, -1.0, 1.0)
-    volatility_score = _clip(math.tanh(volatility * 120.0), 0.0, 1.0)
+    volatility_score = _clip(max(math.tanh(volatility * 120.0), min(spot_range * 15.0, 1.0)), 0.0, 1.0)
     news_shock = _clip(max(abs(sentiment) * max(impact, 0.0), risk, regulation, fed, war, security))
     risk_off = _clip(max(risk, macro, world, regulation, fed, war, security, stablecoin))
-    liquidity_stress = _clip(max(liquidation, min(open_interest_change * 25.0, 1.0), min(funding_rate * 500.0, 1.0)))
-    breakout = _clip(max(abs(candle_5m) * 70.0, max(volume_change, 0.0) * 0.15) * max(0.25, trend_strength))
+    liquidity_stress = _clip(
+        max(
+            liquidation,
+            min(open_interest_change * 25.0, 1.0),
+            min(funding_rate * 500.0, 1.0),
+            min(spot_spread * 200.0, 1.0),
+        )
+    )
+    breakout = _clip(
+        max(abs(candle_5m) * 70.0, max(volume_change, 0.0) * 0.15, spot_activity, spot_range * 10.0)
+        * max(0.25, trend_strength)
+    )
     mean_reversion = _clip(volatility_score * (1.0 - min(trend_strength, 1.0)) * (1.0 - min(news_shock, 1.0)))
-    crowd_pressure = _clip(max(crowd, crowd_risk, abs(_float_value(values, "crowd_long_short_ratio") - 1.0) * 0.25))
+    crowd_pressure = _clip(max(crowd, crowd_risk, spot_imbalance, abs(_float_value(values, "crowd_long_short_ratio") - 1.0) * 0.25))
 
     return {
         "regime_trend_strength": trend_strength,
