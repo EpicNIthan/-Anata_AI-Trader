@@ -277,6 +277,15 @@ def derived_regime_values(values: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def _fill_missing_regime_values(values: dict[str, Any]) -> dict[str, Any]:
+    output = dict(values)
+    derived = derived_regime_values(output)
+    for key, value in derived.items():
+        if key not in values or values.get(key) in (None, ""):
+            output[key] = value
+    return output
+
+
 @dataclass(frozen=True)
 class FeatureVector:
     schema_version: str
@@ -297,8 +306,7 @@ def feature_payload(
     sources: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     safe_values = dict(DEFAULT_FEATURE_VALUES)
-    safe_values.update(values)
-    safe_values.update({key: value for key, value in derived_regime_values(safe_values).items() if key not in values})
+    safe_values.update(_fill_missing_regime_values(values))
     return {
         "schema_version": schema_version,
         "values": safe_values,
@@ -329,8 +337,7 @@ def values_from_feature(feature: Feature | dict[str, Any], feature_columns: list
 
     columns = feature_columns or columns_for_schema(schema_version)
     safe_values = dict(DEFAULT_FEATURE_VALUES)
-    safe_values.update(values)
-    safe_values.update({key: value for key, value in derived_regime_values(safe_values).items() if key not in safe_values or safe_values.get(key) in (None, "")})
+    safe_values.update(_fill_missing_regime_values(values))
     output: dict[str, Any] = {}
     for column in columns:
         output[column] = safe_values.get(column, DEFAULT_FEATURE_VALUES.get(column, 0.0))
