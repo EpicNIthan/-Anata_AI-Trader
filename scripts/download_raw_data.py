@@ -94,6 +94,27 @@ def _zip_manifest(path: Path) -> dict:
             return json.loads(handle.read().decode("utf-8"))
 
 
+def _finished_days_from_manifest(manifest: dict) -> list[str]:
+    days = manifest.get("finished_days")
+    if isinstance(days, list):
+        return sorted({str(day)[:10] for day in days if str(day).strip()})
+
+    day_manifests = manifest.get("day_manifests")
+    if isinstance(day_manifests, dict):
+        finished: list[str] = []
+        for day, day_manifest in day_manifests.items():
+            if not isinstance(day_manifest, dict):
+                continue
+            if day_manifest.get("is_finished") is True or day_manifest.get("status") == "finished":
+                finished.append(str(day)[:10])
+        return sorted({day for day in finished if day})
+
+    statuses = manifest.get("day_statuses")
+    if isinstance(statuses, dict):
+        return sorted({str(day)[:10] for day, status in statuses.items() if status == "finished"})
+    return []
+
+
 def _split_daily_archive(archive_path: Path, output_dir: Path) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
@@ -189,6 +210,8 @@ def main() -> None:
         local_manifest = _zip_manifest(output)
         manifest = export.get("manifest") or local_manifest
         split_result = _split_daily_archive(output, args.output_dir) if args.daily_files else None
+        finished_days = _finished_days_from_manifest(manifest) if args.daily_files else []
+        unfinished_days = manifest.get("unfinished_days", []) if isinstance(manifest.get("unfinished_days"), list) else []
         bundle_removed = False
         if args.daily_files and not args.keep_daily_bundle and split_result and output.exists():
             output.unlink()
@@ -204,14 +227,21 @@ def main() -> None:
             "time_range": manifest.get("time_range", {}),
             "symbols": manifest.get("symbols", []),
             "warnings": manifest.get("warnings", []),
+            "finished_days": finished_days,
+            "unfinished_days": unfinished_days,
             "daily_split": split_result,
             "cleanup": None,
         }
         if args.cleanup_after_download:
             cleanup_options = dict(export_options)
             if args.daily_files and args.delete_railway_db_rows:
-                cleanup_options["until_date"] = _finished_cutoff_iso(args.finished_older_than_hours)
-                cleanup_options["use_all_data"] = False
+                for key in ("daily_files", "date", "since_date", "until_date", "use_all_data"):
+                    cleanup_options.pop(key, None)
+                cleanup_options["delete_finished_days"] = finished_days
+                cleanup_options["protect_unfinished_days"] = True
+                if not finished_days:
+                    cleanup_options["until_date"] = _finished_cutoff_iso(args.finished_older_than_hours)
+                    cleanup_options["use_all_data"] = False
             cleanup_body = {
                 **cleanup_options,
                 "archive_id": archive_id,
