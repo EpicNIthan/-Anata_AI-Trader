@@ -28,7 +28,19 @@ NON_FEATURE_COLUMNS = {
     "target_take_profit_hit_first",
     "target_direction_15m",
     "target_trade_quality_score",
+    "target_best_margin_pct",
+    "target_best_leverage",
+    "target_best_stop_loss_pct",
+    "target_best_take_profit_pct",
+    "target_best_hold_seconds",
 }
+PLAN_TARGETS = [
+    "target_best_margin_pct",
+    "target_best_leverage",
+    "target_best_stop_loss_pct",
+    "target_best_take_profit_pct",
+    "target_best_hold_seconds",
+]
 
 
 def _dataset_hash(path: Path) -> str:
@@ -166,11 +178,64 @@ def _feature_importance(model: Any, feature_columns: list[str]) -> dict[str, flo
     return {name: float(value) for name, value in pairs[:80]}
 
 
-def _package_model(model_path: Path, metadata: dict[str, Any], output_dir: Path) -> Path:
+def _add_plan_targets(frame, *, max_margin_pct: float = 0.10, max_leverage: float = 125.0):
+    import numpy as np
+
+    output = frame.copy()
+    if "target_future_return_15m" not in output or "target_trade_quality_score" not in output:
+        return output
+    ret_15m = output["target_future_return_15m"].astype(float)
+    quality = output["target_trade_quality_score"].astype(float)
+    upside = output["target_max_upside_1h"].astype(float) if "target_max_upside_1h" in output else ret_15m.clip(lower=0.0)
+    drawdown = output["target_max_drawdown_1h"].astype(float) if "target_max_drawdown_1h" in output else ret_15m.clip(upper=0.0)
+    take_first = output["target_take_profit_hit_first"].astype(float) if "target_take_profit_hit_first" in output else 0.0
+    strength = ((quality + 0.004) / 0.035).clip(lower=0.0, upper=1.0)
+    edge_strength = (ret_15m.abs() / 0.025).clip(lower=0.0, upper=1.0)
+    plan_strength = np.maximum(strength, edge_strength * 0.65)
+    output["target_best_margin_pct"] = (0.0025 + max_margin_pct * plan_strength).clip(lower=0.0025, upper=max_margin_pct)
+    output["target_best_leverage"] = (1.0 + (max_leverage - 1.0) * plan_strength).clip(lower=1.0, upper=max_leverage)
+    stop_pct = np.maximum(drawdown.abs() * 1.15, ret_15m.abs() * 0.65).clip(lower=0.003, upper=0.08)
+    take_pct = np.maximum(upside.abs() * 0.90, ret_15m.abs() * 1.8).clip(lower=0.006, upper=0.20)
+    output["target_best_stop_loss_pct"] = stop_pct
+    output["target_best_take_profit_pct"] = take_pct
+    hold_scale = (1.0 - edge_strength).clip(lower=0.0, upper=1.0)
+    output["target_best_hold_seconds"] = (900 + (14400 - 900) * hold_scale - (take_first * 1800)).clip(lower=300, upper=14400)
+    return output
+
+
+def _train_plan_models(model_type: str, train_frame, feature_columns: list[str], out_dir: Path, version: str):
+    import joblib
+
+    model_files: dict[str, str] = {}
+    metrics: dict[str, Any] = {}
+    x_all = train_frame[feature_columns].fillna(0.0).astype(float)
+    for target in PLAN_TARGETS:
+        if target not in train_frame:
+            continue
+        target_frame = train_frame.dropna(subset=[target])
+        if len(target_frame) < 100:
+            metrics[target] = {"status": "skipped", "rows": int(len(target_frame))}
+            continue
+        model = _make_model(model_type)
+        x_target = target_frame[feature_columns].fillna(0.0).astype(float)
+        y_target = target_frame[target].astype(float)
+        model.fit(x_target, y_target)
+        model_path = out_dir / f"model_{version}_{target}.joblib"
+        joblib.dump(model, model_path)
+        model_files[target] = model_path.name
+        predicted = model.predict(x_target)
+        mae = float(abs(predicted - y_target.to_numpy()).mean()) if len(target_frame) else 0.0
+        metrics[target] = {"status": "trained", "rows": int(len(target_frame)), "mae_in_sample": mae}
+    return model_files, metrics
+
+
+def _package_model(model_path: Path, metadata: dict[str, Any], output_dir: Path, extra_paths: list[Path] | None = None) -> Path:
     package_path = output_dir / f"model_package_{metadata['version']}.zip"
     metadata["model_file"] = model_path.name
     with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.write(model_path, model_path.name)
+        for extra_path in extra_paths or []:
+            archive.write(extra_path, extra_path.name)
         archive.writestr("metadata.json", json.dumps(metadata, indent=2, default=str))
     return package_path
 
@@ -190,6 +255,8 @@ def main() -> None:
         help="Comma-separated model types.",
     )
     parser.add_argument("--min-trades", type=int, default=10)
+    parser.add_argument("--max-plan-margin-pct", type=float, default=0.10)
+    parser.add_argument("--max-plan-leverage", type=float, default=125.0)
     args = parser.parse_args()
 
     try:
@@ -206,6 +273,7 @@ def main() -> None:
     frame = frame.dropna(subset=["as_of"]).sort_values("as_of")
     if args.target not in frame.columns:
         raise SystemExit(f"Dataset is missing target column {args.target}.")
+    frame = _add_plan_targets(frame, max_margin_pct=args.max_plan_margin_pct, max_leverage=args.max_plan_leverage)
     return_column = args.return_column if args.return_column in frame.columns else args.target
     train_frame = frame.dropna(subset=[args.target, return_column]).copy()
     if len(train_frame) < 100:
@@ -285,6 +353,7 @@ def main() -> None:
         "total_labeled_rows": int(len(train_frame)),
         "dataset_days": dataset_days,
         "feature_columns": len(feature_columns),
+        "plan_targets": [target for target in PLAN_TARGETS if target in train_frame],
         "data_readiness": _data_readiness(int(len(train_frame)), dataset_days),
         "baseline": baseline_metrics,
         "candidates": candidates,
@@ -303,6 +372,8 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model_path = args.out_dir / f"model_{version}.joblib"
     joblib.dump(final_model, model_path)
+    plan_model_files, plan_model_metrics = _train_plan_models(best["model_type"], train_frame, feature_columns, args.out_dir, version)
+    plan_model_paths = [args.out_dir / filename for filename in plan_model_files.values()]
     metadata = {
         "model_id": f"{best['model_type']}:{version}",
         "name": best["model_type"],
@@ -314,6 +385,8 @@ def main() -> None:
         "feature_columns": feature_columns,
         "target": args.target,
         "return_column": return_column,
+        "plan_model_files": plan_model_files,
+        "plan_targets": PLAN_TARGETS,
         "training_dataset_path": str(args.dataset),
         "training_dataset_hash": _dataset_hash(args.dataset),
         "metrics": best["metrics"] | {
@@ -322,21 +395,23 @@ def main() -> None:
             "train_rows": int(len(training)),
             "total_labeled_rows": int(len(train_frame)),
             "dataset_days": dataset_days,
+            "plan_model_metrics": plan_model_metrics,
         },
         "feature_importance": _feature_importance(final_model, feature_columns),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     metadata_path = args.out_dir / f"model_{version}.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    package_path = _package_model(model_path, metadata, args.out_dir)
+    package_path = _package_model(model_path, metadata, args.out_dir, extra_paths=plan_model_paths)
     result.update(
         {
             "status": "passed",
-            "message": "Best model passed safety checks and was packaged as a candidate. Upload/activate explicitly.",
+            "message": "Best model passed safety checks and was packaged with AI trade-plan models. Upload/activate explicitly.",
             "failed_safety_checks": False,
             "next_steps": ["Upload the model package, then activate it from the dashboard Training tab."],
             "best_model": best,
             "model": str(model_path),
+            "plan_models": plan_model_files,
             "metadata": str(metadata_path),
             "package": str(package_path),
             "model_id": metadata["model_id"],
