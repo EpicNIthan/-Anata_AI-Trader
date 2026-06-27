@@ -1,21 +1,23 @@
-# CoinGecko Historical Collector
+# CoinGecko + GDELT Historical Collector
 
-Standalone PC-only collector for building Anata raw daily files from free CoinGecko historical market data.
+Standalone PC-only collector for building Anata raw daily files from free historical market/news sources.
 
-This folder is intentionally isolated from the FastAPI/Railway app. It does not import `app/*`, does not start collectors, does not trade, and does not write to the database. It only writes ZIP files under the existing training data folder:
+This folder is intentionally isolated from the FastAPI/Railway app. It does not import `app/*`, does not start collectors, does not trade, and does not write to the database.
+
+It writes training-compatible data under:
 
 ```text
+datasets/raw_days/
+```
+
+By default it writes both:
+
+```text
+datasets/raw_days/coingecko_history/YYYY-MM-DD/*.gz
 datasets/raw_days/raw_YYYY-MM-DD.zip
 ```
 
-Those files are compatible with the normal local prepare/train flow:
-
-```powershell
-python scripts/prepare_training_data.py `
-  --input datasets/raw_days `
-  --output-dir datasets/processed `
-  --news-converter smart
-```
+The expanded `coingecko_history/YYYY-MM-DD` folders are what `scripts/prepare_training_data.py` reads directly. The ZIP files are kept as compressed daily backups.
 
 ## What It Collects
 
@@ -25,6 +27,19 @@ From CoinGecko `/coins/{id}/market_chart/range`:
 price history
 market cap history
 total volume history
+derived return/trend/volatility features
+```
+
+From GDELT DOC 2.0 Article List:
+
+```text
+historical crypto/news headlines
+article URLs
+published time
+source domain
+language
+source country
+basic raw_text made from headline + metadata
 ```
 
 The collector writes each day as:
@@ -33,6 +48,7 @@ The collector writes each day as:
 candles.csv.gz
 training_features.jsonl.gz
 external_data_events.jsonl.gz
+news_articles.jsonl.gz
 manifest.json
 ```
 
@@ -47,6 +63,8 @@ CoinGecko price data is aggregated market data.
 CoinGecko volume is total volume at the timestamp, not Binance candle volume.
 CoinGecko free historical range is normally limited to the past 365 days.
 CoinGecko granularity is automatic.
+GDELT gives headlines/URLs/metadata, not full article bodies.
+Some old GDELT windows can be sparse or unavailable depending on API coverage.
 ```
 
 Default `--chunk-days 80` is used because CoinGecko normally returns hourly data for ranges up to 90 days. If you request more than 90 days in one API call, it normally returns daily data instead.
@@ -94,6 +112,32 @@ python historical_collectors/coingecko_history/collect_coingecko_history.py `
   --days 30 `
   --symbols BTCUSDT,ETHUSDT,SOLUSDT `
   --output-dir datasets/raw_days
+```
+
+## Market Only
+
+If GDELT is slow or you only want market data:
+
+```powershell
+python historical_collectors/coingecko_history/collect_coingecko_history.py `
+  --days 365 `
+  --no-include-gdelt-news
+```
+
+## News Query
+
+Default GDELT query:
+
+```text
+bitcoin OR btc OR ethereum OR eth OR solana OR xrp OR cardano OR dogecoin OR avalanche OR chainlink OR litecoin OR crypto OR cryptocurrency OR stablecoin OR binance OR coinbase OR etf
+```
+
+Custom query example:
+
+```powershell
+python historical_collectors/coingecko_history/collect_coingecko_history.py `
+  --days 90 `
+  --gdelt-query '(bitcoin OR ethereum OR crypto OR etf OR stablecoin OR binance)'
 ```
 
 ## Default Coins
@@ -149,12 +193,15 @@ large volatility periods
 market cap context
 volume regime changes
 older bull/bear/range periods
+news headline sentiment context
+macro/regulation/security keywords from old news
 ```
 
 It does not replace real-time exchange data. The best setup is:
 
 ```text
 CoinGecko history = fast old market context
+GDELT history = old headline/news context
 Railway real-time collector = cleaner live exchange candles/news/trades
 PC prepare/train = combine both into training data
 ```
