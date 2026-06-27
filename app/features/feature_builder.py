@@ -154,6 +154,17 @@ class FeatureBuilder:
             "trader_crowd_score": derivatives_features["trader_crowd_score"],
             "crowd_risk_score": derivatives_features["crowd_risk_score"],
             "derivatives_recency_weight": derivatives_features["derivatives_recency_weight"],
+            "spot_price_change_24h": external_features["spot_price_change_24h"],
+            "spot_volume_24h": external_features["spot_volume_24h"],
+            "spot_quote_volume_24h": external_features["spot_quote_volume_24h"],
+            "spot_trade_count_24h": external_features["spot_trade_count_24h"],
+            "spot_weighted_avg_price": external_features["spot_weighted_avg_price"],
+            "spot_bid_ask_spread_pct": external_features["spot_bid_ask_spread_pct"],
+            "spot_orderbook_imbalance": external_features["spot_orderbook_imbalance"],
+            "spot_depth_bid_notional_5": external_features["spot_depth_bid_notional_5"],
+            "spot_depth_ask_notional_5": external_features["spot_depth_ask_notional_5"],
+            "spot_intraday_range_pct": external_features["spot_intraday_range_pct"],
+            "spot_activity_score": external_features["spot_activity_score"],
             "fear_greed_value": external_features["fear_greed_value"],
             "fear_greed_change_1d": external_features["fear_greed_change_1d"],
             "fear_greed_change_24h": external_features["fear_greed_change_24h"],
@@ -221,6 +232,17 @@ class FeatureBuilder:
                 "trader_crowd_score",
                 "crowd_risk_score",
                 "derivatives_recency_weight",
+                "spot_price_change_24h",
+                "spot_volume_24h",
+                "spot_quote_volume_24h",
+                "spot_trade_count_24h",
+                "spot_weighted_avg_price",
+                "spot_bid_ask_spread_pct",
+                "spot_orderbook_imbalance",
+                "spot_depth_bid_notional_5",
+                "spot_depth_ask_notional_5",
+                "spot_intraday_range_pct",
+                "spot_activity_score",
                 "fear_greed_value",
                 "fear_greed_change_1d",
                 "fear_greed_change_24h",
@@ -274,6 +296,9 @@ class FeatureBuilder:
                 "trader_crowd_score": derivatives_features["trader_crowd_score"],
                 "crowd_risk_score": derivatives_features["crowd_risk_score"],
                 "taker_buy_pressure": derivatives_features["taker_buy_pressure"],
+                "spot_activity_score": external_features["spot_activity_score"],
+                "spot_orderbook_imbalance": external_features["spot_orderbook_imbalance"],
+                "spot_bid_ask_spread_pct": external_features["spot_bid_ask_spread_pct"],
                 "market_regime_score": external_features["market_regime_score"],
                 "macro_risk_score": external_features["macro_risk_score"],
                 "stablecoin_depeg_risk": external_features["stablecoin_depeg_risk"],
@@ -447,6 +472,7 @@ class FeatureBuilder:
                         [
                             "alternative_me_fear_greed",
                             "coingecko_global_market",
+                            "binance_spot_context",
                             "binance_futures_liquidations",
                             "defillama_stablecoin_risk",
                             "macro_risk_news",
@@ -454,7 +480,7 @@ class FeatureBuilder:
                     ),
                 )
                 .order_by(desc(ExternalDataEvent.event_time))
-                .limit(300)
+                .limit(400)
             )
         )
 
@@ -498,6 +524,17 @@ class FeatureBuilder:
         btc_dominance_change = value("btc_dominance_change")
         btc_dominance_change_24h = value("btc_dominance_change_24h", btc_dominance_change)
         eth_dominance = value("eth_dominance")
+        spot_price_change_24h = value("spot_price_change_24h", symbol_first=True)
+        spot_volume_24h = value("spot_volume_24h", symbol_first=True)
+        spot_quote_volume_24h = value("spot_quote_volume_24h", symbol_first=True)
+        spot_trade_count_24h = value("spot_trade_count_24h", symbol_first=True)
+        spot_weighted_avg_price = value("spot_weighted_avg_price", symbol_first=True)
+        spot_bid_ask_spread_pct = value("spot_bid_ask_spread_pct", symbol_first=True)
+        spot_orderbook_imbalance = value("spot_orderbook_imbalance", symbol_first=True)
+        spot_depth_bid_notional_5 = value("spot_depth_bid_notional_5", symbol_first=True)
+        spot_depth_ask_notional_5 = value("spot_depth_ask_notional_5", symbol_first=True)
+        spot_intraday_range_pct = value("spot_intraday_range_pct", symbol_first=True)
+        spot_activity_score = value("spot_activity_score", symbol_first=True)
         liquidation_long_usd_1m = value("liquidation_long_usd_1m", symbol_first=True)
         liquidation_short_usd_1m = value("liquidation_short_usd_1m", symbol_first=True)
         liquidation_long_usd_5m = value("liquidation_long_usd_5m", symbol_first=True)
@@ -534,9 +571,11 @@ class FeatureBuilder:
             1.0,
         )
         liquidation_drag = _clamp(liquidation_spike_score / 5.0, 0.0, 1.0)
+        spot_liquidity_bias = _clamp((spot_activity_score * 0.5) - (spot_bid_ask_spread_pct * 100.0), -0.5, 0.5)
         market_regime_score = _clamp(
             fear_greed_bias * 0.25
-            + growth_bias * 0.30
+            + growth_bias * 0.25
+            + spot_liquidity_bias * 0.10
             + etf_bullish_score * 0.20
             - risk_drag * 0.35
             - liquidation_drag * 0.10,
@@ -557,6 +596,17 @@ class FeatureBuilder:
             "btc_dominance_change": btc_dominance_change,
             "btc_dominance_change_24h": btc_dominance_change_24h,
             "eth_dominance": eth_dominance,
+            "spot_price_change_24h": spot_price_change_24h,
+            "spot_volume_24h": spot_volume_24h,
+            "spot_quote_volume_24h": spot_quote_volume_24h,
+            "spot_trade_count_24h": spot_trade_count_24h,
+            "spot_weighted_avg_price": spot_weighted_avg_price,
+            "spot_bid_ask_spread_pct": spot_bid_ask_spread_pct,
+            "spot_orderbook_imbalance": spot_orderbook_imbalance,
+            "spot_depth_bid_notional_5": spot_depth_bid_notional_5,
+            "spot_depth_ask_notional_5": spot_depth_ask_notional_5,
+            "spot_intraday_range_pct": spot_intraday_range_pct,
+            "spot_activity_score": spot_activity_score,
             "liquidation_long_usd_1m": liquidation_long_usd_1m,
             "liquidation_short_usd_1m": liquidation_short_usd_1m,
             "liquidation_long_usd_5m": liquidation_long_usd_5m,
@@ -595,6 +645,7 @@ class FeatureBuilder:
             "source_freshness": {
                 "fear_greed": freshness("alternative_me_fear_greed", ["fear_greed_value"], stale_after_hours=30.0),
                 "global_market": freshness("coingecko_global_market", ["global_market_cap_change_24h", "market_cap_change_24h"], stale_after_hours=12.0),
+                "spot_context": freshness("binance_spot_context", ["spot_activity_score"], symbol_first=True, stale_after_hours=1.0),
                 "liquidations": freshness("binance_futures_liquidations", ["liquidation_total_usd_5m"], symbol_first=True, stale_after_hours=1.0),
                 "stablecoin_risk": freshness("defillama_stablecoin_risk", ["stablecoin_depeg_risk"], stale_after_hours=30.0),
                 "macro_risk": freshness("macro_risk_news", ["macro_risk_score"], stale_after_hours=12.0),
@@ -604,6 +655,7 @@ class FeatureBuilder:
                 for name, item in {
                     "fear_greed": freshness("alternative_me_fear_greed", ["fear_greed_value"], stale_after_hours=30.0),
                     "global_market": freshness("coingecko_global_market", ["global_market_cap_change_24h", "market_cap_change_24h"], stale_after_hours=12.0),
+                    "spot_context": freshness("binance_spot_context", ["spot_activity_score"], symbol_first=True, stale_after_hours=1.0),
                     "liquidations": freshness("binance_futures_liquidations", ["liquidation_total_usd_5m"], symbol_first=True, stale_after_hours=1.0),
                     "stablecoin_risk": freshness("defillama_stablecoin_risk", ["stablecoin_depeg_risk"], stale_after_hours=30.0),
                     "macro_risk": freshness("macro_risk_news", ["macro_risk_score"], stale_after_hours=12.0),
