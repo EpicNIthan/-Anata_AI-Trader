@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shutil
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +73,12 @@ MODEL_DELETE_ORDER = [
 ]
 
 
+POSTGRES_SIZE_NOTE = (
+    "PostgreSQL may keep the same reported Railway DB size after DELETE. "
+    "Deleted pages are reusable by future rows; visible size shrink usually needs vacuum/repack outside this request."
+)
+
+
 def _normalize_symbols(value: Any) -> list[str] | None:
     if isinstance(value, str):
         symbols = [item.strip().upper() for item in value.split(",") if item.strip()]
@@ -81,6 +87,26 @@ def _normalize_symbols(value: Any) -> list[str] | None:
         symbols = [str(item).strip().upper() for item in value if str(item).strip()]
         return symbols or None
     return None
+
+
+def _normalize_days(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        values = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        return []
+    days: list[str] = []
+    for item in values:
+        day = date.fromisoformat(item[:10]).isoformat()
+        days.append(day)
+    return sorted(set(days))
+
+
+def _day_range(day: str) -> tuple[datetime, datetime]:
+    selected = date.fromisoformat(day[:10])
+    start = datetime.combine(selected, time.min, tzinfo=timezone.utc)
+    return start, start + timedelta(days=1)
 
 
 def _safe_remove_path(path: Path, *, root: Path) -> bool:
@@ -126,6 +152,7 @@ def _delete_finished_data(payload: dict[str, Any]) -> dict[str, Any]:
         return {"mode": "all", "deleted": deleted, "missing": missing}
 
     dates: list[str] = []
+    dates.extend(_normalize_days(payload.get("delete_finished_days")))
     for key in ("date", "day"):
         if payload.get(key):
             dates.append(str(payload[key])[:10])
@@ -167,8 +194,36 @@ def _delete_rows_for_spec(
     return int(result.rowcount or 0)
 
 
+def _delete_raw_database_days(session: Session, payload: dict[str, Any], days: list[str]) -> dict[str, Any]:
+    symbols = _normalize_symbols(payload.get("symbols"))
+    deleted_rows: dict[str, int] = {name: 0 for name in DELETE_ORDER}
+    time_ranges: list[dict[str, str]] = []
+    for day in days:
+        start, end = _day_range(day)
+        time_ranges.append({"day": day, "start": start.isoformat(), "end": end.isoformat()})
+        for name in DELETE_ORDER:
+            spec = RAW_TABLES_BY_NAME[name]
+            deleted_rows[name] += _delete_rows_for_spec(session, spec, start=start, end=end, symbols=symbols)
+    session.commit()
+    return {
+        "mode": "finished_days",
+        "finished_days": days,
+        "time_ranges": time_ranges,
+        "symbols": symbols,
+        "deleted_rows": deleted_rows,
+        "total_deleted_rows": sum(deleted_rows.values()),
+        "database_size_note": POSTGRES_SIZE_NOTE,
+    }
+
+
 def delete_raw_database_rows(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    finished_days = _normalize_days(payload.get("delete_finished_days"))
+    if finished_days:
+        return _delete_raw_database_days(session, payload, finished_days)
+
     start, end, _day_name = _export_range(payload)
+    if payload.get("daily_files") and payload.get("use_all_data") and start is None and end is None:
+        raise ValueError("Refusing to delete all DB rows for daily-file cleanup without delete_finished_days or until_date.")
     symbols = _normalize_symbols(payload.get("symbols"))
     deleted_rows: dict[str, int] = {}
     for name in DELETE_ORDER:
@@ -176,6 +231,7 @@ def delete_raw_database_rows(session: Session, payload: dict[str, Any]) -> dict[
         deleted_rows[name] = _delete_rows_for_spec(session, spec, start=start, end=end, symbols=symbols)
     session.commit()
     return {
+        "mode": "time_range",
         "time_range": {
             "start": start.isoformat() if start else None,
             "end": end.isoformat() if end else None,
@@ -183,6 +239,7 @@ def delete_raw_database_rows(session: Session, payload: dict[str, Any]) -> dict[
         "symbols": symbols,
         "deleted_rows": deleted_rows,
         "total_deleted_rows": sum(deleted_rows.values()),
+        "database_size_note": POSTGRES_SIZE_NOTE,
     }
 
 
@@ -200,6 +257,7 @@ def cleanup_downloaded_raw_data(session: Session, payload: dict[str, Any] | None
         "deleted_archive": None,
         "deleted_finished_data": None,
         "deleted_database_rows": None,
+        "database_size_note": POSTGRES_SIZE_NOTE,
     }
 
     if payload.get("delete_archive", True):
