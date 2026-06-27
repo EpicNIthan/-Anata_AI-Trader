@@ -36,6 +36,8 @@ async def lifespan(app: FastAPI):
     await data_lifecycle.start()
     if settings.enable_market_collector:
         await manager.start("market")
+    if settings.enable_spot_context_collector:
+        await manager.start("spot_context")
     if settings.enable_news_collector:
         await manager.start("news")
     if settings.enable_derivatives_collector:
@@ -90,6 +92,7 @@ def health() -> dict[str, object]:
         "auto_trader_enabled": settings.auto_trader_enabled,
         "derivatives_enabled": settings.derivatives_enabled,
         "external_collectors_enabled": {
+            "spot_context": settings.enable_spot_context_collector,
             "fear_greed": settings.enable_fear_greed_collector,
             "global_market": settings.enable_global_market_collector,
             "liquidations": settings.enable_liquidation_collector,
