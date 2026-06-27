@@ -11,6 +11,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.ai.strategy import StrategyDecision
+from app.ai.symbol_identity import symbol_identity_values
 from app.config import settings
 from app.db.models import Feature, ModelVersion
 from app.features.schema import numeric_vector, values_from_feature
@@ -54,7 +55,7 @@ class PriceModelStrategy:
             self.last_fallback_reason = "Active model has no feature_columns metadata."
             return None
 
-        vector = numeric_vector(feature, feature_columns)
+        vector = self._feature_vector(feature, feature_columns)
         predicted_return = self._predict(payload, vector)
         if predicted_return is None:
             self.last_fallback_reason = self.last_fallback_reason or "Active model type is not compatible with Railway inference."
@@ -123,6 +124,16 @@ class PriceModelStrategy:
             model,
             prediction,
         )
+
+    def _feature_vector(self, feature: Feature, feature_columns: list[str]) -> list[float]:
+        if not any(column.startswith("symbol_") for column in feature_columns):
+            return numeric_vector(feature, feature_columns)
+        values = values_from_feature(feature, feature_columns)
+        values.update(symbol_identity_values(feature.symbol))
+        vector: list[float] = []
+        for column in feature_columns:
+            vector.append(float(values.get(column, 0.0) or 0.0))
+        return vector
 
     def _load_model_payload(self, model: ModelVersion) -> dict[str, Any] | None:
         payload = dict(model.raw_payload or {})
