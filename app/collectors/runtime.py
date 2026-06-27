@@ -9,6 +9,7 @@ from app.collectors.derivatives_collector import BinanceDerivativesCollector
 from app.collectors.external_market_collectors import ExternalMarketCollectorManager, LiquidationCollector
 from app.collectors.market_collector import BinanceMarketCollector
 from app.collectors.news_collector import NewsCollector
+from app.collectors.spot_context_collector import BinanceSpotContextCollector
 
 
 @dataclass
@@ -75,6 +76,7 @@ class WorkerManager:
         self._stop_events: dict[str, asyncio.Event] = {}
         self._states: dict[str, CollectorState] = {
             "market": CollectorState(name="market"),
+            "spot_context": CollectorState(name="spot_context"),
             "news": CollectorState(name="news"),
             "derivatives": CollectorState(name="derivatives"),
             "external": CollectorState(name="external"),
@@ -98,6 +100,7 @@ class WorkerManager:
         state.warning = None
 
         market_collector: BinanceMarketCollector | None = None
+        spot_context_collector: BinanceSpotContextCollector | None = None
         news_collector: NewsCollector | None = None
         derivatives_collector: BinanceDerivativesCollector | None = None
         external_collector: ExternalMarketCollectorManager | None = None
@@ -106,6 +109,13 @@ class WorkerManager:
             market_collector = BinanceMarketCollector()
             state.set_subscription(streams=market_collector.subscribed_streams, websocket_url=market_collector.stream_url)
             state.closed_candles_only = True
+        elif name == "spot_context":
+            spot_context_collector = BinanceSpotContextCollector()
+            state.details = {
+                "base_url": spot_context_collector.base_url,
+                "symbols": spot_context_collector.symbols,
+                "interval_seconds": spot_context_collector.interval_seconds,
+            }
         elif name == "news":
             news_collector = NewsCollector()
             if not news_collector.can_collect:
@@ -147,6 +157,8 @@ class WorkerManager:
             try:
                 if name == "market":
                     await (market_collector or BinanceMarketCollector()).run(stop_event, state)
+                elif name == "spot_context":
+                    await (spot_context_collector or BinanceSpotContextCollector()).run(stop_event, state)
                 elif name == "news":
                     await (news_collector or NewsCollector()).run(stop_event, state)
                 elif name == "derivatives":
