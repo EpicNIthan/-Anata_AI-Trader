@@ -82,6 +82,9 @@ class Settings:
     binance_futures_ws_base_url: str = os.getenv("BINANCE_FUTURES_WS_BASE_URL", "wss://fstream.binance.com")
 
     # Collector defaults are production/data-factory friendly so Railway does not need a huge variable list.
+    enable_spot_context_collector: bool = field(default_factory=lambda: _bool("ENABLE_SPOT_CONTEXT_COLLECTOR", True))
+    spot_context_poll_interval_seconds: int = field(default_factory=lambda: _int("SPOT_CONTEXT_POLL_INTERVAL_SECONDS", 300))
+    spot_context_symbols: list[str] = field(default_factory=lambda: _csv(os.getenv("SPOT_CONTEXT_SYMBOLS"), DEFAULT_SYMBOLS))
     derivatives_enabled: bool = field(default_factory=lambda: _bool("DERIVATIVES_ENABLED", True))
     enable_derivatives_collector: bool = field(default_factory=lambda: _bool("ENABLE_DERIVATIVES_COLLECTOR", True))
     derivatives_poll_interval_seconds: int = field(default_factory=lambda: _int("DERIVATIVES_POLL_INTERVAL_SECONDS", 300))
