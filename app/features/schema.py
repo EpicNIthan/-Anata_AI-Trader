@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 from app.db.models import Feature
 
 CURRENT_FEATURE_SCHEMA_VERSION = "price-news-market-v4"
+
+REGIME_FEATURE_COLUMNS = [
+    "regime_trend_strength",
+    "regime_direction_score",
+    "regime_volatility_score",
+    "regime_news_shock_score",
+    "regime_risk_off_score",
+    "regime_liquidity_stress_score",
+    "regime_breakout_pressure",
+    "regime_mean_reversion_pressure",
+    "regime_crowd_pressure",
+]
 
 FEATURE_COLUMNS_BY_SCHEMA: dict[str, list[str]] = {
     "price-news-v1": [
@@ -122,6 +135,7 @@ FEATURE_COLUMNS_BY_SCHEMA: dict[str, list[str]] = {
         "etf_bullish_score",
         "world_risk_score",
         "market_regime_score",
+        *REGIME_FEATURE_COLUMNS,
     ],
 }
 
@@ -190,10 +204,77 @@ DEFAULT_FEATURE_VALUES: dict[str, float | None] = {
     "etf_bullish_score": 0.0,
     "world_risk_score": 0.0,
     "market_regime_score": 0.0,
+    "regime_trend_strength": 0.0,
+    "regime_direction_score": 0.0,
+    "regime_volatility_score": 0.0,
+    "regime_news_shock_score": 0.0,
+    "regime_risk_off_score": 0.0,
+    "regime_liquidity_stress_score": 0.0,
+    "regime_breakout_pressure": 0.0,
+    "regime_mean_reversion_pressure": 0.0,
+    "regime_crowd_pressure": 0.0,
     "last_close": None,
     "candles_used": 0.0,
     "sentiment_articles_used": 0.0,
 }
+
+
+def _float_value(values: dict[str, Any], key: str, default: float = 0.0) -> float:
+    try:
+        value = values.get(key, default)
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clip(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def derived_regime_values(values: dict[str, Any]) -> dict[str, float]:
+    trend = _float_value(values, "trend_score")
+    candle_5m = _float_value(values, "candle_return_5m")
+    volatility = abs(_float_value(values, "volatility"))
+    volume_change = _float_value(values, "volume_change")
+    sentiment = _float_value(values, "sentiment_score")
+    risk = _float_value(values, "risk_score")
+    impact = _float_value(values, "impact_score")
+    macro = _float_value(values, "macro_risk_score")
+    world = _float_value(values, "world_risk_score")
+    regulation = _float_value(values, "regulation_risk_score")
+    fed = _float_value(values, "fed_risk_score")
+    war = _float_value(values, "war_risk_score")
+    security = _float_value(values, "security_risk_score")
+    stablecoin = _float_value(values, "stablecoin_depeg_risk")
+    liquidation = _float_value(values, "liquidation_spike_score")
+    crowd = abs(_float_value(values, "trader_crowd_score"))
+    crowd_risk = _float_value(values, "crowd_risk_score")
+    open_interest_change = abs(_float_value(values, "open_interest_change"))
+    funding_rate = abs(_float_value(values, "funding_rate"))
+
+    trend_strength = _clip(max(abs(trend), min(abs(candle_5m) * 80.0, 1.0)))
+    direction_score = _clip(trend + candle_5m * 40.0, -1.0, 1.0)
+    volatility_score = _clip(math.tanh(volatility * 120.0), 0.0, 1.0)
+    news_shock = _clip(max(abs(sentiment) * max(impact, 0.0), risk, regulation, fed, war, security))
+    risk_off = _clip(max(risk, macro, world, regulation, fed, war, security, stablecoin))
+    liquidity_stress = _clip(max(liquidation, min(open_interest_change * 25.0, 1.0), min(funding_rate * 500.0, 1.0)))
+    breakout = _clip(max(abs(candle_5m) * 70.0, max(volume_change, 0.0) * 0.15) * max(0.25, trend_strength))
+    mean_reversion = _clip(volatility_score * (1.0 - min(trend_strength, 1.0)) * (1.0 - min(news_shock, 1.0)))
+    crowd_pressure = _clip(max(crowd, crowd_risk, abs(_float_value(values, "crowd_long_short_ratio") - 1.0) * 0.25))
+
+    return {
+        "regime_trend_strength": trend_strength,
+        "regime_direction_score": direction_score,
+        "regime_volatility_score": volatility_score,
+        "regime_news_shock_score": news_shock,
+        "regime_risk_off_score": risk_off,
+        "regime_liquidity_stress_score": liquidity_stress,
+        "regime_breakout_pressure": breakout,
+        "regime_mean_reversion_pressure": mean_reversion,
+        "regime_crowd_pressure": crowd_pressure,
+    }
 
 
 @dataclass(frozen=True)
@@ -217,6 +298,7 @@ def feature_payload(
 ) -> dict[str, Any]:
     safe_values = dict(DEFAULT_FEATURE_VALUES)
     safe_values.update(values)
+    safe_values.update({key: value for key, value in derived_regime_values(safe_values).items() if key not in values})
     return {
         "schema_version": schema_version,
         "values": safe_values,
@@ -246,9 +328,12 @@ def values_from_feature(feature: Feature | dict[str, Any], feature_columns: list
         values = legacy
 
     columns = feature_columns or columns_for_schema(schema_version)
+    safe_values = dict(DEFAULT_FEATURE_VALUES)
+    safe_values.update(values)
+    safe_values.update({key: value for key, value in derived_regime_values(safe_values).items() if key not in safe_values or safe_values.get(key) in (None, "")})
     output: dict[str, Any] = {}
     for column in columns:
-        output[column] = values.get(column, DEFAULT_FEATURE_VALUES.get(column, 0.0))
+        output[column] = safe_values.get(column, DEFAULT_FEATURE_VALUES.get(column, 0.0))
     for optional_key in (
         "trend",
         "last_close",
@@ -257,7 +342,7 @@ def values_from_feature(feature: Feature | dict[str, Any], feature_columns: list
         "price_change",
         "final_ai_input",
     ):
-        output.setdefault(optional_key, values.get(optional_key, DEFAULT_FEATURE_VALUES.get(optional_key)))
+        output.setdefault(optional_key, safe_values.get(optional_key, DEFAULT_FEATURE_VALUES.get(optional_key)))
     output["schema_version"] = schema_version
     return output
 
