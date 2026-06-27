@@ -59,14 +59,28 @@ def create_daily_raw_data_archive(session: Session, payload: dict[str, Any] | No
     root_folder.mkdir(parents=True, exist_ok=True)
 
     day_manifests: dict[str, Any] = {}
+    day_statuses: dict[str, str] = {}
+    finished_days: list[str] = []
+    unfinished_days: list[str] = []
     total_row_counts: dict[str, int] = {}
     days: list[str] = []
     for day_start, day_end in _daily_ranges(start, end):
         day_name = day_start.date().isoformat()
+        full_day_end = day_start + timedelta(days=1)
+        is_finished = day_end >= full_day_end
+        status = "finished" if is_finished else "unfinished"
         days.append(day_name)
+        day_statuses[day_name] = status
+        if is_finished:
+            finished_days.append(day_name)
+        else:
+            unfinished_days.append(day_name)
         day_folder = root_folder / day_name
         day_options = {key: value for key, value in payload.items() if key not in {"use_all_data", "date", "since_date", "until_date", "daily_split"}}
         manifest = _write_raw_folder(session, day_folder, start=day_start, end=day_end, options=day_options)
+        manifest["status"] = status
+        manifest["is_finished"] = is_finished
+        manifest["finished_day"] = is_finished
         day_manifests[day_name] = manifest
         for table_name, count in (manifest.get("row_counts") or {}).items():
             total_row_counts[table_name] = total_row_counts.get(table_name, 0) + int(count or 0)
@@ -76,6 +90,9 @@ def create_daily_raw_data_archive(session: Session, payload: dict[str, Any] | No
         "mode": "daily_split",
         "days": days,
         "day_count": len(days),
+        "finished_days": finished_days,
+        "unfinished_days": unfinished_days,
+        "day_statuses": day_statuses,
         "time_range": {"start": start.isoformat(), "end": end.isoformat()},
         "total_row_counts": total_row_counts,
         "day_manifests": day_manifests,
