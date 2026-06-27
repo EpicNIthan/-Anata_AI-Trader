@@ -40,22 +40,22 @@ python scripts/prepare_training_data.py `
   --news-converter smart
 ```
 
-## 3. Symbol-Aware Training
+## 3. Train Normally
 
-Use this wrapper instead of calling `train_best_model.py` directly:
+`train_best_model.py` now adds symbol identity features automatically by default.
 
 ```powershell
 $Dataset = Get-ChildItem datasets/processed/anata_training_ready_*.csv.gz |
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 1
 
-python scripts/train_symbol_aware_model.py `
+python scripts/train_best_model.py `
   --dataset $Dataset.FullName `
   --out-dir models `
   --model-types sklearn_hist_gradient_boosting
 ```
 
-The wrapper adds columns like:
+The trainer adds columns like:
 
 ```text
 symbol_is_BTCUSDT
@@ -66,7 +66,15 @@ symbol_group_layer1
 symbol_group_defi
 ```
 
-Then it runs the same safety-checked `train_best_model.py` flow.
+You can disable this only for comparison testing:
+
+```powershell
+python scripts/train_best_model.py `
+  --dataset $Dataset.FullName `
+  --out-dir models `
+  --model-types sklearn_hist_gradient_boosting `
+  --no-symbol-aware
+```
 
 ## 4. Upload Normally
 
