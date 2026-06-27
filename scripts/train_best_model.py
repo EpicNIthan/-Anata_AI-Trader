@@ -129,6 +129,10 @@ def _simulate(predictions, realized_returns, *, fee_rate: float, min_edge: float
     }
 
 
+def _directional_accuracy(predictions, actual) -> float:
+    return float(((predictions > 0) == (actual > 0)).mean())
+
+
 def _rule_based_predictions(test):
     import numpy as np
 
@@ -137,10 +141,6 @@ def _rule_based_predictions(test):
     risk = test["risk_score"].to_numpy(dtype=float) if "risk_score" in test else np.zeros(len(test))
     crowd = test["trader_crowd_score"].to_numpy(dtype=float) if "trader_crowd_score" in test else np.zeros(len(test))
     return candle + (sentiment * 0.002) + (crowd * 0.001) - (risk * 0.002)
-
-
-def _directional_accuracy(predictions, actual) -> float:
-    return float(((predictions > 0) == (actual > 0)).mean())
 
 
 def _data_readiness(labeled_rows: int, dataset_days: float) -> dict[str, Any]:
@@ -178,7 +178,7 @@ def _failure_advice(candidates: list[dict[str, Any]], dataset_days: float) -> li
             advice.append("Drawdown was too high; the model is overtrading or learning a weak/unstable pattern.")
         if metrics.get("number_of_trades", 0) > metrics.get("test_rows", 0) * 0.50:
             advice.append("The model traded too often. Retry later with a higher edge, for example --min-edge 0.003 or --min-edge 0.005.")
-        regime_summary = best.get("metrics", {}).get("regime_summary", {})
+        regime_summary = metrics.get("regime_summary", {})
         if regime_summary.get("evaluated_regime_count", 0) < 3:
             advice.append("Regime validation had too few populated market regimes. More days and more market conditions are needed.")
         if regime_summary.get("losing_regime_count", 0) > regime_summary.get("profitable_regime_count", 0):
@@ -200,6 +200,12 @@ def _series(frame, column: str, default: float = 0.0):
     if column in frame:
         return pd.to_numeric(frame[column], errors="coerce").fillna(default).astype(float)
     return pd.Series(default, index=frame.index, dtype="float64")
+
+
+def _to_series(values, index):
+    import pandas as pd
+
+    return pd.Series(values, index=index).astype(float)
 
 
 def _add_regime_features(frame):
@@ -227,15 +233,21 @@ def _add_regime_features(frame):
     open_interest_change = _series(output, "open_interest_change").abs()
     funding_rate = _series(output, "funding_rate").abs()
 
-    trend_strength = np.maximum(trend.abs(), (candle_5m.abs() * 80.0).clip(upper=1.0)).clip(0.0, 1.0)
-    direction_score = (trend + candle_5m * 40.0).clip(-1.0, 1.0)
-    volatility_score = np.tanh(volatility * 120.0).clip(0.0, 1.0)
-    news_shock = np.maximum.reduce([sentiment.abs() * impact.clip(lower=0.0), risk, regulation, fed, war, security]).clip(0.0, 1.0)
-    risk_off = np.maximum.reduce([risk, macro, world, regulation, fed, war, security, stablecoin]).clip(0.0, 1.0)
-    liquidity_stress = np.maximum.reduce([liquidation, (open_interest_change * 25.0).clip(upper=1.0), (funding_rate * 500.0).clip(upper=1.0)]).clip(0.0, 1.0)
-    breakout = (np.maximum(candle_5m.abs() * 70.0, volume_change.clip(lower=0.0) * 0.15) * np.maximum(0.25, trend_strength)).clip(0.0, 1.0)
-    mean_reversion = (volatility_score * (1.0 - trend_strength.clip(upper=1.0)) * (1.0 - news_shock.clip(upper=1.0))).clip(0.0, 1.0)
-    crowd_pressure = np.maximum.reduce([crowd, crowd_risk, (crowd_ratio - 1.0).abs() * 0.25]).clip(0.0, 1.0)
+    trend_strength = _to_series(np.maximum(trend.abs(), (candle_5m.abs() * 80.0).clip(upper=1.0)), output.index).clip(lower=0.0, upper=1.0)
+    direction_score = (trend + candle_5m * 40.0).clip(lower=-1.0, upper=1.0)
+    volatility_score = _to_series(np.tanh(volatility * 120.0), output.index).clip(lower=0.0, upper=1.0)
+    news_shock = _to_series(
+        np.maximum.reduce([sentiment.abs() * impact.clip(lower=0.0), risk, regulation, fed, war, security]),
+        output.index,
+    ).clip(lower=0.0, upper=1.0)
+    risk_off = _to_series(np.maximum.reduce([risk, macro, world, regulation, fed, war, security, stablecoin]), output.index).clip(lower=0.0, upper=1.0)
+    liquidity_stress = _to_series(
+        np.maximum.reduce([liquidation, (open_interest_change * 25.0).clip(upper=1.0), (funding_rate * 500.0).clip(upper=1.0)]),
+        output.index,
+    ).clip(lower=0.0, upper=1.0)
+    breakout = (np.maximum(candle_5m.abs() * 70.0, volume_change.clip(lower=0.0) * 0.15) * np.maximum(0.25, trend_strength)).clip(lower=0.0, upper=1.0)
+    mean_reversion = (volatility_score * (1.0 - trend_strength.clip(upper=1.0)) * (1.0 - news_shock.clip(upper=1.0))).clip(lower=0.0, upper=1.0)
+    crowd_pressure = _to_series(np.maximum.reduce([crowd, crowd_risk, (crowd_ratio - 1.0).abs() * 0.25]), output.index).clip(lower=0.0, upper=1.0)
 
     output["regime_trend_strength"] = trend_strength
     output["regime_direction_score"] = direction_score
