@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,10 @@ REGIME_FEATURE_COLUMNS = [
     "regime_mean_reversion_pressure",
     "regime_crowd_pressure",
 ]
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
 def _dataset_hash(path: Path) -> str:
@@ -206,6 +211,24 @@ def _to_series(values, index):
     import pandas as pd
 
     return pd.Series(values, index=index).astype(float)
+
+
+def _add_symbol_features(frame):
+    if "symbol" not in frame.columns:
+        return frame, []
+    sys.path.insert(0, str(_repo_root()))
+    try:
+        from app.ai.symbol_identity import SYMBOL_FEATURE_COLUMNS, symbol_identity_values
+    except Exception as exc:
+        raise SystemExit(f"Could not import symbol identity features: {exc}") from exc
+    import pandas as pd
+
+    output = frame.copy()
+    symbol_features = [symbol_identity_values(symbol) for symbol in output["symbol"]]
+    symbol_frame = pd.DataFrame(symbol_features, index=output.index)
+    for column in SYMBOL_FEATURE_COLUMNS:
+        output[column] = symbol_frame[column].astype(float)
+    return output, list(SYMBOL_FEATURE_COLUMNS)
 
 
 def _add_regime_features(frame):
@@ -393,6 +416,7 @@ def main() -> None:
     parser.add_argument("--min-trades", type=int, default=10)
     parser.add_argument("--max-plan-margin-pct", type=float, default=0.10)
     parser.add_argument("--max-plan-leverage", type=float, default=125.0)
+    parser.add_argument("--symbol-aware", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     try:
@@ -409,6 +433,9 @@ def main() -> None:
     frame = frame.dropna(subset=["as_of"]).sort_values("as_of")
     if args.target not in frame.columns:
         raise SystemExit(f"Dataset is missing target column {args.target}.")
+    symbol_feature_columns: list[str] = []
+    if args.symbol_aware:
+        frame, symbol_feature_columns = _add_symbol_features(frame)
     frame = _add_regime_features(_add_plan_targets(frame, max_margin_pct=args.max_plan_margin_pct, max_leverage=args.max_plan_leverage))
     return_column = args.return_column if args.return_column in frame.columns else args.target
     train_frame = frame.dropna(subset=[args.target, return_column]).copy()
@@ -500,6 +527,8 @@ def main() -> None:
         "total_labeled_rows": int(len(train_frame)),
         "dataset_days": dataset_days,
         "feature_columns": len(feature_columns),
+        "symbol_aware": bool(args.symbol_aware),
+        "symbol_feature_columns": [column for column in symbol_feature_columns if column in feature_columns],
         "regime_feature_columns": [column for column in REGIME_FEATURE_COLUMNS if column in feature_columns],
         "plan_targets": [target for target in PLAN_TARGETS if target in train_frame],
         "data_readiness": _data_readiness(int(len(train_frame)), dataset_days),
@@ -531,6 +560,8 @@ def main() -> None:
         "activation_mode": "manual",
         "feature_schema_version": str(train_frame["feature_schema_version"].dropna().iloc[-1]) if "feature_schema_version" in train_frame else "local-raw-v1",
         "feature_columns": feature_columns,
+        "symbol_aware": bool(args.symbol_aware),
+        "symbol_feature_columns": [column for column in symbol_feature_columns if column in feature_columns],
         "regime_feature_columns": [column for column in REGIME_FEATURE_COLUMNS if column in feature_columns],
         "target": args.target,
         "return_column": return_column,
@@ -555,7 +586,7 @@ def main() -> None:
     result.update(
         {
             "status": "passed",
-            "message": "Best model passed safety checks and was packaged with regime-aware AI trade-plan models. Upload/activate explicitly.",
+            "message": "Best model passed safety checks and was packaged with symbol-aware, regime-aware AI trade-plan models. Upload/activate explicitly.",
             "failed_safety_checks": False,
             "next_steps": ["Upload the model package, then activate it from the dashboard Training tab."],
             "best_model": best,
