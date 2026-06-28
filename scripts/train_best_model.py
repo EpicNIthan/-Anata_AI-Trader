@@ -29,6 +29,9 @@ NON_FEATURE_COLUMNS = {
     "target_take_profit_hit_first",
     "target_direction_15m",
     "target_trade_quality_score",
+    "target_trade_action",
+    "target_edge_threshold",
+    "target_edge_aware_trade_score",
     "target_best_margin_pct",
     "target_best_leverage",
     "target_best_stop_loss_pct",
@@ -114,6 +117,16 @@ def _make_model(model_type: str):
     raise ValueError(f"Unsupported model type: {model_type}")
 
 
+def _fit_model(model: Any, x_train, y_train, sample_weight=None) -> None:
+    if sample_weight is None:
+        model.fit(x_train, y_train)
+        return
+    try:
+        model.fit(x_train, y_train, sample_weight=sample_weight)
+    except TypeError:
+        model.fit(x_train, y_train)
+
+
 def _simulate(predictions, realized_returns, *, fee_rate: float, min_edge: float) -> dict[str, Any]:
     threshold = max(min_edge, fee_rate * 2)
     actions = [1 if pred > threshold else (-1 if pred < -threshold else 0) for pred in predictions]
@@ -182,7 +195,7 @@ def _failure_advice(candidates: list[dict[str, Any]], dataset_days: float) -> li
         if metrics.get("max_drawdown", 0) >= 0.15:
             advice.append("Drawdown was too high; the model is overtrading or learning a weak/unstable pattern.")
         if metrics.get("number_of_trades", 0) > metrics.get("test_rows", 0) * 0.50:
-            advice.append("The model traded too often. Retry later with a higher edge, for example --min-edge 0.003 or --min-edge 0.005.")
+            advice.append("The model traded too often. The edge-aware HOLD target should reduce weak/noisy trades as more live data is collected.")
         regime_summary = metrics.get("regime_summary", {})
         if regime_summary.get("evaluated_regime_count", 0) < 3:
             advice.append("Regime validation had too few populated market regimes. More days and more market conditions are needed.")
@@ -284,6 +297,49 @@ def _add_regime_features(frame):
     return output
 
 
+def _edge_threshold(frame, *, fee_rate: float, min_edge: float, hold_edge_multiplier: float):
+    import numpy as np
+
+    base = max(min_edge, fee_rate * 2.0 * hold_edge_multiplier)
+    volatility = _series(frame, "volatility").abs()
+    trend_strength = _series(frame, "regime_trend_strength")
+    noisy_market_buffer = (volatility * 0.40).clip(lower=0.0, upper=0.006)
+    weak_trend_buffer = ((1.0 - trend_strength.clip(lower=0.0, upper=1.0)) * 0.0005).clip(lower=0.0, upper=0.0005)
+    return _to_series(np.maximum(base, base + noisy_market_buffer + weak_trend_buffer), frame.index).clip(lower=base, upper=0.020)
+
+
+def _add_edge_aware_targets(frame, *, fee_rate: float, min_edge: float, hold_edge_multiplier: float):
+    output = frame.copy()
+    if "target_future_return_15m" not in output:
+        return output
+    ret_15m = _series(output, "target_future_return_15m")
+    threshold = _edge_threshold(output, fee_rate=fee_rate, min_edge=min_edge, hold_edge_multiplier=hold_edge_multiplier)
+    action = (ret_15m > threshold).astype(float) - (ret_15m < -threshold).astype(float)
+    edge_score = ret_15m.copy()
+    edge_score = edge_score.where(action == 0.0, ret_15m - (action * threshold))
+    edge_score = edge_score.where(action != 0.0, 0.0)
+    output["target_trade_action"] = action
+    output["target_edge_threshold"] = threshold
+    output["target_edge_aware_trade_score"] = edge_score
+    return output
+
+
+def _source_weights(frame, *, historical_weight: float, live_weight: float, recency_strength: float):
+    import numpy as np
+    import pandas as pd
+
+    if len(frame) == 0:
+        return None
+    schema = frame["feature_schema_version"].astype(str).str.lower() if "feature_schema_version" in frame else pd.Series("", index=frame.index)
+    final_input = frame["final_ai_input"].astype(str).str.lower() if "final_ai_input" in frame else pd.Series("", index=frame.index)
+    is_historical = schema.str.contains("coingecko", na=False) | final_input.str.contains("coingecko_history", na=False)
+    weights = np.where(is_historical.to_numpy(dtype=bool), historical_weight, live_weight).astype(float)
+    if recency_strength > 0 and "as_of" in frame:
+        order = pd.to_datetime(frame["as_of"], utc=True, errors="coerce").rank(method="first", pct=True).fillna(0.5).to_numpy(dtype=float)
+        weights *= 1.0 + (recency_strength * order)
+    return weights
+
+
 def _regime_masks(frame) -> dict[str, Any]:
     return {
         "trend_up": (_series(frame, "regime_trend_strength") >= 0.35) & (_series(frame, "regime_direction_score") > 0.10),
@@ -349,15 +405,16 @@ def _add_plan_targets(frame, *, max_margin_pct: float = 0.10, max_leverage: floa
     upside = output["target_max_upside_1h"].astype(float) if "target_max_upside_1h" in output else ret_15m.clip(lower=0.0)
     drawdown = output["target_max_drawdown_1h"].astype(float) if "target_max_drawdown_1h" in output else ret_15m.clip(upper=0.0)
     take_first = output["target_take_profit_hit_first"].astype(float) if "target_take_profit_hit_first" in output else 0.0
+    trade_action = output["target_trade_action"].astype(float).abs() if "target_trade_action" in output else 1.0
     strength = ((quality + 0.004) / 0.035).clip(lower=0.0, upper=1.0)
     edge_strength = (ret_15m.abs() / 0.025).clip(lower=0.0, upper=1.0)
-    plan_strength = np.maximum(strength, edge_strength * 0.65)
-    output["target_best_margin_pct"] = (0.0025 + max_margin_pct * plan_strength).clip(lower=0.0025, upper=max_margin_pct)
+    plan_strength = np.maximum(strength, edge_strength * 0.65) * trade_action
+    output["target_best_margin_pct"] = (max_margin_pct * plan_strength).clip(lower=0.0, upper=max_margin_pct)
     output["target_best_leverage"] = (1.0 + (max_leverage - 1.0) * plan_strength).clip(lower=1.0, upper=max_leverage)
     stop_pct = np.maximum(drawdown.abs() * 1.15, ret_15m.abs() * 0.65).clip(lower=0.003, upper=0.08)
     take_pct = np.maximum(upside.abs() * 0.90, ret_15m.abs() * 1.8).clip(lower=0.006, upper=0.20)
-    output["target_best_stop_loss_pct"] = stop_pct
-    output["target_best_take_profit_pct"] = take_pct
+    output["target_best_stop_loss_pct"] = stop_pct * np.maximum(trade_action, 0.0)
+    output["target_best_take_profit_pct"] = take_pct * np.maximum(trade_action, 0.0)
     hold_scale = (1.0 - edge_strength).clip(lower=0.0, upper=1.0)
     output["target_best_hold_seconds"] = (900 + (14400 - 900) * hold_scale - (take_first * 1800)).clip(lower=300, upper=14400)
     return output
@@ -399,10 +456,75 @@ def _package_model(model_path: Path, metadata: dict[str, Any], output_dir: Path,
     return package_path
 
 
+def _clip(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def _candidate_score(metrics: dict[str, Any], passed: bool) -> dict[str, Any]:
+    if passed:
+        return {"score": 100.0, "grade": "PASS", "components": {"passed_safety_checks": 100.0}}
+    directional = float(metrics.get("directional_accuracy", 0.0) or 0.0)
+    net_return = float(metrics.get("net_return_after_fees", -1.0) or 0.0)
+    drawdown = float(metrics.get("max_drawdown", 1.0) or 0.0)
+    beats_baseline = bool(metrics.get("beats_rule_based_baseline", False))
+    regime_summary = metrics.get("regime_summary", {}) or {}
+    evaluated = max(1, int(regime_summary.get("evaluated_regime_count", 0) or 0))
+    profitable = int(regime_summary.get("profitable_regime_count", 0) or 0)
+
+    direction_score = 15.0 * _clip((directional - 0.50) / 0.01)
+    return_score = 30.0 * _clip((net_return + 0.05) / 0.05)
+    drawdown_score = 25.0 * _clip((1.0 - drawdown) / 0.85)
+    baseline_score = 10.0 if beats_baseline else 0.0
+    regime_score = 20.0 * _clip(profitable / evaluated)
+    score = direction_score + return_score + drawdown_score + baseline_score + regime_score
+    score = min(99.0, max(0.0, score))
+    if score >= 80:
+        grade = "close"
+    elif score >= 60:
+        grade = "improving"
+    elif score >= 35:
+        grade = "early"
+    else:
+        grade = "far"
+    return {
+        "score": round(score, 2),
+        "grade": grade,
+        "components": {
+            "directional_accuracy_points": round(direction_score, 2),
+            "net_return_points": round(return_score, 2),
+            "drawdown_points": round(drawdown_score, 2),
+            "baseline_points": round(baseline_score, 2),
+            "regime_points": round(regime_score, 2),
+        },
+        "score_rules": {
+            "100": "model passed safety checks and was packaged",
+            "80_99": "close, but at least one safety condition still failed",
+            "60_79": "improving, not ready",
+            "35_59": "early, needs better behavior",
+            "0_34": "far from passing",
+        },
+    }
+
+
+def _score_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    if not candidates:
+        return {"score": 0.0, "grade": "no_model", "best_model_type": None}
+    for candidate in candidates:
+        candidate["safety_score"] = _candidate_score(candidate.get("metrics", {}), bool(candidate.get("passed")))
+    best = max(candidates, key=lambda item: item.get("safety_score", {}).get("score", 0.0))
+    return {
+        "score": best["safety_score"]["score"],
+        "grade": best["safety_score"]["grade"],
+        "best_model_type": best.get("model_type"),
+        "components": best["safety_score"].get("components", {}),
+        "score_rules": best["safety_score"].get("score_rules", {}),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train multiple local models and package the best safe candidate.")
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--target", default="target_trade_quality_score")
+    parser.add_argument("--target", default="target_edge_aware_trade_score")
     parser.add_argument("--return-column", default="target_future_return_15m")
     parser.add_argument("--out-dir", type=Path, default=Path("models"))
     parser.add_argument("--test-size", type=float, default=0.25)
@@ -417,6 +539,11 @@ def main() -> None:
     parser.add_argument("--max-plan-margin-pct", type=float, default=0.10)
     parser.add_argument("--max-plan-leverage", type=float, default=125.0)
     parser.add_argument("--symbol-aware", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--edge-aware-target", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hold-edge-multiplier", type=float, default=2.5, help="Round-trip fee multiplier used to teach HOLD for weak edges.")
+    parser.add_argument("--historical-source-weight", type=float, default=1.0, help="Training weight for CoinGecko/history rows.")
+    parser.add_argument("--live-source-weight", type=float, default=3.0, help="Training weight for Railway/live rows.")
+    parser.add_argument("--recency-weight-strength", type=float, default=0.5, help="Extra weight for newer rows. Set 0 to disable.")
     args = parser.parse_args()
 
     try:
@@ -431,12 +558,15 @@ def main() -> None:
         raise SystemExit("Dataset is missing as_of column.")
     frame["as_of"] = pd.to_datetime(frame["as_of"], utc=True, errors="coerce")
     frame = frame.dropna(subset=["as_of"]).sort_values("as_of")
-    if args.target not in frame.columns:
-        raise SystemExit(f"Dataset is missing target column {args.target}.")
     symbol_feature_columns: list[str] = []
     if args.symbol_aware:
         frame, symbol_feature_columns = _add_symbol_features(frame)
-    frame = _add_regime_features(_add_plan_targets(frame, max_margin_pct=args.max_plan_margin_pct, max_leverage=args.max_plan_leverage))
+    frame = _add_regime_features(frame)
+    if args.edge_aware_target:
+        frame = _add_edge_aware_targets(frame, fee_rate=args.fee_rate, min_edge=args.min_edge, hold_edge_multiplier=args.hold_edge_multiplier)
+    frame = _add_plan_targets(frame, max_margin_pct=args.max_plan_margin_pct, max_leverage=args.max_plan_leverage)
+    if args.target not in frame.columns:
+        raise SystemExit(f"Dataset is missing target column {args.target}.")
     return_column = args.return_column if args.return_column in frame.columns else args.target
     train_frame = frame.dropna(subset=[args.target, return_column]).copy()
     if len(train_frame) < 100:
@@ -452,6 +582,12 @@ def main() -> None:
     test = train_frame.iloc[split:].copy()
     x_train = training[feature_columns].fillna(0.0).astype(float)
     y_train = training[args.target].astype(float)
+    train_weights = _source_weights(
+        training,
+        historical_weight=args.historical_source_weight,
+        live_weight=args.live_source_weight,
+        recency_strength=args.recency_weight_strength,
+    )
     x_test = test[feature_columns].fillna(0.0).astype(float)
     realized_returns = test[return_column].fillna(0.0).astype(float).to_numpy()
 
@@ -467,7 +603,7 @@ def main() -> None:
     for model_type in [item.strip() for item in args.model_types.split(",") if item.strip()]:
         try:
             model = _make_model(model_type)
-            model.fit(x_train, y_train)
+            _fit_model(model, x_train, y_train, sample_weight=train_weights)
             predictions = model.predict(x_test)
         except Exception as exc:
             skipped[model_type] = str(exc)
@@ -506,6 +642,7 @@ def main() -> None:
         )
         candidates.append({"model_type": model_type, "metrics": metrics, "warnings": warnings, "passed": passed})
 
+    final_score = _score_candidates(candidates)
     passed_candidates = [candidate for candidate in candidates if candidate["passed"]]
     best = max(
         passed_candidates,
@@ -528,6 +665,13 @@ def main() -> None:
         "dataset_days": dataset_days,
         "feature_columns": len(feature_columns),
         "symbol_aware": bool(args.symbol_aware),
+        "edge_aware_target": bool(args.edge_aware_target),
+        "hold_edge_multiplier": args.hold_edge_multiplier,
+        "source_weights": {
+            "historical_source_weight": args.historical_source_weight,
+            "live_source_weight": args.live_source_weight,
+            "recency_weight_strength": args.recency_weight_strength,
+        },
         "symbol_feature_columns": [column for column in symbol_feature_columns if column in feature_columns],
         "regime_feature_columns": [column for column in REGIME_FEATURE_COLUMNS if column in feature_columns],
         "plan_targets": [target for target in PLAN_TARGETS if target in train_frame],
@@ -537,14 +681,25 @@ def main() -> None:
         "skipped_models": skipped,
         "failed_safety_checks": True,
         "next_steps": _failure_advice(candidates, dataset_days),
-        "message": "Training completed, but no model passed safety checks. Nothing was packaged or uploaded.",
+        "final_score": final_score,
+        "message": f"Training completed, but no model passed safety checks. Nothing was packaged or uploaded. Final score: {final_score['score']}/100 ({final_score['grade']}).",
     }
     if best is None:
         print(json.dumps(result, indent=2, default=str))
         return
 
     final_model = _make_model(best["model_type"])
-    final_model.fit(train_frame[feature_columns].fillna(0.0).astype(float), train_frame[args.target].astype(float))
+    _fit_model(
+        final_model,
+        train_frame[feature_columns].fillna(0.0).astype(float),
+        train_frame[args.target].astype(float),
+        sample_weight=_source_weights(
+            train_frame,
+            historical_weight=args.historical_source_weight,
+            live_weight=args.live_source_weight,
+            recency_strength=args.recency_weight_strength,
+        ),
+    )
     version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model_path = args.out_dir / f"model_{version}.joblib"
@@ -561,6 +716,13 @@ def main() -> None:
         "feature_schema_version": str(train_frame["feature_schema_version"].dropna().iloc[-1]) if "feature_schema_version" in train_frame else "local-raw-v1",
         "feature_columns": feature_columns,
         "symbol_aware": bool(args.symbol_aware),
+        "edge_aware_target": bool(args.edge_aware_target),
+        "hold_edge_multiplier": args.hold_edge_multiplier,
+        "source_weights": {
+            "historical_source_weight": args.historical_source_weight,
+            "live_source_weight": args.live_source_weight,
+            "recency_weight_strength": args.recency_weight_strength,
+        },
         "symbol_feature_columns": [column for column in symbol_feature_columns if column in feature_columns],
         "regime_feature_columns": [column for column in REGIME_FEATURE_COLUMNS if column in feature_columns],
         "target": args.target,
@@ -571,6 +733,7 @@ def main() -> None:
         "training_dataset_hash": _dataset_hash(args.dataset),
         "metrics": best["metrics"] | {
             "paper_test_readiness": "PASS",
+            "final_score": {"score": 100.0, "grade": "PASS"},
             "rule_based_baseline": baseline_metrics,
             "train_rows": int(len(training)),
             "total_labeled_rows": int(len(train_frame)),
@@ -586,7 +749,7 @@ def main() -> None:
     result.update(
         {
             "status": "passed",
-            "message": "Best model passed safety checks and was packaged with symbol-aware, regime-aware AI trade-plan models. Upload/activate explicitly.",
+            "message": "Best model passed safety checks and was packaged with symbol-aware, regime-aware, edge-aware AI trade-plan models. Upload/activate explicitly. Final score: 100/100 (PASS).",
             "failed_safety_checks": False,
             "next_steps": ["Upload the model package, then activate it from the dashboard Training tab."],
             "best_model": best,
@@ -595,6 +758,7 @@ def main() -> None:
             "metadata": str(metadata_path),
             "package": str(package_path),
             "model_id": metadata["model_id"],
+            "final_score": {"score": 100.0, "grade": "PASS", "best_model_type": best.get("model_type")},
         }
     )
     print(json.dumps(result, indent=2, default=str))
