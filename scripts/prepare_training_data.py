@@ -71,6 +71,27 @@ def _read_csv_gz(root: Path, filename: str):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def _extract_raw_zips(input_path: Path, temp_root: Path) -> Path:
+    if input_path.is_file() and input_path.suffix.lower() == ".zip":
+        target = temp_root / input_path.stem
+        target.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(input_path) as archive:
+            archive.extractall(target)
+        return temp_root
+
+    zip_paths = sorted(path for path in input_path.rglob("*.zip") if path.is_file()) if input_path.is_dir() else []
+    if not zip_paths:
+        return input_path
+
+    for zip_path in zip_paths:
+        relative = zip_path.relative_to(input_path).with_suffix("")
+        target = temp_root / relative
+        target.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(target)
+    return temp_root
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -606,7 +627,7 @@ def _process(root: Path, output_dir: Path, lookback_hours: float, fee_rate: floa
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert raw Anata data into a training-ready numeric dataset.")
-    parser.add_argument("--input", type=Path, required=True, help="Raw data zip or finished_data/YYYY-MM-DD folder.")
+    parser.add_argument("--input", type=Path, required=True, help="Raw data zip, raw_days folder, or finished_data/YYYY-MM-DD folder.")
     parser.add_argument("--output-dir", type=Path, default=Path("datasets/processed"))
     parser.add_argument("--news-lookback-hours", type=float, default=6.0)
     parser.add_argument("--fee-rate", type=float, default=0.0004)
@@ -619,14 +640,13 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if args.input.is_file() and args.input.suffix.lower() == ".zip":
-            with tempfile.TemporaryDirectory(prefix="anata_raw_") as temp_dir:
-                temp_root = Path(temp_dir)
-                with zipfile.ZipFile(args.input) as archive:
-                    archive.extractall(temp_root)
-                print(json.dumps(_process(temp_root, args.output_dir, args.news_lookback_hours, args.fee_rate, args.news_converter), indent=2))
-        else:
+        if args.input.is_file() and args.input.suffix.lower() != ".zip":
             print(json.dumps(_process(args.input, args.output_dir, args.news_lookback_hours, args.fee_rate, args.news_converter), indent=2))
+            return
+        with tempfile.TemporaryDirectory(prefix="anata_raw_") as temp_dir:
+            temp_root = Path(temp_dir)
+            process_root = _extract_raw_zips(args.input, temp_root)
+            print(json.dumps(_process(process_root, args.output_dir, args.news_lookback_hours, args.fee_rate, args.news_converter), indent=2))
     except Exception as exc:
         print(f"Prepare training data failed: {exc}")
         raise SystemExit(1) from exc
