@@ -56,6 +56,18 @@ REGIME_FEATURE_COLUMNS = [
     "regime_mean_reversion_pressure",
     "regime_crowd_pressure",
 ]
+REGIME_ORDER = [
+    "news_shock",
+    "risk_off",
+    "liquidity_stress",
+    "crowded_market",
+    "breakout_pressure",
+    "mean_reversion_pressure",
+    "trend_up",
+    "trend_down",
+    "range_low_volatility",
+    "high_volatility",
+]
 
 
 def _repo_root() -> Path:
@@ -342,17 +354,31 @@ def _source_weights(frame, *, historical_weight: float, live_weight: float, rece
 
 def _regime_masks(frame) -> dict[str, Any]:
     return {
+        "news_shock": _series(frame, "regime_news_shock_score") >= 0.45,
+        "risk_off": _series(frame, "regime_risk_off_score") >= 0.45,
+        "liquidity_stress": _series(frame, "regime_liquidity_stress_score") >= 0.35,
+        "crowded_market": _series(frame, "regime_crowd_pressure") >= 0.35,
+        "breakout_pressure": _series(frame, "regime_breakout_pressure") >= 0.35,
+        "mean_reversion_pressure": _series(frame, "regime_mean_reversion_pressure") >= 0.35,
         "trend_up": (_series(frame, "regime_trend_strength") >= 0.35) & (_series(frame, "regime_direction_score") > 0.10),
         "trend_down": (_series(frame, "regime_trend_strength") >= 0.35) & (_series(frame, "regime_direction_score") < -0.10),
         "range_low_volatility": (_series(frame, "regime_trend_strength") < 0.25) & (_series(frame, "regime_volatility_score") < 0.20),
         "high_volatility": _series(frame, "regime_volatility_score") >= 0.35,
-        "news_shock": _series(frame, "regime_news_shock_score") >= 0.45,
-        "risk_off": _series(frame, "regime_risk_off_score") >= 0.45,
-        "liquidity_stress": _series(frame, "regime_liquidity_stress_score") >= 0.35,
-        "breakout_pressure": _series(frame, "regime_breakout_pressure") >= 0.35,
-        "mean_reversion_pressure": _series(frame, "regime_mean_reversion_pressure") >= 0.35,
-        "crowded_market": _series(frame, "regime_crowd_pressure") >= 0.35,
     }
+
+
+def _row_regime_names(frame) -> list[str | None]:
+    masks = _regime_masks(frame)
+    output: list[str | None] = []
+    for idx in frame.index:
+        selected = None
+        for regime in REGIME_ORDER:
+            mask = masks.get(regime)
+            if mask is not None and bool(mask.loc[idx]):
+                selected = regime
+                break
+        output.append(selected)
+    return output
 
 
 def _regime_validation(frame, predictions, realized_returns, *, fee_rate: float, min_edge: float, min_rows: int = 25) -> dict[str, Any]:
@@ -445,6 +471,66 @@ def _train_plan_models(model_type: str, train_frame, feature_columns: list[str],
     return model_files, metrics
 
 
+def _train_specialist_models(
+    *,
+    model_type: str,
+    training,
+    test,
+    feature_columns: list[str],
+    target: str,
+    realized_returns,
+    fee_rate: float,
+    min_edge: float,
+    min_rows: int,
+    source_weight_args: dict[str, float],
+):
+    import numpy as np
+
+    predictions = np.full(len(test), np.nan, dtype=float)
+    test_regimes = _row_regime_names(test)
+    files_ready: dict[str, Any] = {}
+    report: dict[str, Any] = {}
+    for regime in REGIME_ORDER:
+        train_mask = _regime_masks(training).get(regime)
+        if train_mask is None:
+            report[regime] = {"status": "skipped_no_mask", "train_rows": 0, "test_rows": int(test_regimes.count(regime))}
+            continue
+        train_rows = training[train_mask].copy()
+        test_indices = [index for index, name in enumerate(test_regimes) if name == regime]
+        if len(train_rows) < min_rows or len(test_indices) < 25:
+            report[regime] = {"status": "skipped_too_few_rows", "train_rows": int(len(train_rows)), "test_rows": int(len(test_indices))}
+            continue
+        model = _make_model(model_type)
+        x_train = train_rows[feature_columns].fillna(0.0).astype(float)
+        y_train = train_rows[target].astype(float)
+        weights = _source_weights(train_rows, **source_weight_args)
+        _fit_model(model, x_train, y_train, sample_weight=weights)
+        x_test = test.iloc[test_indices][feature_columns].fillna(0.0).astype(float)
+        regime_predictions = model.predict(x_test)
+        predictions[test_indices] = regime_predictions
+        metrics = _simulate(regime_predictions, realized_returns[test_indices], fee_rate=fee_rate, min_edge=min_edge)
+        metrics["directional_accuracy"] = _directional_accuracy(regime_predictions, realized_returns[test_indices])
+        metrics["train_rows"] = int(len(train_rows))
+        metrics["test_rows"] = int(len(test_indices))
+        metrics["status"] = "trained"
+        report[regime] = metrics
+        files_ready[regime] = model
+    return predictions, files_ready, report
+
+
+def _write_specialist_models(models: dict[str, Any], out_dir: Path, version: str):
+    import joblib
+
+    files: dict[str, str] = {}
+    paths: list[Path] = []
+    for regime, model in models.items():
+        path = out_dir / f"model_{version}_specialist_{regime}.joblib"
+        joblib.dump(model, path)
+        files[regime] = path.name
+        paths.append(path)
+    return files, paths
+
+
 def _package_model(model_path: Path, metadata: dict[str, Any], output_dir: Path, extra_paths: list[Path] | None = None) -> Path:
     package_path = output_dir / f"model_package_{metadata['version']}.zip"
     metadata["model_file"] = model_path.name
@@ -476,8 +562,7 @@ def _candidate_score(metrics: dict[str, Any], passed: bool) -> dict[str, Any]:
     drawdown_score = 25.0 * _clip((1.0 - drawdown) / 0.85)
     baseline_score = 10.0 if beats_baseline else 0.0
     regime_score = 20.0 * _clip(profitable / evaluated)
-    score = direction_score + return_score + drawdown_score + baseline_score + regime_score
-    score = min(99.0, max(0.0, score))
+    score = min(99.0, max(0.0, direction_score + return_score + drawdown_score + baseline_score + regime_score))
     if score >= 80:
         grade = "close"
     elif score >= 60:
@@ -521,6 +606,17 @@ def _score_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _candidate_passed(metrics: dict[str, Any], min_trades: int) -> bool:
+    return (
+        metrics["directional_accuracy"] > 0.51
+        and metrics["net_return_after_fees"] > 0
+        and metrics["max_drawdown"] < 0.15
+        and metrics["number_of_trades"] >= min_trades
+        and metrics["beats_rule_based_baseline"]
+        and metrics["directional_accuracy"] <= 0.75
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train multiple local models and package the best safe candidate.")
     parser.add_argument("--dataset", type=Path, required=True)
@@ -530,20 +626,18 @@ def main() -> None:
     parser.add_argument("--test-size", type=float, default=0.25)
     parser.add_argument("--fee-rate", type=float, default=0.0004)
     parser.add_argument("--min-edge", type=float, default=0.001)
-    parser.add_argument(
-        "--model-types",
-        default="sklearn_hist_gradient_boosting,random_forest,lightgbm,xgboost",
-        help="Comma-separated model types.",
-    )
+    parser.add_argument("--model-types", default="sklearn_hist_gradient_boosting,random_forest,lightgbm,xgboost", help="Comma-separated model types.")
     parser.add_argument("--min-trades", type=int, default=10)
     parser.add_argument("--max-plan-margin-pct", type=float, default=0.10)
     parser.add_argument("--max-plan-leverage", type=float, default=125.0)
     parser.add_argument("--symbol-aware", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--edge-aware-target", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--hold-edge-multiplier", type=float, default=2.5, help="Round-trip fee multiplier used to teach HOLD for weak edges.")
-    parser.add_argument("--historical-source-weight", type=float, default=1.0, help="Training weight for CoinGecko/history rows.")
-    parser.add_argument("--live-source-weight", type=float, default=3.0, help="Training weight for Railway/live rows.")
-    parser.add_argument("--recency-weight-strength", type=float, default=0.5, help="Extra weight for newer rows. Set 0 to disable.")
+    parser.add_argument("--hold-edge-multiplier", type=float, default=2.5)
+    parser.add_argument("--historical-source-weight", type=float, default=1.0)
+    parser.add_argument("--live-source-weight", type=float, default=3.0)
+    parser.add_argument("--recency-weight-strength", type=float, default=0.5)
+    parser.add_argument("--regime-specialists", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--specialist-min-rows", type=int, default=750)
     args = parser.parse_args()
 
     try:
@@ -582,12 +676,12 @@ def main() -> None:
     test = train_frame.iloc[split:].copy()
     x_train = training[feature_columns].fillna(0.0).astype(float)
     y_train = training[args.target].astype(float)
-    train_weights = _source_weights(
-        training,
-        historical_weight=args.historical_source_weight,
-        live_weight=args.live_source_weight,
-        recency_strength=args.recency_weight_strength,
-    )
+    source_weight_args = {
+        "historical_weight": args.historical_source_weight,
+        "live_weight": args.live_source_weight,
+        "recency_strength": args.recency_weight_strength,
+    }
+    train_weights = _source_weights(training, **source_weight_args)
     x_test = test[feature_columns].fillna(0.0).astype(float)
     realized_returns = test[return_column].fillna(0.0).astype(float).to_numpy()
 
@@ -600,20 +694,54 @@ def main() -> None:
 
     candidates: list[dict[str, Any]] = []
     skipped: dict[str, str] = {}
+    trained_global_models: dict[str, Any] = {}
+    trained_specialists: dict[str, dict[str, Any]] = {}
     for model_type in [item.strip() for item in args.model_types.split(",") if item.strip()]:
         try:
             model = _make_model(model_type)
             _fit_model(model, x_train, y_train, sample_weight=train_weights)
-            predictions = model.predict(x_test)
+            global_predictions = model.predict(x_test)
         except Exception as exc:
             skipped[model_type] = str(exc)
             continue
+        trained_global_models[model_type] = model
+        predictions = global_predictions
+        specialist_report: dict[str, Any] = {}
+        specialist_summary = {"enabled": bool(args.regime_specialists), "trained_count": 0, "used_test_rows": 0}
+        if args.regime_specialists:
+            specialist_predictions, specialists, specialist_report = _train_specialist_models(
+                model_type=model_type,
+                training=training,
+                test=test,
+                feature_columns=feature_columns,
+                target=args.target,
+                realized_returns=realized_returns,
+                fee_rate=args.fee_rate,
+                min_edge=args.min_edge,
+                min_rows=args.specialist_min_rows,
+                source_weight_args=source_weight_args,
+            )
+            used_mask = ~np.isnan(specialist_predictions)
+            if used_mask.any():
+                predictions = global_predictions.copy()
+                predictions[used_mask] = specialist_predictions[used_mask]
+                trained_specialists[model_type] = specialists
+                specialist_summary = {
+                    "enabled": True,
+                    "trained_count": int(len(specialists)),
+                    "used_test_rows": int(used_mask.sum()),
+                    "used_test_rows_pct": float(used_mask.mean() * 100.0),
+                }
         metrics = _simulate(predictions, realized_returns, fee_rate=args.fee_rate, min_edge=args.min_edge)
         metrics["directional_accuracy"] = _directional_accuracy(predictions, realized_returns)
         metrics["average_predicted_return"] = float(np.mean(predictions)) if len(predictions) else 0.0
         metrics["test_rows"] = int(len(test))
         metrics["model_type"] = model_type
         metrics["beats_rule_based_baseline"] = metrics["net_return_after_fees"] > baseline_metrics["net_return_after_fees"]
+        metrics["global_only"] = _simulate(global_predictions, realized_returns, fee_rate=args.fee_rate, min_edge=args.min_edge)
+        metrics["global_only"]["directional_accuracy"] = _directional_accuracy(global_predictions, realized_returns)
+        metrics["specialist_summary"] = specialist_summary
+        metrics["specialist_metrics"] = specialist_report
         regime_validation = _regime_validation(test, predictions, realized_returns, fee_rate=args.fee_rate, min_edge=args.min_edge)
         metrics["regime_summary"] = regime_validation["summary"]
         metrics["regime_metrics"] = regime_validation["metrics"]
@@ -632,14 +760,7 @@ def main() -> None:
             warnings.append("Too few populated regimes for strong regime validation.")
         if metrics["regime_summary"]["losing_regime_count"] > metrics["regime_summary"]["profitable_regime_count"]:
             warnings.append("Model loses in more evaluated regimes than it wins.")
-        passed = (
-            metrics["directional_accuracy"] > 0.51
-            and metrics["net_return_after_fees"] > 0
-            and metrics["max_drawdown"] < 0.15
-            and metrics["number_of_trades"] >= args.min_trades
-            and metrics["beats_rule_based_baseline"]
-            and metrics["directional_accuracy"] <= 0.75
-        )
+        passed = _candidate_passed(metrics, args.min_trades)
         candidates.append({"model_type": model_type, "metrics": metrics, "warnings": warnings, "passed": passed})
 
     final_score = _score_candidates(candidates)
@@ -666,6 +787,8 @@ def main() -> None:
         "feature_columns": len(feature_columns),
         "symbol_aware": bool(args.symbol_aware),
         "edge_aware_target": bool(args.edge_aware_target),
+        "regime_specialists": bool(args.regime_specialists),
+        "specialist_min_rows": args.specialist_min_rows,
         "hold_edge_multiplier": args.hold_edge_multiplier,
         "source_weights": {
             "historical_source_weight": args.historical_source_weight,
@@ -674,6 +797,7 @@ def main() -> None:
         },
         "symbol_feature_columns": [column for column in symbol_feature_columns if column in feature_columns],
         "regime_feature_columns": [column for column in REGIME_FEATURE_COLUMNS if column in feature_columns],
+        "regime_order": REGIME_ORDER,
         "plan_targets": [target for target in PLAN_TARGETS if target in train_frame],
         "data_readiness": _data_readiness(int(len(train_frame)), dataset_days),
         "baseline": baseline_metrics,
@@ -693,12 +817,7 @@ def main() -> None:
         final_model,
         train_frame[feature_columns].fillna(0.0).astype(float),
         train_frame[args.target].astype(float),
-        sample_weight=_source_weights(
-            train_frame,
-            historical_weight=args.historical_source_weight,
-            live_weight=args.live_source_weight,
-            recency_strength=args.recency_weight_strength,
-        ),
+        sample_weight=_source_weights(train_frame, **source_weight_args),
     )
     version = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -706,6 +825,23 @@ def main() -> None:
     joblib.dump(final_model, model_path)
     plan_model_files, plan_model_metrics = _train_plan_models(best["model_type"], train_frame, feature_columns, args.out_dir, version)
     plan_model_paths = [args.out_dir / filename for filename in plan_model_files.values()]
+    specialist_model_files: dict[str, str] = {}
+    specialist_model_paths: list[Path] = []
+    if args.regime_specialists:
+        specialist_frame = train_frame.copy()
+        _, specialist_models, _ = _train_specialist_models(
+            model_type=best["model_type"],
+            training=specialist_frame,
+            test=test,
+            feature_columns=feature_columns,
+            target=args.target,
+            realized_returns=realized_returns,
+            fee_rate=args.fee_rate,
+            min_edge=args.min_edge,
+            min_rows=args.specialist_min_rows,
+            source_weight_args=source_weight_args,
+        )
+        specialist_model_files, specialist_model_paths = _write_specialist_models(specialist_models, args.out_dir, version)
     metadata = {
         "model_id": f"{best['model_type']}:{version}",
         "name": best["model_type"],
@@ -717,6 +853,10 @@ def main() -> None:
         "feature_columns": feature_columns,
         "symbol_aware": bool(args.symbol_aware),
         "edge_aware_target": bool(args.edge_aware_target),
+        "regime_specialists": bool(args.regime_specialists),
+        "specialist_model_files": specialist_model_files,
+        "specialist_regime_order": REGIME_ORDER,
+        "specialist_min_rows": args.specialist_min_rows,
         "hold_edge_multiplier": args.hold_edge_multiplier,
         "source_weights": {
             "historical_source_weight": args.historical_source_weight,
@@ -745,16 +885,17 @@ def main() -> None:
     }
     metadata_path = args.out_dir / f"model_{version}.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    package_path = _package_model(model_path, metadata, args.out_dir, extra_paths=plan_model_paths)
+    package_path = _package_model(model_path, metadata, args.out_dir, extra_paths=plan_model_paths + specialist_model_paths)
     result.update(
         {
             "status": "passed",
-            "message": "Best model passed safety checks and was packaged with symbol-aware, regime-aware, edge-aware AI trade-plan models. Upload/activate explicitly. Final score: 100/100 (PASS).",
+            "message": "Best model passed safety checks and was packaged with symbol-aware, regime-specialist, edge-aware AI trade-plan models. Upload/activate explicitly. Final score: 100/100 (PASS).",
             "failed_safety_checks": False,
             "next_steps": ["Upload the model package, then activate it from the dashboard Training tab."],
             "best_model": best,
             "model": str(model_path),
             "plan_models": plan_model_files,
+            "specialist_models": specialist_model_files,
             "metadata": str(metadata_path),
             "package": str(package_path),
             "model_id": metadata["model_id"],
