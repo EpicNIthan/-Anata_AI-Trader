@@ -17,6 +17,20 @@ from app.db.models import Feature, ModelVersion
 from app.features.schema import numeric_vector, values_from_feature
 
 
+REGIME_ORDER = [
+    "news_shock",
+    "risk_off",
+    "liquidity_stress",
+    "crowded_market",
+    "breakout_pressure",
+    "mean_reversion_pressure",
+    "trend_up",
+    "trend_down",
+    "range_low_volatility",
+    "high_volatility",
+]
+
+
 @dataclass(frozen=True)
 class ModelDecision:
     decision: StrategyDecision
@@ -56,13 +70,24 @@ class PriceModelStrategy:
             return None
 
         vector = self._feature_vector(feature, feature_columns)
-        predicted_return = self._predict(payload, vector)
+        values = values_from_feature(feature, feature_columns)
+        values.update(symbol_identity_values(feature.symbol))
+        specialist_regime, specialist_file = self._select_specialist_model_file(payload, values)
+        prediction_source = "global_model"
+        predicted_return: float | None = None
+        if specialist_file:
+            predicted_return = self._predict_model_file(payload, specialist_file, vector)
+            if predicted_return is not None:
+                prediction_source = f"regime_specialist:{specialist_regime}"
+            else:
+                self.last_fallback_reason = None
+        if predicted_return is None:
+            predicted_return = self._predict(payload, vector)
         if predicted_return is None:
             self.last_fallback_reason = self.last_fallback_reason or "Active model type is not compatible with Railway inference."
             return None
         required_edge = settings.paper_fee_rate * 2.0 + settings.strategy_min_edge_after_fees
         confidence = self._confidence(predicted_return, required_edge)
-        values = values_from_feature(feature, feature_columns)
         last_close = values.get("last_close")
         trade_plan = self._trade_plan(payload=payload, vector=vector, confidence=confidence, predicted_return=predicted_return)
 
@@ -76,6 +101,8 @@ class PriceModelStrategy:
             "confidence": confidence,
             "trade_plan": trade_plan,
             "trade_plan_source": trade_plan.get("source"),
+            "prediction_source": prediction_source,
+            "specialist_regime": specialist_regime,
         }
 
         if abs(predicted_return) < required_edge:
@@ -100,7 +127,7 @@ class PriceModelStrategy:
                 action=action,
                 confidence=confidence,
                 reason=(
-                    f"Trained model trade plan: {predicted_return:.4%} {side.lower()} edge, "
+                    f"Trained model trade plan ({prediction_source}): {predicted_return:.4%} {side.lower()} edge, "
                     f"{trade_plan['margin_pct']:.2%} margin, {trade_plan['leverage']:.2f}x leverage."
                 ),
                 stop_loss=self._price_level(
@@ -209,6 +236,39 @@ class PriceModelStrategy:
         except (TypeError, ValueError, IndexError):
             self.last_fallback_reason = "Model prediction was not a numeric scalar."
             return None
+
+    def _select_specialist_model_file(self, payload: dict[str, Any], values: dict[str, Any]) -> tuple[str | None, str | None]:
+        specialist_files = payload.get("specialist_model_files") if isinstance(payload.get("specialist_model_files"), dict) else {}
+        if not specialist_files:
+            return None, None
+        active = self._active_regime(values, list(payload.get("specialist_regime_order") or REGIME_ORDER))
+        if active and active in specialist_files:
+            return active, str(specialist_files[active])
+        return active, None
+
+    def _active_regime(self, values: dict[str, Any], order: list[str]) -> str | None:
+        checks = {
+            "news_shock": self._float(values.get("regime_news_shock_score")) >= 0.45,
+            "risk_off": self._float(values.get("regime_risk_off_score")) >= 0.45,
+            "liquidity_stress": self._float(values.get("regime_liquidity_stress_score")) >= 0.35,
+            "crowded_market": self._float(values.get("regime_crowd_pressure")) >= 0.35,
+            "breakout_pressure": self._float(values.get("regime_breakout_pressure")) >= 0.35,
+            "mean_reversion_pressure": self._float(values.get("regime_mean_reversion_pressure")) >= 0.35,
+            "trend_up": self._float(values.get("regime_trend_strength")) >= 0.35 and self._float(values.get("regime_direction_score")) > 0.10,
+            "trend_down": self._float(values.get("regime_trend_strength")) >= 0.35 and self._float(values.get("regime_direction_score")) < -0.10,
+            "range_low_volatility": self._float(values.get("regime_trend_strength")) < 0.25 and self._float(values.get("regime_volatility_score")) < 0.20,
+            "high_volatility": self._float(values.get("regime_volatility_score")) >= 0.35,
+        }
+        for regime in order:
+            if checks.get(regime):
+                return regime
+        return None
+
+    def _float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value if value is not None else default)
+        except (TypeError, ValueError):
+            return default
 
     def _confidence(self, predicted_return: float, required_edge: float) -> float:
         scale = abs(predicted_return) / max(required_edge * 4.0, 1e-9)
