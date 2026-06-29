@@ -2238,6 +2238,7 @@ def positions(session: Session = Depends(get_session)) -> list[dict[str, Any]]:
             "leverage": row.leverage,
             "unrealized_pnl": row.unrealized_pnl,
             "unrealized_pnl_pct": (row.unrealized_pnl / (row.quantity * row.entry_price)) if row.quantity and row.entry_price else 0.0,
+            "unrealized_roi_pct": (row.unrealized_pnl / row.margin_used) if row.margin_used else 0.0,
             "realized_pnl": row.realized_pnl,
             "stop_loss": row.stop_loss,
             "take_profit": row.take_profit,

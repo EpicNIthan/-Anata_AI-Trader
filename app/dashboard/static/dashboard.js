@@ -343,7 +343,7 @@
         <td>${money(row.entry_price)}</td>
         <td>${money(row.current_price)}</td>
         <td class="${cls(row.unrealized_pnl)}">${money(row.unrealized_pnl)}</td>
-        <td class="${cls(row.unrealized_pnl_pct)}">${pct(row.unrealized_pnl_pct)}</td>
+        <td class="${cls(row.unrealized_roi_pct ?? row.unrealized_pnl_pct)}">${pct(row.unrealized_roi_pct ?? row.unrealized_pnl_pct)}</td>
         <td>${money(row.notional)}</td>
         <td>${row.stop_loss ? money(row.stop_loss) : "-"}</td>
         <td>${row.take_profit ? money(row.take_profit) : "-"}</td>
