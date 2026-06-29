@@ -38,10 +38,14 @@ class RiskManager:
         existing_position: Position | None,
         requested_leverage: float | None = None,
         requested_margin_pct: float | None = None,
+        paper_data_collection_exploration: bool = False,
     ) -> RiskResult:
         normalized_action = action.upper()
         intent, side = self._intent(normalized_action, existing_position)
         has_ai_plan = requested_leverage is not None or requested_margin_pct is not None
+        data_collection_exploration = (
+            settings.is_paper_mode and settings.paper_data_collection_mode and paper_data_collection_exploration
+        )
 
         if intent == "hold":
             return RiskResult(True, "Hold action does not create market exposure.", 0.0, intent=intent)
@@ -76,23 +80,28 @@ class RiskManager:
                 requested_margin_pct=requested_margin_pct,
             )
 
-        if confidence < settings.risk_min_confidence:
+        sizing_confidence = confidence
+        if data_collection_exploration:
+            sizing_confidence = max(confidence, min(settings.risk_min_confidence + 0.01, 1.0))
+
+        if not data_collection_exploration and confidence < settings.risk_min_confidence:
             return RiskResult(False, "Signal confidence is below the configured minimum.", 0.0, intent=intent, side=side)
 
-        daily_pnl = self._daily_realized_pnl()
-        max_daily_loss = settings.paper_start_balance * settings.risk_max_daily_loss_pct
-        if daily_pnl <= -max_daily_loss:
-            return RiskResult(False, "Max daily loss limit reached.", 0.0, intent=intent, side=side)
+        if not data_collection_exploration:
+            daily_pnl = self._daily_realized_pnl()
+            max_daily_loss = settings.paper_start_balance * settings.risk_max_daily_loss_pct
+            if daily_pnl <= -max_daily_loss:
+                return RiskResult(False, "Max daily loss limit reached.", 0.0, intent=intent, side=side)
 
-        if self._cooldown_active(equity):
+        if not data_collection_exploration and self._cooldown_active(equity):
             return RiskResult(False, "Cooldown is active after a large recent loss.", 0.0, intent=intent, side=side)
 
         open_positions = self.session.scalar(select(func.count(Position.id)).where(Position.status == "OPEN")) or 0
-        if existing_position is None and open_positions >= settings.risk_max_open_positions:
+        if not data_collection_exploration and existing_position is None and open_positions >= settings.risk_max_open_positions:
             return RiskResult(False, "Max open position limit reached.", 0.0, intent=intent, side=side)
 
-        leverage = self._paper_leverage(confidence)
-        allocation_pct = self._confidence_allocation(confidence)
+        leverage = self._paper_leverage(sizing_confidence)
+        allocation_pct = self._confidence_allocation(sizing_confidence)
         if allocation_pct <= 0:
             return RiskResult(False, "Signal confidence did not earn a positive position size.", 0.0, intent=intent, side=side)
 
@@ -116,8 +125,14 @@ class RiskManager:
         return RiskResult(
             True,
             (
-                f"Risk checks passed for {side} paper futures. "
-                f"Confidence-sized leverage {leverage:g}x, margin allocation {allocation_pct:.1%}."
+                "Paper data collection exploration accepted for "
+                f"{side} paper futures; soft confidence/loss/cooldown/open-position gates are bypassed. "
+                f"Leverage {leverage:g}x, margin allocation {allocation_pct:.1%}."
+                if data_collection_exploration
+                else (
+                    f"Risk checks passed for {side} paper futures. "
+                    f"Confidence-sized leverage {leverage:g}x, margin allocation {allocation_pct:.1%}."
+                )
             ),
             max_notional,
             margin_required=max_margin,

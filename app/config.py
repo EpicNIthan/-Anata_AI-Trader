@@ -180,6 +180,13 @@ class Settings:
     # Exploration creates random paper actions. Keep it off by default so collected data is cleaner.
     exploration_mode: bool = field(default_factory=lambda: _bool("EXPLORATION_MODE", False))
     exploration_rate: float = field(default_factory=lambda: _float("EXPLORATION_RATE", 0.05))
+    paper_data_collection_mode: bool = field(default_factory=lambda: _bool("PAPER_DATA_COLLECTION_MODE", False))
+    paper_data_collection_exploration_rate: float = field(default_factory=lambda: _float("PAPER_DATA_COLLECTION_EXPLORATION_RATE", 0.35))
+    paper_data_collection_reset_enabled: bool = field(default_factory=lambda: _bool("PAPER_DATA_COLLECTION_RESET_ENABLED", True))
+    paper_data_collection_reset_equity_pct: float = field(default_factory=lambda: _float("PAPER_DATA_COLLECTION_RESET_EQUITY_PCT", 0.10))
+    paper_data_collection_min_hold_seconds: int = field(default_factory=lambda: _int("PAPER_DATA_COLLECTION_MIN_HOLD_SECONDS", 60))
+    paper_data_collection_close_rate: float = field(default_factory=lambda: _float("PAPER_DATA_COLLECTION_CLOSE_RATE", 0.35))
+    paper_data_collection_confidence: float = field(default_factory=lambda: _float("PAPER_DATA_COLLECTION_CONFIDENCE", 0.70))
     min_paper_trade_notional: float = field(default_factory=lambda: _float("MIN_PAPER_TRADE_NOTIONAL", 50.0))
 
     railway_data_factory_mode: bool = field(default_factory=lambda: _bool("RAILWAY_DATA_FACTORY_MODE", True))

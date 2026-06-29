@@ -43,6 +43,7 @@ class PaperEngine:
         notional: float | None = None,
         leverage: float | None = None,
         margin_pct: float | None = None,
+        paper_data_collection_exploration: bool = False,
     ) -> ExecutionResult:
         if not settings.is_paper_mode:
             return ExecutionResult("REJECTED", "Trading mode is not paper; real order APIs are disabled.")
@@ -68,6 +69,7 @@ class PaperEngine:
             existing_position=existing_position,
             requested_leverage=leverage,
             requested_margin_pct=margin_pct,
+            paper_data_collection_exploration=paper_data_collection_exploration,
         )
         if not risk.accepted:
             return ExecutionResult("REJECTED", risk.reason, balance=latest_account.cash_balance, equity=latest_account.equity)
@@ -115,6 +117,87 @@ class PaperEngine:
             "realized_pnl": latest.realized_pnl,
             "unrealized_pnl": latest.unrealized_pnl,
             "drawdown": latest.drawdown,
+        }
+
+    def reset_paper_account_if_needed(self) -> dict[str, object] | None:
+        if not settings.is_paper_mode:
+            return None
+        if not settings.paper_data_collection_mode or not settings.paper_data_collection_reset_enabled:
+            return None
+
+        latest = self._latest_account(create=True)
+        reset_threshold = settings.paper_start_balance * max(settings.paper_data_collection_reset_equity_pct, 0.0)
+        if latest.equity > reset_threshold:
+            return None
+
+        previous_equity = latest.equity
+        reset_at = datetime.now(timezone.utc)
+        closed_positions: list[dict[str, object]] = []
+        open_positions = list(self.session.scalars(select(Position).where(Position.status == "OPEN")))
+        for position in open_positions:
+            mark_price = self._resolve_price(position.symbol, None) or position.current_price or position.entry_price
+            if mark_price and mark_price > 0:
+                result = self._close(
+                    symbol=position.symbol,
+                    price=mark_price,
+                    reason="Paper data collection account reset: force-closing open position before balance reset.",
+                    requested_quantity=None,
+                    existing_position=position,
+                    requested_action="CLOSE",
+                )
+                closed_positions.append(
+                    {
+                        "position_id": position.id,
+                        "symbol": position.symbol,
+                        "side": position.side,
+                        "price": mark_price,
+                        "status": result.status,
+                        "trade_id": result.trade_id,
+                        "message": result.message,
+                    }
+                )
+                continue
+
+            position.quantity = 0.0
+            position.notional = 0.0
+            position.margin_used = 0.0
+            position.unrealized_pnl = 0.0
+            position.status = "CLOSED"
+            position.closed_at = reset_at
+            closed_positions.append(
+                {
+                    "position_id": position.id,
+                    "symbol": position.symbol,
+                    "side": position.side,
+                    "status": "CLOSED_WITHOUT_MARK_PRICE",
+                    "message": "No mark price was available; position was marked closed during paper reset.",
+                }
+            )
+
+        realized_pnl = float(self.session.scalar(select(func.coalesce(func.sum(PaperTrade.realized_pnl), 0.0))) or 0.0)
+        reset_row = AccountEquity(
+            timestamp=reset_at,
+            cash_balance=settings.paper_start_balance,
+            equity=settings.paper_start_balance,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=0.0,
+            drawdown=0.0,
+            raw={
+                "paper_data_collection_reset": True,
+                "previous_equity": previous_equity,
+                "reset_threshold": reset_threshold,
+                "timestamp": reset_at.isoformat(),
+                "closed_positions": closed_positions,
+            },
+        )
+        self.session.add(reset_row)
+        self.session.commit()
+        return {
+            "paper_data_collection_reset": True,
+            "previous_equity": previous_equity,
+            "reset_threshold": reset_threshold,
+            "timestamp": reset_at.isoformat(),
+            "closed_positions": closed_positions,
         }
 
     def _open_or_add(

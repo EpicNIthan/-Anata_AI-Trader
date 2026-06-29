@@ -34,6 +34,11 @@ class AutoTraderState:
     skipped_trades: int = 0
     exploration_enabled: bool = False
     exploration_rate: float = 0.0
+    paper_data_collection_mode: bool = False
+    paper_data_collection_exploration_rate: float = 0.0
+    paper_data_collection_reset_enabled: bool = False
+    paper_data_collection_reset_equity_pct: float = 0.0
+    last_paper_data_collection_reset: dict[str, Any] | None = None
     last_run_at: str | None = None
     last_error: str | None = None
     last_skip_reason: str | None = None
@@ -61,8 +66,12 @@ class AutoTraderService:
             enabled=settings.auto_trader_enabled,
             interval_seconds=self.interval_seconds,
             symbols=self.symbols,
-            exploration_enabled=settings.exploration_mode and settings.is_paper_mode,
-            exploration_rate=settings.exploration_rate,
+            exploration_enabled=self._effective_exploration_enabled(),
+            exploration_rate=self._effective_exploration_rate(),
+            paper_data_collection_mode=self._paper_data_collection_active(),
+            paper_data_collection_exploration_rate=settings.paper_data_collection_exploration_rate,
+            paper_data_collection_reset_enabled=settings.paper_data_collection_reset_enabled,
+            paper_data_collection_reset_equity_pct=settings.paper_data_collection_reset_equity_pct,
             model_strategy_enabled=settings.auto_trader_use_trained_model,
             strategy_mode="model" if settings.auto_trader_use_trained_model else "bot",
         )
@@ -71,6 +80,7 @@ class AutoTraderService:
         self._stop_event: asyncio.Event | None = None
 
     def status(self) -> dict[str, Any]:
+        self._sync_runtime_settings()
         return {
             **self.state.as_dict(),
             "position_management": {
@@ -87,9 +97,36 @@ class AutoTraderService:
                 "max_leverage": settings.paper_max_leverage,
                 "max_margin_allocation_pct": settings.risk_max_trade_size_pct,
                 "model_mode": "Trained AI sends its own trade plan; bot position filters are not applied to model decisions.",
-                "close_filter": "Bot/exploration BUY/SELL/CLOSE opposite-position closes are fee-aware and min-hold protected.",
+                "close_filter": (
+                    "Bot/exploration BUY/SELL/CLOSE opposite-position closes are fee-aware and min-hold protected; "
+                    "paper data collection exploration bypasses those bot filters in paper mode only."
+                ),
             },
         }
+
+    def _sync_runtime_settings(self) -> None:
+        self.state.exploration_enabled = self._effective_exploration_enabled()
+        self.state.exploration_rate = self._effective_exploration_rate()
+        self.state.paper_data_collection_mode = self._paper_data_collection_active()
+        self.state.paper_data_collection_exploration_rate = settings.paper_data_collection_exploration_rate
+        self.state.paper_data_collection_reset_enabled = settings.paper_data_collection_reset_enabled
+        self.state.paper_data_collection_reset_equity_pct = settings.paper_data_collection_reset_equity_pct
+
+    def _paper_data_collection_active(self) -> bool:
+        return settings.is_paper_mode and settings.paper_data_collection_mode
+
+    def _effective_exploration_enabled(self) -> bool:
+        if not settings.is_paper_mode:
+            return False
+        return self._paper_data_collection_active() or settings.exploration_mode
+
+    def _effective_exploration_rate(self) -> float:
+        if self._paper_data_collection_active():
+            return settings.paper_data_collection_exploration_rate
+        return settings.exploration_rate
+
+    def _bounded_probability(self, value: float) -> float:
+        return min(max(value, 0.0), 1.0)
 
     def set_strategy_mode(self, mode: str) -> dict[str, Any]:
         normalized = mode.strip().lower()
@@ -154,6 +191,10 @@ class AutoTraderService:
 
         cycle_decisions: list[dict[str, Any]] = []
         with SessionLocal() as session:
+            engine = PaperEngine(session)
+            reset_info = engine.reset_paper_account_if_needed()
+            if reset_info:
+                self.state.last_paper_data_collection_reset = reset_info
             for symbol in self.symbols:
                 try:
                     cycle_decisions.append(self._run_symbol(session, symbol.upper()))
@@ -161,7 +202,7 @@ class AutoTraderService:
                     logger.exception("Auto trader symbol cycle failed for %s", symbol)
                     cycle_decisions.append({"symbol": symbol.upper(), "status": "ERROR", "message": str(exc)})
                     self.state.last_error = str(exc)
-            PaperEngine(session).snapshot()
+            engine.snapshot()
             update_experience_rewards(session)
 
         self.state.cycles += 1
@@ -198,13 +239,17 @@ class AutoTraderService:
         base_decision = model_decision.decision if model_decision else fallback_decision
         base_source = "model" if model_decision else "strategy"
         decision, decision_source = self._maybe_explore(session, symbol, base_decision, base_source)
+        data_collection_exploration = decision_source == "exploration" and self._paper_data_collection_active()
 
         if decision_source != "model":
-            managed_decision = self._position_management_decision(session, symbol, decision)
-            if managed_decision:
-                decision, decision_source = managed_decision
-            decision = self._fee_aware_close_decision(session, symbol, decision)
-            duplicate_result = self._duplicate_or_loss_cooldown(session, symbol, decision)
+            if data_collection_exploration:
+                duplicate_result = None
+            else:
+                managed_decision = self._position_management_decision(session, symbol, decision)
+                if managed_decision:
+                    decision, decision_source = managed_decision
+                decision = self._fee_aware_close_decision(session, symbol, decision)
+                duplicate_result = self._duplicate_or_loss_cooldown(session, symbol, decision)
         else:
             ai_exit = self._ai_plan_exit_decision(session, symbol)
             if ai_exit:
@@ -224,6 +269,7 @@ class AutoTraderService:
                 leverage=decision.leverage if decision_source == "model" else None,
                 margin_pct=decision.margin_pct if decision_source == "model" else None,
                 notional=settings.min_paper_trade_notional if decision_source == "exploration" and decision.action in {"BUY", "SELL"} else None,
+                paper_data_collection_exploration=data_collection_exploration,
             )
 
         execution = {
@@ -233,6 +279,7 @@ class AutoTraderService:
             "balance": execution_result.balance,
             "equity": execution_result.equity,
             "trade_plan": self._trade_plan_payload(decision) if decision_source == "model" else None,
+            "paper_data_collection_exploration": data_collection_exploration,
         }
         execution["decision_source"] = decision_source
         execution["strategy_action"] = fallback_decision.action
@@ -305,9 +352,11 @@ class AutoTraderService:
         base_decision: StrategyDecision,
         base_source: str,
     ) -> tuple[StrategyDecision, str]:
-        if not settings.is_paper_mode or not settings.exploration_mode or settings.exploration_rate <= 0:
+        data_collection = self._paper_data_collection_active()
+        exploration_rate = self._effective_exploration_rate()
+        if not settings.is_paper_mode or not self._effective_exploration_enabled() or exploration_rate <= 0:
             return base_decision, base_source
-        if self._rng.random() >= min(max(settings.exploration_rate, 0.0), 1.0):
+        if self._rng.random() >= self._bounded_probability(exploration_rate):
             return base_decision, base_source
 
         existing_position = session.scalar(
@@ -316,6 +365,28 @@ class AutoTraderService:
             .order_by(desc(Position.opened_at))
             .limit(1)
         )
+        if data_collection:
+            if existing_position:
+                min_hold_seconds = max(settings.paper_data_collection_min_hold_seconds, 0)
+                if self._position_age_seconds(existing_position) >= min_hold_seconds:
+                    close_rate = self._bounded_probability(settings.paper_data_collection_close_rate)
+                    same_side_action = "BUY" if existing_position.side.upper() == "LONG" else "SELL"
+                    action = (
+                        "CLOSE"
+                        if self._rng.random() < close_rate
+                        else self._rng.choices([same_side_action, "HOLD"], weights=[0.85, 0.15], k=1)[0]
+                    )
+                else:
+                    action = self._rng.choices(["BUY", "SELL", "CLOSE"], weights=[0.4, 0.4, 0.2], k=1)[0]
+            else:
+                action = self._rng.choices(["BUY", "SELL", "HOLD"], weights=[0.47, 0.47, 0.06], k=1)[0]
+            confidence = min(max(settings.paper_data_collection_confidence, 0.0), 1.0)
+            reason = (
+                "Paper data collection exploration action selected to collect action-result training data. "
+                f"Original {base_source} wanted {base_decision.action}: {base_decision.reason}"
+            )
+            return StrategyDecision(action=action, confidence=confidence, reason=reason), "exploration"
+
         if existing_position:
             action = self._rng.choice(["BUY", "SELL", "CLOSE"])
         else:
@@ -380,8 +451,12 @@ class AutoTraderService:
                 "model_fallback_reason": self.state.model_fallback_reason if model_decision is None else None,
                 "model_trade_plan_bypassed_bot_filters": decision_source == "model",
                 "exploration": {
-                    "enabled": settings.exploration_mode,
-                    "rate": settings.exploration_rate,
+                    "enabled": self._effective_exploration_enabled(),
+                    "rate": self._effective_exploration_rate(),
+                    "configured_enabled": settings.exploration_mode,
+                    "configured_rate": settings.exploration_rate,
+                    "paper_data_collection_mode": self._paper_data_collection_active(),
+                    "paper_data_collection_exploration_rate": settings.paper_data_collection_exploration_rate,
                     "min_notional": settings.min_paper_trade_notional,
                 },
             },

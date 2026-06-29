@@ -17,6 +17,27 @@ DASHBOARD_PASSWORD=
 HF_API_TOKEN=
 ```
 
+## Optional paper data collection mode
+
+Use this only for paper/demo training-data collection. It does not enable real-money trading and should be paired with `TRADING_MODE=paper`.
+
+```text
+TRADING_MODE=paper
+PAPER_DATA_COLLECTION_MODE=true
+PAPER_DATA_COLLECTION_EXPLORATION_RATE=0.35
+PAPER_DATA_COLLECTION_RESET_ENABLED=true
+PAPER_DATA_COLLECTION_RESET_EQUITY_PCT=0.10
+PAPER_DATA_COLLECTION_MIN_HOLD_SECONDS=60
+PAPER_DATA_COLLECTION_CLOSE_RATE=0.35
+PAPER_DATA_COLLECTION_CONFIDENCE=0.70
+AUTO_TRADER_ENABLED=true
+AUTO_TRADER_USE_TRAINED_MODEL=false
+AUTO_TRADER_INTERVAL_SECONDS=60
+MIN_PAPER_TRADE_NOTIONAL=50
+```
+
+The same values are available in `presets/paper_data_collection.env`.
+
 Railway normally injects `PORT` automatically. You only need `PORT=8000` for local testing or a custom deployment.
 
 ## Remove from Railway if you did not intentionally override them
@@ -52,6 +73,13 @@ NEWS_SENTIMENT_MODEL
 ENABLE_HF_SENTIMENT
 EXPLORATION_MODE
 EXPLORATION_RATE
+PAPER_DATA_COLLECTION_MODE
+PAPER_DATA_COLLECTION_EXPLORATION_RATE
+PAPER_DATA_COLLECTION_RESET_ENABLED
+PAPER_DATA_COLLECTION_RESET_EQUITY_PCT
+PAPER_DATA_COLLECTION_MIN_HOLD_SECONDS
+PAPER_DATA_COLLECTION_CLOSE_RATE
+PAPER_DATA_COLLECTION_CONFIDENCE
 MIN_PAPER_TRADE_NOTIONAL
 DERIVATIVES_ENABLED
 ENABLE_DERIVATIVES_COLLECTOR
@@ -107,5 +135,6 @@ DIAGNOSTIC_RETENTION_DAYS
 - Paper auto trader: enabled by default.
 - Paper runner starts in Bot mode by default. Switch to Trained AI in the dashboard only after uploading and activating a model you trust.
 - Exploration mode is intentionally off by default because it creates random/noisy paper trades.
+- Paper data collection mode is intentionally off by default. Enable it only with `TRADING_MODE=paper`.
 - Server training is disabled by default; train on your PC.
 - Raw ticks are disabled by default because they grow too fast.
