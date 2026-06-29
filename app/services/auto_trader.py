@@ -268,7 +268,13 @@ class AutoTraderService:
                 take_profit=decision.take_profit,
                 leverage=decision.leverage if decision_source == "model" else None,
                 margin_pct=decision.margin_pct if decision_source == "model" else None,
-                notional=settings.min_paper_trade_notional if decision_source == "exploration" and decision.action in {"BUY", "SELL"} else None,
+                notional=(
+                    settings.min_paper_trade_notional
+                    if decision_source == "exploration"
+                    and not data_collection_exploration
+                    and decision.action in {"BUY", "SELL"}
+                    else None
+                ),
                 paper_data_collection_exploration=data_collection_exploration,
             )
 
