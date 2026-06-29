@@ -68,6 +68,14 @@ REGIME_ORDER = [
     "range_low_volatility",
     "high_volatility",
 ]
+DEMO_CONFIG: dict[str, float | int] = {
+    "slippage_rate": 0.0002,
+    "stress_cost_multiplier": 2.0,
+    "max_demo_drawdown": 0.35,
+    "max_trade_rate": 0.70,
+    "min_trade_directional_accuracy": 0.50,
+    "min_profitable_slices": 1,
+}
 
 
 def _repo_root() -> Path:
@@ -90,6 +98,10 @@ def _max_drawdown(equity_curve: list[float]) -> float:
         if peak:
             worst = min(worst, (value - peak) / peak)
     return abs(worst)
+
+
+def _clip(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
 
 
 def _feature_columns(frame, target: str) -> list[str]:
@@ -139,28 +151,200 @@ def _fit_model(model: Any, x_train, y_train, sample_weight=None) -> None:
         model.fit(x_train, y_train)
 
 
-def _simulate(predictions, realized_returns, *, fee_rate: float, min_edge: float) -> dict[str, Any]:
-    threshold = max(min_edge, fee_rate * 2)
-    actions = [1 if pred > threshold else (-1 if pred < -threshold else 0) for pred in predictions]
-    trade_returns = [(action * ret - (fee_rate * 2 if action else 0.0)) for action, ret in zip(actions, realized_returns)]
+def _trade_cost(*, fee_rate: float, slippage_rate: float = 0.0, cost_multiplier: float = 1.0) -> float:
+    return float(max(0.0, ((fee_rate + slippage_rate) * 2.0) * max(0.0, cost_multiplier)))
+
+
+def _actions_from_predictions(predictions, *, fee_rate: float, min_edge: float):
+    import numpy as np
+
+    predictions = np.asarray(predictions, dtype=float)
+    threshold = float(max(min_edge, fee_rate * 2.0))
+    actions = np.where(predictions > threshold, 1, np.where(predictions < -threshold, -1, 0))
+    return actions, threshold
+
+
+def _longest_losing_streak(trade_returns) -> int:
+    longest = 0
+    current = 0
+    for ret in trade_returns:
+        if float(ret) <= 0.0:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return int(longest)
+
+
+def _raw_simulate(
+    predictions,
+    realized_returns,
+    *,
+    fee_rate: float,
+    min_edge: float,
+    slippage_rate: float = 0.0,
+    cost_multiplier: float = 1.0,
+) -> dict[str, Any]:
+    import numpy as np
+
+    predictions = np.asarray(predictions, dtype=float)
+    realized_returns = np.asarray(realized_returns, dtype=float)
+    actions, threshold = _actions_from_predictions(predictions, fee_rate=fee_rate, min_edge=min_edge)
+    round_trip_cost = _trade_cost(fee_rate=fee_rate, slippage_rate=slippage_rate, cost_multiplier=cost_multiplier)
+    trade_returns = np.where(actions != 0, (actions * realized_returns) - round_trip_cost, 0.0)
+
     equity = [1.0]
     for ret in trade_returns:
-        equity.append(equity[-1] * (1.0 + float(ret)))
-    traded = [ret for action, ret in zip(actions, trade_returns) if action]
-    wins = [ret for ret in traded if ret > 0]
+        equity.append(max(0.0, equity[-1] * (1.0 + float(ret))))
+
+    traded = trade_returns[actions != 0]
+    wins = traded[traded > 0]
+    losses = traded[traded <= 0]
+    gross_profit = float(wins.sum()) if len(wins) else 0.0
+    gross_loss = float(abs(losses.sum())) if len(losses) else 0.0
+    average_win = float(wins.mean()) if len(wins) else 0.0
+    average_loss = float(abs(losses.mean())) if len(losses) else 0.0
+    long_count = int((actions == 1).sum())
+    short_count = int((actions == -1).sum())
+    trade_count = int(len(traded))
+
     return {
         "net_return_after_fees": float(equity[-1] - 1.0),
         "max_drawdown": float(_max_drawdown(equity)),
-        "number_of_trades": int(len(traded)),
-        "skipped_no_trade_count": int(len(actions) - len(traded)),
-        "simulated_win_rate": float(len(wins) / len(traded)) if traded else 0.0,
-        "average_return_per_trade": float(sum(traded) / len(traded)) if traded else 0.0,
-        "average_realized_return_after_fees": float(sum(trade_returns) / len(trade_returns)) if trade_returns else 0.0,
+        "number_of_trades": trade_count,
+        "skipped_no_trade_count": int((actions == 0).sum()),
+        "trade_rate": float(trade_count / len(actions)) if len(actions) else 0.0,
+        "long_trade_count": long_count,
+        "short_trade_count": short_count,
+        "action_bias": float((long_count - short_count) / trade_count) if trade_count else 0.0,
+        "simulated_win_rate": float(len(wins) / trade_count) if trade_count else 0.0,
+        "average_return_per_trade": float(traded.mean()) if trade_count else 0.0,
+        "average_realized_return_after_fees": float(trade_returns.mean()) if len(trade_returns) else 0.0,
+        "best_trade_return": float(traded.max()) if trade_count else 0.0,
+        "worst_trade_return": float(traded.min()) if trade_count else 0.0,
+        "average_win_return": average_win,
+        "average_loss_return": average_loss,
+        "payoff_ratio": float(average_win / average_loss) if average_loss > 0 else (999.0 if average_win > 0 else 0.0),
+        "profit_factor": float(gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0),
+        "longest_losing_streak": _longest_losing_streak(traded),
+        "edge_threshold_used": threshold,
+        "round_trip_cost_used": round_trip_cost,
     }
 
 
 def _directional_accuracy(predictions, actual) -> float:
+    import numpy as np
+
+    predictions = np.asarray(predictions, dtype=float)
+    actual = np.asarray(actual, dtype=float)
+    if len(predictions) == 0:
+        return 0.0
     return float(((predictions > 0) == (actual > 0)).mean())
+
+
+def _trade_directional_accuracy(predictions, realized_returns, *, fee_rate: float, min_edge: float) -> float:
+    import numpy as np
+
+    realized_returns = np.asarray(realized_returns, dtype=float)
+    actions, _ = _actions_from_predictions(predictions, fee_rate=fee_rate, min_edge=min_edge)
+    mask = actions != 0
+    if not bool(mask.any()):
+        return 0.0
+    actual_direction = np.where(realized_returns[mask] > 0, 1, -1)
+    return float((actions[mask] == actual_direction).mean())
+
+
+def _slice_validation(
+    predictions,
+    realized_returns,
+    *,
+    fee_rate: float,
+    min_edge: float,
+    slippage_rate: float = 0.0,
+    cost_multiplier: float = 1.0,
+    slices: int = 4,
+    min_rows: int = 25,
+) -> dict[str, Any]:
+    import numpy as np
+
+    predictions = np.asarray(predictions, dtype=float)
+    realized_returns = np.asarray(realized_returns, dtype=float)
+    chunks = np.array_split(np.arange(len(predictions)), max(1, slices))
+    metrics: list[dict[str, Any]] = []
+    profitable = 0
+    losing = 0
+    evaluated = 0
+    worst_net = None
+    worst_drawdown = 0.0
+
+    for index, chunk in enumerate(chunks, start=1):
+        if len(chunk) < min_rows:
+            metrics.append({"slice": index, "status": "too_few_rows", "rows": int(len(chunk))})
+            continue
+        result = _raw_simulate(
+            predictions[chunk],
+            realized_returns[chunk],
+            fee_rate=fee_rate,
+            min_edge=min_edge,
+            slippage_rate=slippage_rate,
+            cost_multiplier=cost_multiplier,
+        )
+        result["slice"] = index
+        result["rows"] = int(len(chunk))
+        result["status"] = "evaluated"
+        metrics.append(result)
+        evaluated += 1
+        net_return = float(result["net_return_after_fees"])
+        worst_net = net_return if worst_net is None else min(worst_net, net_return)
+        worst_drawdown = max(worst_drawdown, float(result["max_drawdown"]))
+        if net_return > 0.0:
+            profitable += 1
+        else:
+            losing += 1
+
+    return {
+        "metrics": metrics,
+        "summary": {
+            "evaluated_slice_count": evaluated,
+            "profitable_slice_count": profitable,
+            "losing_slice_count": losing,
+            "worst_slice_net_return": float(worst_net) if worst_net is not None else None,
+            "worst_slice_drawdown": float(worst_drawdown),
+            "min_rows_per_slice": min_rows,
+        },
+    }
+
+
+def _simulate(predictions, realized_returns, *, fee_rate: float, min_edge: float) -> dict[str, Any]:
+    metrics = _raw_simulate(predictions, realized_returns, fee_rate=fee_rate, min_edge=min_edge)
+    metrics["trade_directional_accuracy"] = _trade_directional_accuracy(
+        predictions,
+        realized_returns,
+        fee_rate=fee_rate,
+        min_edge=min_edge,
+    )
+    metrics["stress_test"] = _raw_simulate(
+        predictions,
+        realized_returns,
+        fee_rate=fee_rate,
+        min_edge=min_edge,
+        slippage_rate=float(DEMO_CONFIG["slippage_rate"]),
+        cost_multiplier=float(DEMO_CONFIG["stress_cost_multiplier"]),
+    )
+    normal_slices = _slice_validation(predictions, realized_returns, fee_rate=fee_rate, min_edge=min_edge)
+    stress_slices = _slice_validation(
+        predictions,
+        realized_returns,
+        fee_rate=fee_rate,
+        min_edge=min_edge,
+        slippage_rate=float(DEMO_CONFIG["slippage_rate"]),
+        cost_multiplier=float(DEMO_CONFIG["stress_cost_multiplier"]),
+    )
+    metrics["slice_summary"] = normal_slices["summary"]
+    metrics["slice_metrics"] = normal_slices["metrics"]
+    metrics["stress_slice_summary"] = stress_slices["summary"]
+    metrics["stress_slice_metrics"] = stress_slices["metrics"]
+    return metrics
 
 
 def _rule_based_predictions(test):
@@ -179,40 +363,35 @@ def _data_readiness(labeled_rows: int, dataset_days: float) -> dict[str, Any]:
         use = "pipeline test only"
     elif labeled_rows < 20000 or dataset_days < 3:
         rank = "C-"
-        use = "early experiment; do not activate unless safety checks pass"
+        use = "early experiment; demo activation only if safety gate passes"
     elif labeled_rows < 75000 or dataset_days < 7:
         rank = "C/B-"
-        use = "experiment model; compare against Bot carefully"
+        use = "demo/paper experiment; compare against Bot carefully"
     elif labeled_rows < 250000 or dataset_days < 14:
         rank = "B"
-        use = "first serious paper-test candidate"
+        use = "first serious demo/paper candidate"
     else:
         rank = "A"
-        use = "stronger paper-test candidate, still not live-money proof"
+        use = "stronger demo/paper candidate, still not live-money proof"
     return {"rank": rank, "use": use, "labeled_rows": labeled_rows, "dataset_days": dataset_days}
 
 
 def _failure_advice(candidates: list[dict[str, Any]], dataset_days: float) -> list[str]:
     advice = [
-        "Training completed, but no model was packaged because every candidate failed safety checks.",
-        "Keep Paper Runner on Bot and keep collecting more days before activating Trained AI.",
+        "Training completed, but no model was packaged because every candidate failed demo/paper safety checks.",
+        "Keep Paper Runner on Bot and keep collecting more days before activating Trained AI in the demo website.",
     ]
     if dataset_days < 3:
-        advice.append("24 hours is enough to test the pipeline, but usually too short for a reliable trading model. Aim for 3-7 days for the next attempt.")
+        advice.append("24 hours can test the pipeline, but 3-7 days gives the demo gate better evidence.")
     if candidates:
         best = max(candidates, key=lambda item: item.get("metrics", {}).get("net_return_after_fees", -999.0))
         metrics = best.get("metrics", {})
-        if metrics.get("net_return_after_fees", 0) <= 0:
-            advice.append("The best candidate still had negative net return after fees, so uploading it would teach Railway to trade badly.")
-        if metrics.get("max_drawdown", 0) >= 0.15:
-            advice.append("Drawdown was too high; the model is overtrading or learning a weak/unstable pattern.")
-        if metrics.get("number_of_trades", 0) > metrics.get("test_rows", 0) * 0.50:
-            advice.append("The model traded too often. The edge-aware HOLD target should reduce weak/noisy trades as more live data is collected.")
-        regime_summary = metrics.get("regime_summary", {})
-        if regime_summary.get("evaluated_regime_count", 0) < 3:
-            advice.append("Regime validation had too few populated market regimes. More days and more market conditions are needed.")
-        if regime_summary.get("losing_regime_count", 0) > regime_summary.get("profitable_regime_count", 0):
-            advice.append("The model loses in more regimes than it wins. Keep collecting different market conditions before activation.")
+        gate = metrics.get("demo_safety_gate", {})
+        failures = gate.get("hard_failures", [])
+        if failures:
+            advice.append("Best candidate failed demo gate checks: " + ", ".join(failures[:8]))
+        if metrics.get("number_of_trades", 0) > metrics.get("test_rows", 0) * 0.70:
+            advice.append("The model traded too often. Try a higher --min-edge such as 0.003 or 0.005.")
     return advice
 
 
@@ -542,27 +721,135 @@ def _package_model(model_path: Path, metadata: dict[str, Any], output_dir: Path,
     return package_path
 
 
-def _clip(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
-    return max(lower, min(upper, value))
+def _gate_check(value: Any, passed: bool, *, requirement: str, hard: bool = True) -> dict[str, Any]:
+    return {"value": value, "passed": bool(passed), "requirement": requirement, "hard": bool(hard)}
+
+
+def _demo_safety_gate(metrics: dict[str, Any], min_trades: int) -> dict[str, Any]:
+    regime_summary = metrics.get("regime_summary", {}) or {}
+    slice_summary = metrics.get("slice_summary", {}) or {}
+    stress_test = metrics.get("stress_test", {}) or {}
+    evaluated_regimes = int(regime_summary.get("evaluated_regime_count", 0) or 0)
+    profitable_regimes = int(regime_summary.get("profitable_regime_count", 0) or 0)
+    evaluated_slices = int(slice_summary.get("evaluated_slice_count", 0) or 0)
+    profitable_slices = int(slice_summary.get("profitable_slice_count", 0) or 0)
+    trade_rate = float(metrics.get("trade_rate", 0.0) or 0.0)
+    trade_accuracy = float(metrics.get("trade_directional_accuracy", 0.0) or 0.0)
+    stress_net = float(stress_test.get("net_return_after_fees", 0.0) or 0.0)
+    stress_drawdown = float(stress_test.get("max_drawdown", 0.0) or 0.0)
+    max_demo_drawdown = float(DEMO_CONFIG["max_demo_drawdown"])
+    stress_drawdown_limit = min(0.65, max_demo_drawdown * 1.5)
+
+    checks = {
+        "net_return_after_fees_positive": _gate_check(
+            metrics.get("net_return_after_fees"),
+            float(metrics.get("net_return_after_fees", 0.0) or 0.0) > 0.0,
+            requirement="> 0 after normal fees",
+        ),
+        "stress_test_not_destroyed": _gate_check(
+            stress_net,
+            stress_net > -0.05,
+            requirement="> -5% after stress fee/slippage test",
+        ),
+        "max_drawdown_demo_limit": _gate_check(
+            metrics.get("max_drawdown"),
+            float(metrics.get("max_drawdown", 1.0) or 1.0) <= max_demo_drawdown,
+            requirement=f"<= {max_demo_drawdown:.2%} demo max drawdown",
+        ),
+        "stress_drawdown_demo_limit": _gate_check(
+            stress_drawdown,
+            stress_drawdown <= stress_drawdown_limit,
+            requirement=f"<= {stress_drawdown_limit:.2%} stress max drawdown",
+        ),
+        "minimum_trades": _gate_check(
+            metrics.get("number_of_trades"),
+            int(metrics.get("number_of_trades", 0) or 0) >= min_trades,
+            requirement=f">= {min_trades} simulated trades",
+        ),
+        "not_overtrading": _gate_check(
+            trade_rate,
+            trade_rate <= float(DEMO_CONFIG["max_trade_rate"]),
+            requirement=f"trade rate <= {float(DEMO_CONFIG['max_trade_rate']):.0%} of test rows",
+        ),
+        "trade_directional_accuracy": _gate_check(
+            trade_accuracy,
+            trade_accuracy >= float(DEMO_CONFIG["min_trade_directional_accuracy"]),
+            requirement=f">= {float(DEMO_CONFIG['min_trade_directional_accuracy']):.2%} on executed trades",
+        ),
+        "beats_rule_based_baseline": _gate_check(
+            metrics.get("beats_rule_based_baseline"),
+            bool(metrics.get("beats_rule_based_baseline", False)),
+            requirement="AI net return after fees > rule-based baseline net return",
+        ),
+        "accuracy_not_suspiciously_high": _gate_check(
+            metrics.get("directional_accuracy"),
+            float(metrics.get("directional_accuracy", 0.0) or 0.0) <= 0.75,
+            requirement="<= 75% total directional accuracy to reduce leakage risk",
+        ),
+        "trade_accuracy_not_suspiciously_high": _gate_check(
+            trade_accuracy,
+            trade_accuracy <= 0.85,
+            requirement="<= 85% trade directional accuracy to reduce leakage risk",
+        ),
+        "time_slices_have_a_winner": _gate_check(
+            profitable_slices,
+            evaluated_slices < 2 or profitable_slices >= int(DEMO_CONFIG["min_profitable_slices"]),
+            requirement=f">= {int(DEMO_CONFIG['min_profitable_slices'])} profitable chronological test slice when at least 2 slices are evaluated",
+        ),
+        "regimes_not_all_losing": _gate_check(
+            {"profitable": profitable_regimes, "evaluated": evaluated_regimes},
+            evaluated_regimes < 3 or profitable_regimes > 0,
+            requirement="not 0 profitable regimes when at least 3 regimes are evaluated",
+        ),
+        "regime_coverage": _gate_check(
+            evaluated_regimes,
+            evaluated_regimes >= 3,
+            requirement=">= 3 evaluated regimes preferred",
+            hard=False,
+        ),
+    }
+    hard_failures = [name for name, check in checks.items() if check["hard"] and not check["passed"]]
+    soft_warnings = [name for name, check in checks.items() if not check["hard"] and not check["passed"]]
+    return {
+        "mode": "paper_demo_activation",
+        "passed": not hard_failures,
+        "hard_failures": hard_failures,
+        "soft_warnings": soft_warnings,
+        "checks": checks,
+        "settings": dict(DEMO_CONFIG),
+        "note": "PASS only means usable for the demo/paper website. It is not real-money approval.",
+    }
 
 
 def _candidate_score(metrics: dict[str, Any], passed: bool) -> dict[str, Any]:
     if passed:
-        return {"score": 100.0, "grade": "PASS", "components": {"passed_safety_checks": 100.0}}
-    directional = float(metrics.get("directional_accuracy", 0.0) or 0.0)
+        return {"score": 100.0, "grade": "DEMO_PASS", "components": {"passed_demo_safety_checks": 100.0}}
+
+    trade_directional = float(metrics.get("trade_directional_accuracy", metrics.get("directional_accuracy", 0.0)) or 0.0)
     net_return = float(metrics.get("net_return_after_fees", -1.0) or 0.0)
     drawdown = float(metrics.get("max_drawdown", 1.0) or 0.0)
+    trade_rate = float(metrics.get("trade_rate", 1.0) or 0.0)
+    profit_factor = float(metrics.get("profit_factor", 0.0) or 0.0)
     beats_baseline = bool(metrics.get("beats_rule_based_baseline", False))
+    stress_net = float((metrics.get("stress_test", {}) or {}).get("net_return_after_fees", -1.0) or 0.0)
     regime_summary = metrics.get("regime_summary", {}) or {}
-    evaluated = max(1, int(regime_summary.get("evaluated_regime_count", 0) or 0))
-    profitable = int(regime_summary.get("profitable_regime_count", 0) or 0)
+    slice_summary = metrics.get("slice_summary", {}) or {}
+    evaluated_regimes = max(1, int(regime_summary.get("evaluated_regime_count", 0) or 0))
+    profitable_regimes = int(regime_summary.get("profitable_regime_count", 0) or 0)
+    evaluated_slices = max(1, int(slice_summary.get("evaluated_slice_count", 0) or 0))
+    profitable_slices = int(slice_summary.get("profitable_slice_count", 0) or 0)
 
-    direction_score = 15.0 * _clip((directional - 0.50) / 0.01)
-    return_score = 30.0 * _clip((net_return + 0.05) / 0.05)
-    drawdown_score = 25.0 * _clip((1.0 - drawdown) / 0.85)
+    direction_score = 12.0 * _clip((trade_directional - 0.49) / 0.03)
+    return_score = 24.0 * _clip((net_return + 0.05) / 0.08)
+    stress_score = 12.0 * _clip((stress_net + 0.08) / 0.08)
+    drawdown_score = 16.0 * _clip((0.75 - drawdown) / 0.75)
+    activity_score = 8.0 * _clip(1.0 - max(0.0, trade_rate - float(DEMO_CONFIG["max_trade_rate"])) / max(0.01, 1.0 - float(DEMO_CONFIG["max_trade_rate"])))
     baseline_score = 10.0 if beats_baseline else 0.0
-    regime_score = 20.0 * _clip(profitable / evaluated)
-    score = min(99.0, max(0.0, direction_score + return_score + drawdown_score + baseline_score + regime_score))
+    regime_score = 8.0 * _clip(profitable_regimes / evaluated_regimes)
+    slice_score = 10.0 * _clip(profitable_slices / evaluated_slices)
+    profit_factor_score = 10.0 * _clip((profit_factor - 0.8) / 0.7)
+    score = min(99.0, max(0.0, direction_score + return_score + stress_score + drawdown_score + activity_score + baseline_score + regime_score + slice_score + profit_factor_score))
+
     if score >= 80:
         grade = "close"
     elif score >= 60:
@@ -575,16 +862,20 @@ def _candidate_score(metrics: dict[str, Any], passed: bool) -> dict[str, Any]:
         "score": round(score, 2),
         "grade": grade,
         "components": {
-            "directional_accuracy_points": round(direction_score, 2),
+            "trade_directional_accuracy_points": round(direction_score, 2),
             "net_return_points": round(return_score, 2),
+            "stress_cost_points": round(stress_score, 2),
             "drawdown_points": round(drawdown_score, 2),
+            "trade_activity_points": round(activity_score, 2),
             "baseline_points": round(baseline_score, 2),
             "regime_points": round(regime_score, 2),
+            "time_slice_points": round(slice_score, 2),
+            "profit_factor_points": round(profit_factor_score, 2),
         },
         "score_rules": {
-            "100": "model passed safety checks and was packaged",
-            "80_99": "close, but at least one safety condition still failed",
-            "60_79": "improving, not ready",
+            "100": "model passed demo/paper safety checks and was packaged",
+            "80_99": "close, but at least one demo activation condition still failed",
+            "60_79": "improving, not ready for demo activation",
             "35_59": "early, needs better behavior",
             "0_34": "far from passing",
         },
@@ -607,18 +898,13 @@ def _score_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _candidate_passed(metrics: dict[str, Any], min_trades: int) -> bool:
-    return (
-        metrics["directional_accuracy"] > 0.51
-        and metrics["net_return_after_fees"] > 0
-        and metrics["max_drawdown"] < 0.15
-        and metrics["number_of_trades"] >= min_trades
-        and metrics["beats_rule_based_baseline"]
-        and metrics["directional_accuracy"] <= 0.75
-    )
+    gate = _demo_safety_gate(metrics, min_trades)
+    metrics["demo_safety_gate"] = gate
+    return bool(gate["passed"])
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train multiple local models and package the best safe candidate.")
+    parser = argparse.ArgumentParser(description="Train multiple local models and package the best demo/paper-safe candidate.")
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--target", default="target_edge_aware_trade_score")
     parser.add_argument("--return-column", default="target_future_return_15m")
@@ -638,7 +924,24 @@ def main() -> None:
     parser.add_argument("--recency-weight-strength", type=float, default=0.5)
     parser.add_argument("--regime-specialists", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--specialist-min-rows", type=int, default=750)
+    parser.add_argument("--demo-slippage-rate", type=float, default=0.0002)
+    parser.add_argument("--demo-stress-cost-multiplier", type=float, default=2.0)
+    parser.add_argument("--max-demo-drawdown", type=float, default=0.35)
+    parser.add_argument("--max-demo-trade-rate", type=float, default=0.70)
+    parser.add_argument("--min-demo-trade-accuracy", type=float, default=0.50)
+    parser.add_argument("--min-demo-profitable-slices", type=int, default=1)
     args = parser.parse_args()
+
+    DEMO_CONFIG.update(
+        {
+            "slippage_rate": args.demo_slippage_rate,
+            "stress_cost_multiplier": args.demo_stress_cost_multiplier,
+            "max_demo_drawdown": args.max_demo_drawdown,
+            "max_trade_rate": args.max_demo_trade_rate,
+            "min_trade_directional_accuracy": args.min_demo_trade_accuracy,
+            "min_profitable_slices": args.min_demo_profitable_slices,
+        }
+    )
 
     try:
         import joblib
@@ -652,6 +955,7 @@ def main() -> None:
         raise SystemExit("Dataset is missing as_of column.")
     frame["as_of"] = pd.to_datetime(frame["as_of"], utc=True, errors="coerce")
     frame = frame.dropna(subset=["as_of"]).sort_values("as_of")
+
     symbol_feature_columns: list[str] = []
     if args.symbol_aware:
         frame, symbol_feature_columns = _add_symbol_features(frame)
@@ -661,6 +965,7 @@ def main() -> None:
     frame = _add_plan_targets(frame, max_margin_pct=args.max_plan_margin_pct, max_leverage=args.max_plan_leverage)
     if args.target not in frame.columns:
         raise SystemExit(f"Dataset is missing target column {args.target}.")
+
     return_column = args.return_column if args.return_column in frame.columns else args.target
     train_frame = frame.dropna(subset=[args.target, return_column]).copy()
     if len(train_frame) < 100:
@@ -668,12 +973,14 @@ def main() -> None:
     feature_columns = _feature_columns(train_frame, args.target)
     if not feature_columns:
         raise SystemExit("No numeric feature columns found.")
+
     dataset_days = float((train_frame["as_of"].max() - train_frame["as_of"].min()).total_seconds() / 86400.0)
     split = max(1, int(len(train_frame) * (1.0 - min(max(args.test_size, 0.05), 0.50))))
     if split >= len(train_frame):
         raise SystemExit("Not enough rows for time-based test split.")
     training = train_frame.iloc[:split].copy()
     test = train_frame.iloc[split:].copy()
+
     x_train = training[feature_columns].fillna(0.0).astype(float)
     y_train = training[args.target].astype(float)
     source_weight_args = {
@@ -694,8 +1001,8 @@ def main() -> None:
 
     candidates: list[dict[str, Any]] = []
     skipped: dict[str, str] = {}
-    trained_global_models: dict[str, Any] = {}
     trained_specialists: dict[str, dict[str, Any]] = {}
+
     for model_type in [item.strip() for item in args.model_types.split(",") if item.strip()]:
         try:
             model = _make_model(model_type)
@@ -704,7 +1011,7 @@ def main() -> None:
         except Exception as exc:
             skipped[model_type] = str(exc)
             continue
-        trained_global_models[model_type] = model
+
         predictions = global_predictions
         specialist_report: dict[str, Any] = {}
         specialist_summary = {"enabled": bool(args.regime_specialists), "trained_count": 0, "used_test_rows": 0}
@@ -732,6 +1039,7 @@ def main() -> None:
                     "used_test_rows": int(used_mask.sum()),
                     "used_test_rows_pct": float(used_mask.mean() * 100.0),
                 }
+
         metrics = _simulate(predictions, realized_returns, fee_rate=args.fee_rate, min_edge=args.min_edge)
         metrics["directional_accuracy"] = _directional_accuracy(predictions, realized_returns)
         metrics["average_predicted_return"] = float(np.mean(predictions)) if len(predictions) else 0.0
@@ -745,22 +1053,30 @@ def main() -> None:
         regime_validation = _regime_validation(test, predictions, realized_returns, fee_rate=args.fee_rate, min_edge=args.min_edge)
         metrics["regime_summary"] = regime_validation["summary"]
         metrics["regime_metrics"] = regime_validation["metrics"]
+
         warnings = []
         if metrics["directional_accuracy"] > 0.75:
-            warnings.append("Unrealistically high directional accuracy; possible leakage/overfitting.")
+            warnings.append("Unrealistically high total directional accuracy; possible leakage/overfitting.")
+        if metrics.get("trade_directional_accuracy", 0.0) > 0.85:
+            warnings.append("Unrealistically high trade directional accuracy; possible leakage/overfitting.")
         if metrics["number_of_trades"] < args.min_trades:
             warnings.append("Too few simulated trades.")
         if metrics["net_return_after_fees"] <= 0:
             warnings.append("Net return after fees is not positive.")
-        if metrics["max_drawdown"] >= 0.15:
-            warnings.append("Max drawdown is above preferred 0.15.")
+        if metrics["max_drawdown"] > args.max_demo_drawdown:
+            warnings.append("Max drawdown is above demo activation limit.")
+        if metrics.get("trade_rate", 0.0) > args.max_demo_trade_rate:
+            warnings.append("Model trades too often for demo activation.")
         if not metrics["beats_rule_based_baseline"]:
             warnings.append("Model did not beat rule-based baseline.")
         if metrics["regime_summary"]["evaluated_regime_count"] < 3:
             warnings.append("Too few populated regimes for strong regime validation.")
         if metrics["regime_summary"]["losing_regime_count"] > metrics["regime_summary"]["profitable_regime_count"]:
             warnings.append("Model loses in more evaluated regimes than it wins.")
+
         passed = _candidate_passed(metrics, args.min_trades)
+        if metrics.get("demo_safety_gate", {}).get("hard_failures"):
+            warnings.append("Demo gate hard failures: " + ", ".join(metrics["demo_safety_gate"]["hard_failures"]))
         candidates.append({"model_type": model_type, "metrics": metrics, "warnings": warnings, "passed": passed})
 
     final_score = _score_candidates(candidates)
@@ -771,12 +1087,13 @@ def main() -> None:
             item["metrics"]["net_return_after_fees"],
             item["metrics"]["regime_summary"]["profitable_regime_count"],
             -item["metrics"]["max_drawdown"],
-            item["metrics"]["directional_accuracy"],
+            item["metrics"].get("trade_directional_accuracy", 0.0),
         ),
         default=None,
     )
+
     result: dict[str, Any] = {
-        "status": "trained_failed_safety_checks" if candidates else "no_model_selected",
+        "status": "trained_failed_demo_safety_checks" if candidates else "no_model_selected",
         "dataset": str(args.dataset),
         "target": args.target,
         "return_column": return_column,
@@ -790,6 +1107,8 @@ def main() -> None:
         "regime_specialists": bool(args.regime_specialists),
         "specialist_min_rows": args.specialist_min_rows,
         "hold_edge_multiplier": args.hold_edge_multiplier,
+        "demo_safety_mode": "paper_demo_activation",
+        "demo_safety_settings": dict(DEMO_CONFIG),
         "source_weights": {
             "historical_source_weight": args.historical_source_weight,
             "live_source_weight": args.live_source_weight,
@@ -806,7 +1125,7 @@ def main() -> None:
         "failed_safety_checks": True,
         "next_steps": _failure_advice(candidates, dataset_days),
         "final_score": final_score,
-        "message": f"Training completed, but no model passed safety checks. Nothing was packaged or uploaded. Final score: {final_score['score']}/100 ({final_score['grade']}).",
+        "message": f"Training completed, but no model passed demo/paper safety checks. Nothing was packaged or uploaded. Final score: {final_score['score']}/100 ({final_score['grade']}).",
     }
     if best is None:
         print(json.dumps(result, indent=2, default=str))
@@ -823,6 +1142,7 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model_path = args.out_dir / f"model_{version}.joblib"
     joblib.dump(final_model, model_path)
+
     plan_model_files, plan_model_metrics = _train_plan_models(best["model_type"], train_frame, feature_columns, args.out_dir, version)
     plan_model_paths = [args.out_dir / filename for filename in plan_model_files.values()]
     specialist_model_files: dict[str, str] = {}
@@ -842,6 +1162,7 @@ def main() -> None:
             source_weight_args=source_weight_args,
         )
         specialist_model_files, specialist_model_paths = _write_specialist_models(specialist_models, args.out_dir, version)
+
     metadata = {
         "model_id": f"{best['model_type']}:{version}",
         "name": best["model_type"],
@@ -849,7 +1170,8 @@ def main() -> None:
         "model_type": best["model_type"],
         "status": "candidate",
         "activation_mode": "manual",
-        "feature_schema_version": str(train_frame["feature_schema_version"].dropna().iloc[-1]) if "feature_schema_version" in train_frame else "local-raw-v1",
+        "paper_demo_only": True,
+        "feature_schema_version": str(train_frame["feature_schema_version"].dropna().iloc[-1]) if "feature_schema_version" in train_frame and len(train_frame["feature_schema_version"].dropna()) else "local-raw-v1",
         "feature_columns": feature_columns,
         "symbol_aware": bool(args.symbol_aware),
         "edge_aware_target": bool(args.edge_aware_target),
@@ -858,6 +1180,8 @@ def main() -> None:
         "specialist_regime_order": REGIME_ORDER,
         "specialist_min_rows": args.specialist_min_rows,
         "hold_edge_multiplier": args.hold_edge_multiplier,
+        "demo_safety_mode": "paper_demo_activation",
+        "demo_safety_settings": dict(DEMO_CONFIG),
         "source_weights": {
             "historical_source_weight": args.historical_source_weight,
             "live_source_weight": args.live_source_weight,
@@ -871,9 +1195,10 @@ def main() -> None:
         "plan_targets": PLAN_TARGETS,
         "training_dataset_path": str(args.dataset),
         "training_dataset_hash": _dataset_hash(args.dataset),
-        "metrics": best["metrics"] | {
-            "paper_test_readiness": "PASS",
-            "final_score": {"score": 100.0, "grade": "PASS"},
+        "metrics": best["metrics"]
+        | {
+            "paper_test_readiness": "DEMO_PASS",
+            "final_score": {"score": 100.0, "grade": "DEMO_PASS"},
             "rule_based_baseline": baseline_metrics,
             "train_rows": int(len(training)),
             "total_labeled_rows": int(len(train_frame)),
@@ -886,12 +1211,13 @@ def main() -> None:
     metadata_path = args.out_dir / f"model_{version}.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     package_path = _package_model(model_path, metadata, args.out_dir, extra_paths=plan_model_paths + specialist_model_paths)
+
     result.update(
         {
             "status": "passed",
-            "message": "Best model passed safety checks and was packaged with symbol-aware, regime-specialist, edge-aware AI trade-plan models. Upload/activate explicitly. Final score: 100/100 (PASS).",
+            "message": "Best model passed demo/paper safety checks and was packaged. Upload/activate explicitly for the demo website only. Final score: 100/100 (DEMO_PASS).",
             "failed_safety_checks": False,
-            "next_steps": ["Upload the model package, then activate it from the dashboard Training tab."],
+            "next_steps": ["Upload the model package, then activate it from the dashboard Training tab for demo/paper trading."],
             "best_model": best,
             "model": str(model_path),
             "plan_models": plan_model_files,
@@ -899,7 +1225,7 @@ def main() -> None:
             "metadata": str(metadata_path),
             "package": str(package_path),
             "model_id": metadata["model_id"],
-            "final_score": {"score": 100.0, "grade": "PASS", "best_model_type": best.get("model_type")},
+            "final_score": {"score": 100.0, "grade": "DEMO_PASS", "best_model_type": best.get("model_type")},
         }
     )
     print(json.dumps(result, indent=2, default=str))
