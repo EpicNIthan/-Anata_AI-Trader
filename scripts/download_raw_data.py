@@ -169,13 +169,13 @@ def _merge_gzip_text_files(existing: Path, incoming: Path, output: Path, *, csv_
                     writer.write(line if line.endswith("\n") else f"{line}\n")
 
 
-def _merge_daily_manifest(existing_manifest: Path, incoming_manifest: Path, output: Path, existing_zip: Path) -> None:
+def _merge_daily_manifest(existing_manifest: Path, incoming_manifest: Path, output: Path, local_daily_file: Path) -> None:
     existing = _read_json_file(existing_manifest) if existing_manifest.exists() else {}
     incoming = _read_json_file(incoming_manifest) if incoming_manifest.exists() else {}
     merged = dict(incoming or existing)
     merged["local_daily_file_merge"] = {
         "merged_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "existing_backup_file": str(existing_zip),
+        "local_daily_file": str(local_daily_file),
         "reason": "Existing local raw day ZIP was merged with a new download to avoid overwriting partial local data.",
         "existing_manifest": existing,
         "incoming_manifest": incoming,
@@ -184,7 +184,7 @@ def _merge_daily_manifest(existing_manifest: Path, incoming_manifest: Path, outp
     output.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _merge_daily_zip(existing_zip: Path, incoming_day_folder: Path, output_path: Path) -> None:
+def _merge_daily_zip(existing_zip: Path, incoming_day_folder: Path, output_path: Path, *, local_daily_file: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="anata_merge_raw_day_") as temp_dir:
         temp_root = Path(temp_dir)
         existing_root = temp_root / "existing"
@@ -212,7 +212,7 @@ def _merge_daily_zip(existing_zip: Path, incoming_day_folder: Path, output_path:
             output_file.parent.mkdir(parents=True, exist_ok=True)
 
             if relative_path.name == "manifest.json":
-                _merge_daily_manifest(existing_file, incoming_file, output_file, existing_zip)
+                _merge_daily_manifest(existing_file, incoming_file, output_file, local_daily_file)
             elif existing_file.exists() and incoming_file.exists() and relative_path.name.endswith(".jsonl.gz"):
                 _merge_gzip_text_files(existing_file, incoming_file, output_file)
             elif existing_file.exists() and incoming_file.exists() and relative_path.name.endswith(".csv.gz"):
@@ -249,22 +249,20 @@ def _write_daily_zip(
         }
 
     if merge_existing:
-        backup_path = _unique_sibling(output_path, "before_merge")
         previous_size = output_path.stat().st_size
-        output_path.replace(backup_path)
-        try:
-            _merge_daily_zip(backup_path, day_folder, output_path)
-        except Exception:
-            if output_path.exists():
-                output_path.unlink()
-            backup_path.replace(output_path)
-            raise
+        with tempfile.TemporaryDirectory(prefix="anata_existing_raw_day_") as temp_dir:
+            temp_root = Path(temp_dir)
+            existing_copy = temp_root / output_path.name
+            merged_output = temp_root / f"merged_{output_path.name}"
+            shutil.copy2(output_path, existing_copy)
+            _merge_daily_zip(existing_copy, day_folder, merged_output, local_daily_file=output_path)
+            merged_size = merged_output.stat().st_size
+            shutil.move(str(merged_output), output_path)
         return {
             "path": str(output_path),
             "action": "merged_existing",
-            "backup_path": str(backup_path),
             "previous_size_bytes": previous_size,
-            "size_bytes": output_path.stat().st_size,
+            "size_bytes": merged_size,
         }
 
     duplicate_path = _unique_sibling(output_path, "redownload")
