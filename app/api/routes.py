@@ -78,6 +78,25 @@ INSPECTOR_FEATURE_KEYS = [
     "volatility",
     "volume_change",
     "trend_score",
+    "rsi_14",
+    "macd_pct",
+    "macd_signal_pct",
+    "macd_histogram_pct",
+    "sma_20_distance_pct",
+    "ema_20_distance_pct",
+    "bollinger_width_pct",
+    "bollinger_position",
+    "atr_14_pct",
+    "vwap_20_distance_pct",
+    "adx_14",
+    "time_hour_utc_sin",
+    "time_hour_utc_cos",
+    "time_day_of_week_sin",
+    "time_day_of_week_cos",
+    "time_is_weekend",
+    "session_asia",
+    "session_london",
+    "session_new_york",
     "crowd_long_account_pct",
     "crowd_short_account_pct",
     "crowd_long_short_ratio",
@@ -128,6 +147,54 @@ INSPECTOR_FEATURE_KEYS = [
     "etf_bullish_score",
     "world_risk_score",
     "market_regime_score",
+]
+
+MISSING_DATA_ITEMS_FOR_LATER = [
+    {
+        "item": "Longer multi-regime history",
+        "why_later": "Four to a few days can test the pipeline, but weeks or months are needed for bull, bear, sideways, high-volatility, and low-volatility regimes.",
+        "priority": "high",
+    },
+    {
+        "item": "Raw tick/trade tape",
+        "why_later": "Useful for scalping and micro-momentum, but it grows the database very quickly and needs buy/sell aggressor handling.",
+        "priority": "medium",
+    },
+    {
+        "item": "Full historical order book snapshots",
+        "why_later": "Better for short-term liquidity learning than top-5 summaries, but storage and noise are much higher.",
+        "priority": "medium",
+    },
+    {
+        "item": "Structured economic calendar events",
+        "why_later": "CPI, FOMC, jobs, and rate decisions are sparse but useful; current macro/news scoring is only a rough proxy.",
+        "priority": "medium",
+    },
+    {
+        "item": "Real exchange slippage and latency",
+        "why_later": "Important before live trading, but it requires testnet/live execution fills; current app is paper-only and uses simulated slippage.",
+        "priority": "medium",
+    },
+    {
+        "item": "Social sentiment feeds",
+        "why_later": "X, Reddit, Telegram, and Discord can help, but spam/noise filtering is required to avoid overfitting.",
+        "priority": "low",
+    },
+    {
+        "item": "On-chain and exchange-flow data",
+        "why_later": "Whale transfers, exchange inflows/outflows, stablecoin flows, and wallet activity can help crypto models, but reliable sources are often paid or rate-limited.",
+        "priority": "low",
+    },
+    {
+        "item": "Volume profile and liquidity zones",
+        "why_later": "Useful for support/resistance context, but it needs extra aggregation logic beyond the current candle indicators.",
+        "priority": "low",
+    },
+    {
+        "item": "Asset-specific fundamentals",
+        "why_later": "Mostly useful if you expand beyond short-term crypto into stocks, forex, or longer-term strategies.",
+        "priority": "low",
+    },
 ]
 
 
@@ -689,7 +756,7 @@ def _collection_recommendations(
         recommendations.append("Sentiment is still mostly rule-based. Use laptop Hugging Face scoring for stronger news numbers.")
     if (labels.get("rows_with_target_trade_quality_score") or 0) == 0 and counts.get("training_features", 0) > 0:
         recommendations.append("Training features exist but labels are missing. Build labels after enough future candles are available.")
-    if (labels.get("label_coverage_pct") or 0) < 50 and counts.get("training_features", 0) > 1000:
+    if (labels.get("label_coverage_pct") or 0) < 0.50 and counts.get("training_features", 0) > 1000:
         recommendations.append("Label coverage is low. Build labels or export an older date range with enough future candles.")
     if counts.get("experiences", 0) < 500:
         recommendations.append("Experience rows are still low. More paper-trading cycles will help evaluate action-result behavior.")
@@ -1114,6 +1181,11 @@ def data_collection_report(session: Session = Depends(get_session), include_stor
         "collecting_now": {
             "market_closed_candles": "training-quality OHLCV rows in candles where is_closed=true",
             "live_chart_candles": "short-term in-progress rows in live_candle_updates",
+            "upgraded_best_next_additions": [
+                "technical indicators: RSI, MACD, SMA/EMA distance, Bollinger position/width, ATR, VWAP distance, ADX",
+                "time/session features: UTC hour/day cycles, weekend flag, Asia/London/New York sessions",
+                "remaining missing item list is included in missing_items_for_later",
+            ],
             "news": provider_counts,
             "sentiment_models": sentiment_models,
             "external_context": external_counts,
@@ -1135,6 +1207,7 @@ def data_collection_report(session: Session = Depends(get_session), include_stor
             "Train locally from all saved local_data folders, upload candidate model, activate only after metrics look good.",
         ],
         "improve_next": recommendations,
+        "missing_items_for_later": MISSING_DATA_ITEMS_FOR_LATER,
         "storage": storage,
     }
 

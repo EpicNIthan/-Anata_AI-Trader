@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from statistics import mean, pstdev
 from typing import Any
@@ -52,6 +53,154 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _sma(values: list[float], period: int) -> float:
+    window = values[-period:] if len(values) >= period else values
+    return mean(window) if window else 0.0
+
+
+def _ema_series(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    alpha = 2.0 / (period + 1.0)
+    output = [float(values[0])]
+    for value in values[1:]:
+        output.append((float(value) * alpha) + (output[-1] * (1.0 - alpha)))
+    return output
+
+
+def _rsi(closes: list[float], period: int = 14) -> float:
+    if len(closes) <= period:
+        return 0.5
+    deltas = [closes[i] - closes[i - 1] for i in range(len(closes) - period, len(closes))]
+    gains = [max(delta, 0.0) for delta in deltas]
+    losses = [abs(min(delta, 0.0)) for delta in deltas]
+    average_gain = mean(gains) if gains else 0.0
+    average_loss = mean(losses) if losses else 0.0
+    if average_loss == 0.0:
+        return 1.0 if average_gain > 0.0 else 0.5
+    rs = average_gain / average_loss
+    return _clamp(1.0 - (1.0 / (1.0 + rs)), 0.0, 1.0)
+
+
+def _true_ranges(highs: list[float], lows: list[float], closes: list[float]) -> list[float]:
+    ranges: list[float] = []
+    for index, high in enumerate(highs):
+        low = lows[index] if index < len(lows) else high
+        if index == 0 or index - 1 >= len(closes):
+            ranges.append(max(high - low, 0.0))
+            continue
+        previous_close = closes[index - 1]
+        ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close), 0.0))
+    return ranges
+
+
+def _adx(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> float:
+    if len(highs) <= period or len(lows) <= period or len(closes) <= period:
+        return 0.0
+    true_ranges = _true_ranges(highs, lows, closes)
+    dx_values: list[float] = []
+    start = max(1, len(highs) - (period * 2))
+    for end in range(start + period, len(highs) + 1):
+        plus_dm = 0.0
+        minus_dm = 0.0
+        tr_sum = sum(true_ranges[end - period : end])
+        if tr_sum <= 0.0:
+            continue
+        for index in range(end - period + 1, end):
+            up_move = highs[index] - highs[index - 1]
+            down_move = lows[index - 1] - lows[index]
+            if up_move > down_move and up_move > 0.0:
+                plus_dm += up_move
+            if down_move > up_move and down_move > 0.0:
+                minus_dm += down_move
+        plus_di = 100.0 * plus_dm / tr_sum
+        minus_di = 100.0 * minus_dm / tr_sum
+        total = plus_di + minus_di
+        if total > 0.0:
+            dx_values.append(abs(plus_di - minus_di) / total)
+    return _clamp(mean(dx_values[-period:]) if dx_values else 0.0, 0.0, 1.0)
+
+
+def _technical_indicator_features(candles: list[Candle]) -> dict[str, float]:
+    closes = [float(candle.close or 0.0) for candle in candles]
+    highs = [float(candle.high or 0.0) for candle in candles]
+    lows = [float(candle.low or 0.0) for candle in candles]
+    volumes = [float(candle.volume or 0.0) for candle in candles]
+    last_close = closes[-1] if closes else 0.0
+    if last_close <= 0.0:
+        return {
+            "rsi_14": 0.5,
+            "macd_pct": 0.0,
+            "macd_signal_pct": 0.0,
+            "macd_histogram_pct": 0.0,
+            "sma_20_distance_pct": 0.0,
+            "ema_20_distance_pct": 0.0,
+            "bollinger_width_pct": 0.0,
+            "bollinger_position": 0.5,
+            "atr_14_pct": 0.0,
+            "vwap_20_distance_pct": 0.0,
+            "adx_14": 0.0,
+        }
+
+    ema_12 = _ema_series(closes, 12)
+    ema_26 = _ema_series(closes, 26)
+    macd_series = [(fast - slow) for fast, slow in zip(ema_12[-len(ema_26) :], ema_26)] if ema_12 and ema_26 else []
+    macd_value = macd_series[-1] if macd_series else 0.0
+    signal_series = _ema_series(macd_series, 9)
+    signal_value = signal_series[-1] if signal_series else 0.0
+    histogram_value = macd_value - signal_value
+
+    sma_20 = _sma(closes, 20)
+    ema_20_series = _ema_series(closes, 20)
+    ema_20 = ema_20_series[-1] if ema_20_series else sma_20
+    bollinger_window = closes[-20:] if len(closes) >= 20 else closes
+    bollinger_mid = mean(bollinger_window) if bollinger_window else last_close
+    bollinger_std = pstdev(bollinger_window) if len(bollinger_window) > 1 else 0.0
+    bollinger_upper = bollinger_mid + (bollinger_std * 2.0)
+    bollinger_lower = bollinger_mid - (bollinger_std * 2.0)
+    bollinger_range = bollinger_upper - bollinger_lower
+    bollinger_position = ((last_close - bollinger_lower) / bollinger_range) if bollinger_range > 0.0 else 0.5
+
+    true_ranges = _true_ranges(highs, lows, closes)
+    atr_14 = mean(true_ranges[-14:]) if true_ranges else 0.0
+    vwap_window = candles[-20:] if len(candles) >= 20 else candles
+    vwap_numerator = sum(((row.high + row.low + row.close) / 3.0) * max(row.volume or 0.0, 0.0) for row in vwap_window)
+    vwap_denominator = sum(max(row.volume or 0.0, 0.0) for row in vwap_window)
+    vwap_20 = vwap_numerator / vwap_denominator if vwap_denominator > 0.0 else last_close
+
+    return {
+        "rsi_14": _rsi(closes),
+        "macd_pct": macd_value / last_close,
+        "macd_signal_pct": signal_value / last_close,
+        "macd_histogram_pct": histogram_value / last_close,
+        "sma_20_distance_pct": _safe_pct_change(last_close, sma_20) if sma_20 else 0.0,
+        "ema_20_distance_pct": _safe_pct_change(last_close, ema_20) if ema_20 else 0.0,
+        "bollinger_width_pct": (bollinger_range / bollinger_mid) if bollinger_mid else 0.0,
+        "bollinger_position": _clamp(bollinger_position, 0.0, 1.0),
+        "atr_14_pct": atr_14 / last_close,
+        "vwap_20_distance_pct": _safe_pct_change(last_close, vwap_20) if vwap_20 else 0.0,
+        "adx_14": _adx(highs, lows, closes),
+    }
+
+
+def _time_context_features(value: datetime | None) -> dict[str, float]:
+    timestamp = _aware(value) or datetime.now(timezone.utc)
+    hour = timestamp.hour + (timestamp.minute / 60.0)
+    day = float(timestamp.weekday())
+    hour_angle = (hour / 24.0) * math.tau
+    day_angle = (day / 7.0) * math.tau
+    return {
+        "time_hour_utc_sin": math.sin(hour_angle),
+        "time_hour_utc_cos": math.cos(hour_angle),
+        "time_day_of_week_sin": math.sin(day_angle),
+        "time_day_of_week_cos": math.cos(day_angle),
+        "time_is_weekend": 1.0 if timestamp.weekday() >= 5 else 0.0,
+        "session_asia": 1.0 if 0 <= timestamp.hour < 8 else 0.0,
+        "session_london": 1.0 if 7 <= timestamp.hour < 16 else 0.0,
+        "session_new_york": 1.0 if 13 <= timestamp.hour < 22 else 0.0,
+    }
 
 
 class FeatureBuilder:
@@ -109,9 +258,12 @@ class FeatureBuilder:
         else:
             volume_change = 0.0
 
-        news_features = self._recent_news_features(normalized_symbol, now=datetime.now(timezone.utc))
-        derivatives_features = self._recent_derivatives_features(normalized_symbol, now=datetime.now(timezone.utc))
-        external_features = self._recent_external_context_features(normalized_symbol, now=datetime.now(timezone.utc))
+        now = datetime.now(timezone.utc)
+        news_features = self._recent_news_features(normalized_symbol, now=now)
+        derivatives_features = self._recent_derivatives_features(normalized_symbol, now=now)
+        external_features = self._recent_external_context_features(normalized_symbol, now=now)
+        technical_features = _technical_indicator_features(candles)
+        time_features = _time_context_features((candles[-1].close_time or candles[-1].open_time) if candles else now)
         sentiment_score = news_features["sentiment_score"]
         sentiment_confidence = news_features["sentiment_confidence"]
         risk_score = news_features["risk_score"]
@@ -120,7 +272,6 @@ class FeatureBuilder:
         sentiment_count = int(news_features["sentiment_articles_used"])
         trend = _trend_from_change(price_change, volatility)
         trend_score = _clamp(candle_return_5m / max(volatility * 3.0, 0.001), -1.0, 1.0)
-        now = datetime.now(timezone.utc)
 
         values: dict[str, Any] = {
             "price_change": price_change,
@@ -138,6 +289,8 @@ class FeatureBuilder:
             "macro_related": news_features["macro_related"],
             "candle_return_1m": candle_return_1m,
             "candle_return_5m": candle_return_5m,
+            **technical_features,
+            **time_features,
             "last_close": closes[-1] if closes else None,
             "candles_used": len(candles),
             "sentiment_articles_used": sentiment_count,
@@ -219,6 +372,25 @@ class FeatureBuilder:
                 "volatility",
                 "volume_change",
                 "trend_score",
+                "rsi_14",
+                "macd_pct",
+                "macd_signal_pct",
+                "macd_histogram_pct",
+                "sma_20_distance_pct",
+                "ema_20_distance_pct",
+                "bollinger_width_pct",
+                "bollinger_position",
+                "atr_14_pct",
+                "vwap_20_distance_pct",
+                "adx_14",
+                "time_hour_utc_sin",
+                "time_hour_utc_cos",
+                "time_day_of_week_sin",
+                "time_day_of_week_cos",
+                "time_is_weekend",
+                "session_asia",
+                "session_london",
+                "session_new_york",
                 "crowd_long_account_pct",
                 "crowd_short_account_pct",
                 "crowd_long_short_ratio",
@@ -293,6 +465,10 @@ class FeatureBuilder:
                 "risk_score": risk_score,
                 "volatility": volatility,
                 "trend": trend,
+                "rsi_14": technical_features["rsi_14"],
+                "atr_14_pct": technical_features["atr_14_pct"],
+                "adx_14": technical_features["adx_14"],
+                "vwap_20_distance_pct": technical_features["vwap_20_distance_pct"],
                 "trader_crowd_score": derivatives_features["trader_crowd_score"],
                 "crowd_risk_score": derivatives_features["crowd_risk_score"],
                 "taker_buy_pressure": derivatives_features["taker_buy_pressure"],
@@ -312,6 +488,14 @@ class FeatureBuilder:
                 "interval": candle_interval,
                 "returns_used": len(returns),
                 "missing_future_features_default": "0/null",
+                "technical_indicator_periods": {
+                    "rsi": 14,
+                    "macd": "12/26/9",
+                    "atr": 14,
+                    "vwap": 20,
+                    "bollinger": 20,
+                    "adx": 14,
+                },
                 "news_context": news_features["news_context"],
                 "derivatives_context": derivatives_features["derivatives_context"],
                 "external_context": external_features["external_context"],

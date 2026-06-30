@@ -35,7 +35,12 @@ class RuleBasedStrategy:
         price_change = candle_return_5m or legacy_price_change
         volume_change = self._as_float(data.get("volume_change"))
         volatility = abs(self._as_float(data.get("volatility")))
+        atr_14_pct = abs(self._as_float(data.get("atr_14_pct")))
         trend_score = self._as_float(data.get("trend_score"))
+        rsi_14 = self._as_float(data.get("rsi_14"), 0.5)
+        adx_14 = self._as_float(data.get("adx_14"))
+        bollinger_position = self._as_float(data.get("bollinger_position"), 0.5)
+        vwap_distance = self._as_float(data.get("vwap_20_distance_pct"))
         sentiment = self._as_float(data.get("sentiment_score"))
         sentiment_confidence = self._as_float(data.get("sentiment_confidence"))
         risk = self._as_float(data.get("risk_score"))
@@ -59,7 +64,8 @@ class RuleBasedStrategy:
         directional_move = abs(candle_return_5m) + abs(candle_return_1m) * 0.45
         news_edge = abs(sentiment) * max(sentiment_confidence, 0.25) * 0.0025
         flow_edge = abs(trader_crowd_score) * 0.0015 + abs(taker_buy_pressure - 0.5) * 0.002 if taker_buy_pressure else 0.0
-        expected_edge = directional_move + news_edge + flow_edge
+        technical_edge = max(0.0, adx_14 - 0.20) * 0.0015 + min(atr_14_pct * 1.5, 0.002)
+        expected_edge = directional_move + news_edge + flow_edge + technical_edge
 
         if risk >= 0.85:
             return StrategyDecision(
@@ -87,8 +93,20 @@ class RuleBasedStrategy:
         momentum_bias = (candle_return_5m * 80.0) + (candle_return_1m * 35.0) + (trend_score * 0.70)
         news_bias = sentiment * max(sentiment_confidence, 0.35) * 0.35
         market_bias = market_regime * 0.15
+        rsi_bias = _bounded((rsi_14 - 0.5) * 2.0, -1.0, 1.0)
+        vwap_bias = _bounded(vwap_distance * 80.0, -0.35, 0.35)
+        technical_bias = (rsi_bias * 0.16) + (vwap_bias * 0.12) + (adx_14 * trend_score * 0.18)
         long_score = momentum_bias + news_bias + flow_bias + trader_crowd_score * 0.20 + market_bias
         short_score = -momentum_bias - news_bias - flow_bias - trader_crowd_score * 0.20 - market_bias
+        long_score += technical_bias
+        short_score -= technical_bias
+
+        if bollinger_position >= 0.90:
+            long_score -= 0.10
+            short_score += 0.06
+        elif bollinger_position <= 0.10:
+            long_score += 0.06
+            short_score -= 0.10
 
         # Liquidation imbalance can hint at squeeze risk: positive supports longs, negative supports shorts.
         long_score += liquidation_imbalance * 0.12
@@ -103,7 +121,7 @@ class RuleBasedStrategy:
         threshold = 0.22 if volatility >= 0.0008 else 0.30
         if long_score > threshold and long_score > short_score + 0.08:
             confidence = self._confidence(long_score, volatility, expected_edge, required_edge)
-            stop_pct, take_pct = self._adaptive_risk_levels(volatility, long=True)
+            stop_pct, take_pct = self._adaptive_risk_levels(max(volatility, atr_14_pct), long=True)
             return StrategyDecision(
                 action="BUY",
                 confidence=confidence,
@@ -116,7 +134,7 @@ class RuleBasedStrategy:
             )
         if short_score > threshold and short_score > long_score + 0.08:
             confidence = self._confidence(short_score, volatility, expected_edge, required_edge)
-            stop_pct, take_pct = self._adaptive_risk_levels(volatility, long=False)
+            stop_pct, take_pct = self._adaptive_risk_levels(max(volatility, atr_14_pct), long=False)
             return StrategyDecision(
                 action="SELL",
                 confidence=confidence,
@@ -150,6 +168,11 @@ class RuleBasedStrategy:
                 "candle_return_1m",
                 "candle_return_5m",
                 "trend_score",
+                "rsi_14",
+                "atr_14_pct",
+                "adx_14",
+                "bollinger_position",
+                "vwap_20_distance_pct",
                 "trader_crowd_score",
                 "crowd_risk_score",
                 "taker_buy_pressure",
@@ -182,3 +205,7 @@ class RuleBasedStrategy:
 
 def decide_trade(feature: Feature | dict[str, Any]) -> StrategyDecision:
     return RuleBasedStrategy().decide(feature)
+
+
+def _bounded(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))

@@ -28,6 +28,25 @@
     ["volatility", "volatility"],
     ["volume_change", "volume_change"],
     ["trend_score", "trend_score"],
+    ["rsi_14", "rsi_14"],
+    ["macd_pct", "macd_pct"],
+    ["macd_signal_pct", "macd_signal_pct"],
+    ["macd_histogram_pct", "macd_histogram_pct"],
+    ["sma_20_distance_pct", "sma_20_distance_pct"],
+    ["ema_20_distance_pct", "ema_20_distance_pct"],
+    ["bollinger_width_pct", "bollinger_width_pct"],
+    ["bollinger_position", "bollinger_position"],
+    ["atr_14_pct", "atr_14_pct"],
+    ["vwap_20_distance_pct", "vwap_20_distance_pct"],
+    ["adx_14", "adx_14"],
+    ["time_hour_utc_sin", "time_hour_utc_sin"],
+    ["time_hour_utc_cos", "time_hour_utc_cos"],
+    ["time_day_of_week_sin", "time_day_of_week_sin"],
+    ["time_day_of_week_cos", "time_day_of_week_cos"],
+    ["time_is_weekend", "time_is_weekend"],
+    ["session_asia", "session_asia"],
+    ["session_london", "session_london"],
+    ["session_new_york", "session_new_york"],
     ["crowd_long_account_pct", "crowd_long_account_pct"],
     ["crowd_short_account_pct", "crowd_short_account_pct"],
     ["crowd_long_short_ratio", "crowd_long_short_ratio"],
@@ -489,6 +508,8 @@
       const coverage = data.coverage || {};
       const collecting = data.collecting_now || {};
       const improve = data.improve_next || [];
+      const upgraded = collecting.upgraded_best_next_additions || [];
+      const missing = data.missing_items_for_later || [];
       output.textContent = [
         "Railway role: temporary data factory",
         `Candles: ${number(counts.candles || 0, 0)} (${number(coverage.candle_days || 0, 2)} days)`,
@@ -500,8 +521,14 @@
         `News providers: ${JSON.stringify(collecting.news || {})}`,
         `Sentiment models: ${JSON.stringify(collecting.sentiment_models || {})}`,
         "",
+        "Upgraded now:",
+        ...upgraded.map((item) => `- ${item}`),
+        "",
         "Improve next:",
         ...improve.map((item) => `- ${item}`),
+        "",
+        "Missing items for later decisions:",
+        ...missing.map((item) => `- [${item.priority || "later"}] ${item.item}: ${item.why_later || ""}`),
       ].join("\n");
     } catch (error) {
       output.textContent = `Collection report failed: ${error.message}`;

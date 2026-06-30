@@ -29,6 +29,39 @@ CONVERTER_MODEL_NAMES = {
     "cryptobert": "pc-news-converter-v1-cryptobert",
     "rule-based": "rule-based-fallback-v1",
 }
+TECHNICAL_FEATURE_COLUMNS = [
+    "rsi_14",
+    "macd_pct",
+    "macd_signal_pct",
+    "macd_histogram_pct",
+    "sma_20_distance_pct",
+    "ema_20_distance_pct",
+    "bollinger_width_pct",
+    "bollinger_position",
+    "atr_14_pct",
+    "vwap_20_distance_pct",
+    "adx_14",
+]
+TIME_CONTEXT_FEATURE_COLUMNS = [
+    "time_hour_utc_sin",
+    "time_hour_utc_cos",
+    "time_day_of_week_sin",
+    "time_day_of_week_cos",
+    "time_is_weekend",
+    "session_asia",
+    "session_london",
+    "session_new_york",
+]
+CANDLE_FEATURE_COLUMNS = [
+    "last_close",
+    "candle_return_1m",
+    "candle_return_5m",
+    "volume_change",
+    "volatility",
+    "trend_score",
+    *TECHNICAL_FEATURE_COLUMNS,
+    *TIME_CONTEXT_FEATURE_COLUMNS,
+]
 _PIPELINES: dict[str, Any] = {}
 
 
@@ -344,29 +377,147 @@ def _rows_from_candles(candles):
     pd, _ = _load_pandas()
     if candles.empty:
         return pd.DataFrame()
-    rows = []
+    frame = _candle_feature_frame(candles)
+    if frame.empty:
+        return frame
+    frame["position"] = frame.groupby("symbol").cumcount()
+    frame = frame[frame["position"] >= 5].drop(columns=["position"])
+    frame["feature_schema_version"] = "local-raw-v2"
+    return frame
+
+
+def _time_context_frame(frame):
+    pd, np = _load_pandas()
+    if frame.empty or "as_of" not in frame:
+        return frame
+    output = frame.copy()
+    timestamps = pd.to_datetime(output["as_of"], utc=True, errors="coerce")
+    hour = timestamps.dt.hour.fillna(0).astype(float) + timestamps.dt.minute.fillna(0).astype(float) / 60.0
+    day = timestamps.dt.dayofweek.fillna(0).astype(float)
+    hour_angle = (hour / 24.0) * (math.pi * 2.0)
+    day_angle = (day / 7.0) * (math.pi * 2.0)
+    output["time_hour_utc_sin"] = np.sin(hour_angle)
+    output["time_hour_utc_cos"] = np.cos(hour_angle)
+    output["time_day_of_week_sin"] = np.sin(day_angle)
+    output["time_day_of_week_cos"] = np.cos(day_angle)
+    output["time_is_weekend"] = (day >= 5).astype(float)
+    output["session_asia"] = ((hour >= 0) & (hour < 8)).astype(float)
+    output["session_london"] = ((hour >= 7) & (hour < 16)).astype(float)
+    output["session_new_york"] = ((hour >= 13) & (hour < 22)).astype(float)
+    return output
+
+
+def _candle_feature_frame(candles):
+    pd, np = _load_pandas()
+    if candles.empty:
+        return pd.DataFrame()
+    frames = []
     for symbol, group in candles.groupby("symbol"):
         group = group.sort_values("as_of").copy()
         close = group["close"].astype(float)
+        high = group["high"].astype(float)
+        low = group["low"].astype(float)
         volume = group["volume"].astype(float)
-        for index, row in group.iterrows():
-            position = group.index.get_loc(index)
-            if position < 5:
-                continue
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "as_of": row["as_of"],
-                    "feature_schema_version": "local-raw-v1",
-                    "last_close": float(row["close"]),
-                    "candle_return_1m": float(close.iloc[position] / close.iloc[position - 1] - 1.0) if close.iloc[position - 1] else 0.0,
-                    "candle_return_5m": float(close.iloc[position] / close.iloc[position - 5] - 1.0) if close.iloc[position - 5] else 0.0,
-                    "volume_change": float(volume.iloc[position] / max(volume.iloc[position - 5], 1e-9) - 1.0),
-                    "volatility": float(close.iloc[max(0, position - 20) : position + 1].pct_change().std() or 0.0),
-                    "trend_score": float(math.tanh((close.iloc[position] / max(close.iloc[max(0, position - 20)], 1e-9) - 1.0) * 50.0)),
-                }
-            )
-    return pd.DataFrame(rows)
+        safe_close = close.replace(0, np.nan)
+        returns = close.pct_change().replace([np.inf, -np.inf], np.nan)
+        ema_12 = close.ewm(span=12, adjust=False).mean()
+        ema_20 = close.ewm(span=20, adjust=False).mean()
+        ema_26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema_12 - ema_26
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
+        sma_20 = close.rolling(20, min_periods=1).mean()
+        bollinger_std = close.rolling(20, min_periods=2).std(ddof=0).fillna(0.0)
+        bollinger_upper = sma_20 + bollinger_std * 2.0
+        bollinger_lower = sma_20 - bollinger_std * 2.0
+        bollinger_range = (bollinger_upper - bollinger_lower).replace(0, np.nan)
+        typical_price = (high + low + close) / 3.0
+        vwap_denominator = volume.rolling(20, min_periods=1).sum().replace(0, np.nan)
+        vwap_20 = (typical_price * volume).rolling(20, min_periods=1).sum() / vwap_denominator
+        previous_close = close.shift(1)
+        true_range = pd.concat(
+            [
+                high - low,
+                (high - previous_close).abs(),
+                (low - previous_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1).fillna(0.0)
+        atr_14 = true_range.rolling(14, min_periods=1).mean()
+        delta = close.diff()
+        average_gain = delta.clip(lower=0).rolling(14, min_periods=1).mean()
+        average_loss = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
+        rs = average_gain / average_loss.replace(0, np.nan)
+        rsi = (1.0 - (1.0 / (1.0 + rs))).fillna(0.5).clip(0.0, 1.0)
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=group.index)
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=group.index)
+        tr_sum = true_range.rolling(14, min_periods=1).sum().replace(0, np.nan)
+        plus_di = 100.0 * plus_dm.rolling(14, min_periods=1).sum() / tr_sum
+        minus_di = 100.0 * minus_dm.rolling(14, min_periods=1).sum() / tr_sum
+        dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+        adx = dx.rolling(14, min_periods=1).mean().clip(0.0, 1.0)
+        output = pd.DataFrame(
+            {
+                "symbol": symbol,
+                "as_of": group["as_of"],
+                "feature_schema_version": "local-raw-v2",
+                "last_close": close,
+                "candle_return_1m": returns.fillna(0.0),
+                "candle_return_5m": close.pct_change(5).replace([np.inf, -np.inf], np.nan).fillna(0.0),
+                "volume_change": volume.pct_change(5).replace([np.inf, -np.inf], np.nan).fillna(0.0),
+                "volatility": returns.rolling(20, min_periods=2).std().fillna(0.0),
+                "trend_score": np.tanh((close / close.shift(20).fillna(close.iloc[0]).replace(0, np.nan) - 1.0).fillna(0.0) * 50.0),
+                "rsi_14": rsi,
+                "macd_pct": (macd / safe_close).fillna(0.0),
+                "macd_signal_pct": (macd_signal / safe_close).fillna(0.0),
+                "macd_histogram_pct": ((macd - macd_signal) / safe_close).fillna(0.0),
+                "sma_20_distance_pct": (close / sma_20.replace(0, np.nan) - 1.0).fillna(0.0),
+                "ema_20_distance_pct": (close / ema_20.replace(0, np.nan) - 1.0).fillna(0.0),
+                "bollinger_width_pct": ((bollinger_upper - bollinger_lower) / sma_20.replace(0, np.nan)).fillna(0.0),
+                "bollinger_position": ((close - bollinger_lower) / bollinger_range).fillna(0.5).clip(0.0, 1.0),
+                "atr_14_pct": (atr_14 / safe_close).fillna(0.0),
+                "vwap_20_distance_pct": (close / vwap_20.replace(0, np.nan) - 1.0).fillna(0.0),
+                "adx_14": adx,
+            }
+        )
+        frames.append(_time_context_frame(output))
+    return pd.concat(frames, ignore_index=True).sort_values(["symbol", "as_of"]) if frames else pd.DataFrame()
+
+
+def _add_candle_features(frame, candles):
+    pd, _ = _load_pandas()
+    if frame.empty:
+        return frame
+    if candles.empty:
+        return _time_context_frame(frame)
+    source = _candle_feature_frame(candles)
+    if source.empty:
+        return _time_context_frame(frame)
+    merged_rows = []
+    for symbol, group in frame.groupby("symbol", sort=False):
+        source_group = source[source["symbol"] == symbol].sort_values("as_of")
+        group = group.sort_values("as_of").copy()
+        if source_group.empty:
+            merged_rows.append(_time_context_frame(group))
+            continue
+        merged = pd.merge_asof(
+            group,
+            source_group[["as_of", *CANDLE_FEATURE_COLUMNS]].sort_values("as_of"),
+            on="as_of",
+            direction="backward",
+            suffixes=("", "_candle"),
+        )
+        for column in CANDLE_FEATURE_COLUMNS:
+            candle_column = f"{column}_candle"
+            if candle_column in merged:
+                if column in group.columns:
+                    merged[column] = merged[column].where(merged[column].notna(), merged[candle_column])
+                else:
+                    merged[column] = merged[candle_column]
+                merged = merged.drop(columns=[candle_column])
+        merged_rows.append(_time_context_frame(merged))
+    return pd.concat(merged_rows, ignore_index=True).sort_values(["symbol", "as_of"]) if merged_rows else _time_context_frame(frame)
 
 
 def _aggregate_news_for_row(news, as_of, symbol: str, lookback_hours: float):
@@ -600,6 +751,7 @@ def _process(root: Path, output_dir: Path, lookback_hours: float, fee_rate: floa
         frame = _rows_from_candles(candles)
     if frame.empty:
         raise SystemExit("No training feature rows or candle rows were found in the raw input.")
+    frame = _add_candle_features(frame, candles)
     frame = _add_news_features(frame, news, lookback_hours)
     frame = _add_external_summary(frame, external, 24.0)
     frame = _add_labels(frame, candles, fee_rate)

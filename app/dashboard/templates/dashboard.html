@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Anata AI Trader</title>
-    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v7">
+    <link rel="stylesheet" href="/static/styles.css?v=trade-terminal-v8">
     <script defer src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     <script>
       window.DASHBOARD_CONFIG = {
@@ -301,9 +301,25 @@
             <div><span>Retention</span><strong id="dbRetentionSummary">-</strong></div>
           </div>
           <p id="dbStorageWarning" class="warning"></p>
+          <div class="panel-tools">
+            <button id="collectionReportButton" class="secondary">Collection Report</button>
+            <button id="finishRawDataButton" class="secondary">Finish Raw Day</button>
+            <button id="exportRawDataButton" class="secondary">Export Raw Data</button>
+            <button id="buildDailyBundlesButton" class="secondary">Build Bundles</button>
+            <button id="cleanupFinishedBundlesButton" class="secondary">Cleanup Finished</button>
+            <button id="compactDbButton" class="secondary">Compact DB</button>
+            <button id="compactArchiveDbButton" class="secondary">Archive + Compact</button>
+            <button id="pipelineGuideButton" class="secondary">Pipeline Command</button>
+            <output id="dbStorageActionResult"></output>
+          </div>
+          <pre id="collectionReportBox" class="log-box"></pre>
           <table>
             <thead><tr><th>Table</th><th>Rows</th><th>MB</th><th>Raw/JSON MB</th><th>Oldest</th><th>Newest</th></tr></thead>
             <tbody id="dbStorageBody"><tr><td colspan="6" class="empty">Loading storage diagnostics</td></tr></tbody>
+          </table>
+          <table>
+            <thead><tr><th>Bundle</th><th>Day</th><th>Status</th><th>Rows</th><th>Size</th><th>Action</th></tr></thead>
+            <tbody id="dailyBundlesBody"><tr><td colspan="6" class="empty">Loading daily bundles</td></tr></tbody>
           </table>
         </section>
 
@@ -320,6 +336,6 @@
       </section>
     </main>
 
-    <script src="/static/dashboard.js?v=trade-terminal-v18"></script>
+    <script src="/static/dashboard.js?v=trade-terminal-v19"></script>
   </body>
 </html>
