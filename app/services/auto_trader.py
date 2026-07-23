@@ -16,6 +16,7 @@ from app.config import settings
 from app.db.models import AiDecision, Candle, Feature, LiveCandleUpdate, ModelVersion, PaperTrade, Position
 from app.db.session import SessionLocal
 from app.features.feature_builder import FeatureBuilder
+from app.pipeline.service import V2PipelineService
 from app.trading.paper_engine import ExecutionResult, PaperEngine
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ class AutoTraderService:
                 "min_leverage": settings.paper_min_leverage,
                 "max_leverage": settings.paper_max_leverage,
                 "max_margin_allocation_pct": settings.risk_max_trade_size_pct,
-                "model_mode": "Trained AI sends its own trade plan; bot position filters are not applied to model decisions.",
+                "model_mode": "V2 models emit forecasts only; ensemble, portfolio and independent risk select paper exposure.",
                 "close_filter": (
                     "Bot/exploration BUY/SELL/CLOSE opposite-position closes are fee-aware and min-hold protected; "
                     "paper data collection exploration bypasses those bot filters in paper mode only."
@@ -191,13 +192,16 @@ class AutoTraderService:
 
         cycle_decisions: list[dict[str, Any]] = []
         with SessionLocal() as session:
-            engine = PaperEngine(session)
+            engine = PaperEngine(session, paper_account_id=settings.v2_champion_account_id)
             reset_info = engine.reset_paper_account_if_needed()
             if reset_info:
                 self.state.last_paper_data_collection_reset = reset_info
             for symbol in self.symbols:
                 try:
-                    cycle_decisions.append(self._run_symbol(session, symbol.upper()))
+                    if settings.anata_v2_enabled:
+                        cycle_decisions.append(self._run_symbol_v2(session, symbol.upper()))
+                    else:
+                        cycle_decisions.append(self._run_symbol(session, symbol.upper()))
                 except Exception as exc:
                     logger.exception("Auto trader symbol cycle failed for %s", symbol)
                     cycle_decisions.append({"symbol": symbol.upper(), "status": "ERROR", "message": str(exc)})
@@ -221,6 +225,31 @@ class AutoTraderService:
                 self.state.skipped_trades += 1
                 self.state.last_skip_reason = item.get("message") or item.get("reason")
         return self.status()
+
+    def _run_symbol_v2(self, session, symbol: str) -> dict[str, Any]:
+        """Run the mandatory V2 stage pipeline; no model trade plan is forwarded."""
+        result = V2PipelineService(session).run_symbol(symbol, account_id=settings.v2_champion_account_id)
+        decision_source = "v2-pipeline"
+        return {
+            "decision_id": getattr(result, "legacy_decision_id", None),
+            "decision_trace_id": result.decision_trace_id,
+            "symbol": result.symbol,
+            "feature_id": result.feature_id,
+            "action": result.action,
+            "confidence": None,
+            "reason": result.message,
+            "decision_source": decision_source,
+            "strategy_action": None,
+            "model_action": None,
+            "model_version_id": None,
+            "model_fallback_reason": "V2 narrow baseline is active; legacy uploaded plan sizing is not executable.",
+            "trade_plan": None,
+            "status": result.status,
+            "message": result.message,
+            "trade_id": result.trade_id,
+            "requested_exposure": result.requested_exposure,
+            "approved_exposure": result.approved_exposure,
+        }
 
     def _run_symbol(self, session, symbol: str) -> dict[str, Any]:
         feature = FeatureBuilder(session).build_for_symbol(

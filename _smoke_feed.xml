@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Smoke Crypto Feed</title>
+    <item>
+      <title>Bitcoin and Ethereum liquidity improves</title>
+      <link>https://example.com/smoke-bitcoin-ethereum</link>
+      <pubDate>Wed, 24 Jun 2026 04:00:00 GMT</pubDate>
+      <description>BTC, ETH, Solana, BNB, and XRP traders watch inflation and risk.</description>
+    </item>
+  </channel>
+</rss>

@@ -24,9 +24,11 @@ from app.db.models import (
     Feature,
     LiveCandleUpdate,
     MarketTick,
+    ModelPredictionRecord,
     NewsArticle,
     NewsSentiment,
     PaperTrade,
+    StructuredNewsEvent,
     TrainingFeature,
 )
 from app.db.session import SessionLocal
@@ -222,8 +224,24 @@ def compact_database(
         session.execute(delete(Candle).where(Candle.is_closed.is_(True), Candle.open_time < closed_candle_cutoff))
     )
     old_news_article_ids = select(NewsArticle.id).where(NewsArticle.created_at < raw_news_cutoff)
+    # Preserve the structured event ledger while allowing raw news retention to
+    # proceed. The event retains its own source/availability metadata after the
+    # optional legacy article foreign key is detached.
+    detached_old_structured_news_articles = _rowcount(
+        session.execute(
+            update(StructuredNewsEvent)
+            .where(StructuredNewsEvent.article_id.in_(old_news_article_ids))
+            .values(article_id=None)
+        )
+    )
     deleted_old_news_sentiment = _rowcount(session.execute(delete(NewsSentiment).where(NewsSentiment.article_id.in_(old_news_article_ids))))
-    deleted_old_news_articles = _rowcount(session.execute(delete(NewsArticle).where(NewsArticle.created_at < raw_news_cutoff)))
+    deleted_old_news_articles = _rowcount(
+        session.execute(
+            delete(NewsArticle)
+            .where(NewsArticle.created_at < raw_news_cutoff)
+            .execution_options(synchronize_session=False)
+        )
+    )
     deleted_old_training_features = _rowcount(
         session.execute(delete(TrainingFeature).where(TrainingFeature.as_of < training_feature_cutoff))
     )
@@ -258,6 +276,7 @@ def compact_database(
             update(NewsArticle)
             .where(NewsArticle.created_at < raw_payload_cutoff)
             .values(raw=None, raw_payload=None)
+            .execution_options(synchronize_session=False)
         )
     )
     compacted_news_text = _rowcount(
@@ -268,6 +287,7 @@ def compact_database(
                 NewsArticle.id.in_(select(NewsSentiment.article_id)),
             )
             .values(raw_text=None)
+            .execution_options(synchronize_session=False)
         )
     )
     compacted_news_sentiment = _rowcount(
@@ -322,12 +342,20 @@ def compact_database(
                 .values(source_feature_id=None)
             )
         )
+        detached_old_prediction_features = _rowcount(
+            session.execute(
+                update(ModelPredictionRecord)
+                .where(ModelPredictionRecord.feature_id.in_(old_feature_ids))
+                .values(feature_id=None)
+            )
+        )
     else:
         detached_old_experience_decisions = 0
         detached_old_decision_features = 0
         detached_old_decision_trades = 0
         detached_old_experience_features = 0
         detached_old_training_feature_sources = 0
+        detached_old_prediction_features = 0
     compacted_old_ai_decisions = _rowcount(
         session.execute(
             update(AiDecision)
@@ -443,6 +471,8 @@ def compact_database(
             "ai_decision_trade_links_detached": detached_old_decision_trades,
             "experience_feature_links_detached": detached_old_experience_features,
             "training_feature_source_links_detached": detached_old_training_feature_sources,
+            "model_prediction_feature_links_detached": detached_old_prediction_features,
+            "structured_news_article_links_detached": detached_old_structured_news_articles,
         },
     }
 

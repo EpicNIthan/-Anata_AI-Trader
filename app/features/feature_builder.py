@@ -5,11 +5,11 @@ from datetime import datetime, timedelta, timezone
 from statistics import mean, pstdev
 from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db.models import Candle, ExternalDataEvent, Feature, NewsArticle, NewsSentiment, TrainingFeature
+from app.db.models import Candle, ExternalDataEvent, Feature, NewsArticle, NewsSentiment, StructuredNewsEvent, TrainingFeature
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, feature_payload
 
 
@@ -262,6 +262,7 @@ class FeatureBuilder:
         news_features = self._recent_news_features(normalized_symbol, now=now)
         derivatives_features = self._recent_derivatives_features(normalized_symbol, now=now)
         external_features = self._recent_external_context_features(normalized_symbol, now=now)
+        external_ai_features = self._recent_external_ai_features(normalized_symbol, now=now)
         technical_features = _technical_indicator_features(candles)
         time_features = _time_context_features((candles[-1].close_time or candles[-1].open_time) if candles else now)
         sentiment_score = news_features["sentiment_score"]
@@ -355,6 +356,17 @@ class FeatureBuilder:
             "etf_bullish_score": external_features["etf_bullish_score"],
             "world_risk_score": external_features["world_risk_score"],
             "market_regime_score": external_features["market_regime_score"],
+            # Optional overlay values are explicit missingness flags, never a neutral
+            # sentiment substitute. Only events available before this feature build
+            # can be used, and the ensemble bounds their eventual contribution.
+            "external_ai_available": external_ai_features["external_ai_available"],
+            "external_ai_missing": external_ai_features["external_ai_missing"],
+            "external_ai_failed": external_ai_features["external_ai_failed"],
+            "external_ai_confidence": external_ai_features["external_ai_confidence"],
+            "external_ai_age_seconds": external_ai_features["external_ai_age_seconds"],
+            "external_ai_provider": external_ai_features["external_ai_provider"],
+            "external_ai_prompt_version": external_ai_features["external_ai_prompt_version"],
+            "external_ai_direction_score": external_ai_features["external_ai_direction_score"],
         }
         inspector_vector = {
             key: values[key]
@@ -499,6 +511,7 @@ class FeatureBuilder:
                 "news_context": news_features["news_context"],
                 "derivatives_context": derivatives_features["derivatives_context"],
                 "external_context": external_features["external_context"],
+                "external_ai_context": external_ai_features["external_ai_context"],
                 "source_freshness": external_features["source_freshness"],
                 "stale_sources": external_features["stale_sources"],
                 "training_quality_candles": training_quality_candles,
@@ -510,6 +523,7 @@ class FeatureBuilder:
                 "news_sentiment": "news_sentiment",
                 "derivatives": "external_data_events",
                 "market_context": "external_data_events",
+                "structured_news_events": "structured_news_events",
             },
         )
         feature = Feature(
@@ -517,6 +531,10 @@ class FeatureBuilder:
             schema_version=CURRENT_FEATURE_SCHEMA_VERSION,
             source_name="feature_builder",
             as_of=now,
+            event_time=(candles[-1].close_time or candles[-1].open_time) if candles else now,
+            received_time=now,
+            processed_time=now,
+            available_to_model_time=now,
             price_change=price_change,
             volume_change=volume_change,
             volatility=volatility,
@@ -556,6 +574,111 @@ class FeatureBuilder:
             self.session.refresh(feature)
         return feature
 
+    def _recent_external_ai_features(self, symbol: str, now: datetime) -> dict[str, Any]:
+        """Return external-news context that was available to the model by ``now``.
+
+        Publication time is not sufficient for point-in-time use because enrichment
+        finishes later. Local-only structured events remain audit context, but they do
+        not set ``external_ai_available`` or contribute an external direction score.
+        """
+        now = _aware(now) or datetime.now(timezone.utc)
+        since = now - timedelta(hours=48)
+        rows = list(
+            self.session.scalars(
+                select(StructuredNewsEvent)
+                .where(
+                    StructuredNewsEvent.available_to_model_time.is_not(None),
+                    StructuredNewsEvent.available_to_model_time >= since,
+                    StructuredNewsEvent.available_to_model_time <= now,
+                    or_(
+                        StructuredNewsEvent.validation_status == "VALID",
+                        StructuredNewsEvent.validation_status == "valid",
+                        StructuredNewsEvent.validation_status.is_(None),
+                    ),
+                )
+                .order_by(desc(StructuredNewsEvent.available_to_model_time))
+                .limit(200)
+            )
+        )
+
+        normalized_symbol = symbol.upper()
+        base_asset = normalized_symbol
+        for suffix in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH"):
+            if normalized_symbol.endswith(suffix) and len(normalized_symbol) > len(suffix):
+                base_asset = normalized_symbol[: -len(suffix)]
+                break
+        symbol_aliases = {normalized_symbol, base_asset}
+
+        def relevant(row: StructuredNewsEvent) -> bool:
+            primary = (row.primary_symbol or "").upper()
+            affected = {str(value).upper() for value in (row.affected_assets or []) if value}
+            # An event without asset scope is market-wide. Scoped events must match
+            # this instrument or its base asset.
+            return (not primary and not affected) or primary in symbol_aliases or bool(affected & symbol_aliases)
+
+        relevant_rows = [row for row in rows if relevant(row)]
+        external_rows = [row for row in relevant_rows if bool((row.payload or {}).get("external_ai_available"))]
+        latest_context = relevant_rows[0] if relevant_rows else None
+        latest_external = external_rows[0] if external_rows else None
+
+        def direction_score(row: StructuredNewsEvent) -> float:
+            sign = {
+                "bullish": 1.0,
+                "bearish": -1.0,
+                "positive": 1.0,
+                "negative": -1.0,
+            }.get((row.direction or "").lower(), 0.0)
+            magnitude = max(abs(_float(row.sentiment)), _float(row.importance), _float(row.severity))
+            return sign * _clamp(magnitude, 0.0, 1.0)
+
+        weighted_score = 0.0
+        weighted_confidence = 0.0
+        total_weight = 0.0
+        for row in external_rows[:20]:
+            recency = _recency_weight(_aware(row.available_to_model_time), now, horizon_hours=48.0)
+            confidence = _clamp(_float(row.confidence), 0.0, 1.0)
+            weight = max(recency, 0.01) * max(confidence, 0.05)
+            weighted_score += direction_score(row) * weight
+            weighted_confidence += confidence * weight
+            total_weight += weight
+
+        selected = latest_external or latest_context
+        selected_time = _aware(selected.available_to_model_time) if selected else None
+        age_seconds = max((now - selected_time).total_seconds(), 0.0) if selected_time else None
+        external_available = bool(external_rows)
+        external_failed = bool(
+            not external_available
+            and any(bool((row.payload or {}).get("external_ai_failed")) for row in relevant_rows[:20])
+        )
+        return {
+            "external_ai_available": external_available,
+            "external_ai_missing": not external_available,
+            "external_ai_failed": external_failed,
+            "external_ai_confidence": (weighted_confidence / total_weight) if total_weight else 0.0,
+            "external_ai_age_seconds": age_seconds,
+            "external_ai_provider": latest_external.provider if latest_external else None,
+            "external_ai_prompt_version": latest_external.prompt_version if latest_external else None,
+            "external_ai_direction_score": _clamp(weighted_score / total_weight, -1.0, 1.0) if total_weight else 0.0,
+            "external_ai_context": [
+                {
+                    "id": row.id,
+                    "primary_symbol": row.primary_symbol,
+                    "event_type": row.event_type,
+                    "affected_assets": row.affected_assets or [],
+                    "direction": row.direction,
+                    "importance": row.importance,
+                    "confidence": row.confidence,
+                    "provider": row.provider,
+                    "prompt_version": row.prompt_version,
+                    "available_to_model_time": row.available_to_model_time.isoformat()
+                    if row.available_to_model_time
+                    else None,
+                    "external_ai_available": bool((row.payload or {}).get("external_ai_available")),
+                }
+                for row in relevant_rows[:20]
+            ],
+        }
+
     def _recent_derivatives_features(self, symbol: str, now: datetime) -> dict[str, Any]:
         since = now - timedelta(hours=24)
         rows = list(
@@ -565,6 +688,7 @@ class FeatureBuilder:
                     ExternalDataEvent.symbol == symbol,
                     ExternalDataEvent.source_name.like("binance_futures_%"),
                     ExternalDataEvent.event_time >= since,
+                    ExternalDataEvent.event_time <= now,
                 )
                 .order_by(desc(ExternalDataEvent.event_time))
                 .limit(100)
@@ -652,6 +776,7 @@ class FeatureBuilder:
                 select(ExternalDataEvent)
                 .where(
                     ExternalDataEvent.event_time >= since,
+                    ExternalDataEvent.event_time <= now,
                     ExternalDataEvent.source_name.in_(
                         [
                             "alternative_me_fear_greed",
@@ -851,15 +976,21 @@ class FeatureBuilder:
     def _recent_news_features(self, symbol: str, now: datetime) -> dict[str, Any]:
         now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
         since = now - timedelta(hours=48)
+        available_at = func.coalesce(
+            NewsArticle.available_to_model_time,
+            NewsArticle.received_time,
+            NewsArticle.published_at,
+            NewsArticle.created_at,
+        )
         rows = list(
             self.session.execute(
                 select(NewsSentiment, NewsArticle)
                 .join(NewsArticle, NewsArticle.id == NewsSentiment.article_id)
                 .where(
-                    NewsArticle.published_at >= since,
-                    NewsArticle.published_at <= now,
+                    available_at >= since,
+                    available_at <= now,
                 )
-                .order_by(desc(NewsArticle.published_at))
+                .order_by(desc(available_at))
                 .limit(200)
             )
         )
@@ -880,7 +1011,19 @@ class FeatureBuilder:
             eth_related = max(eth_related, 1.0 if article_eth_related else 0.0)
             macro_related = max(macro_related, 1.0 if article_macro_related else 0.0)
             if not affected_symbols or symbol in affected_symbols or article_macro_related:
-                relevant.append((sentiment, article, _recency_weight(article.published_at or sentiment.created_at, now)))
+                relevant.append(
+                    (
+                        sentiment,
+                        article,
+                        _recency_weight(
+                            article.available_to_model_time
+                            or article.received_time
+                            or article.published_at
+                            or sentiment.created_at,
+                            now,
+                        ),
+                    )
+                )
         if not relevant:
             return {
                 "sentiment_score": 0.0,
@@ -920,6 +1063,9 @@ class FeatureBuilder:
                     "source": article.source,
                     "provider": article.source_name,
                     "published_at": article.published_at.isoformat() if article.published_at else None,
+                    "available_to_model_time": article.available_to_model_time.isoformat()
+                    if article.available_to_model_time
+                    else None,
                     "sentiment_score": sentiment.sentiment_score,
                     "sentiment_confidence": sentiment.confidence,
                     "risk_score": sentiment.risk_score,

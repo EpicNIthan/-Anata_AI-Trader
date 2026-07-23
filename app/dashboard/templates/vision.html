@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Anata AI Vision</title>
+    <link rel="stylesheet" href="/static/vision.css?v=anata-v2">
+    <script defer src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+      window.VISION_CONFIG = {
+        symbols: {{ dashboard_symbols | tojson }},
+        defaultSymbol: {{ default_symbol | tojson }},
+        apiBase: "/api/vision",
+        refreshSeconds: {{ vision_refresh_seconds | tojson }},
+        defaultLimit: {{ vision_default_limit | tojson }}
+      };
+    </script>
+  </head>
+  <body class="vision-page">
+    <header class="vision-topbar">
+      <div class="vision-brand">
+        <div>
+          <p class="eyebrow">ANATA / PAPER RESEARCH</p>
+          <h1>AI Vision</h1>
+        </div>
+        <span class="paper-badge">Paper only</span>
+      </div>
+      <div class="vision-actions">
+        <label>
+          <span>Symbol</span>
+          <select id="visionSymbol" aria-label="Symbol">
+            {% for symbol in dashboard_symbols %}
+            <option value="{{ symbol }}" {% if symbol == default_symbol %}selected{% endif %}>{{ symbol }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          <span>Window</span>
+          <select id="visionRange" aria-label="Time range">
+            <option value="6h">6 hours</option>
+            <option value="24h" selected>24 hours</option>
+            <option value="7d">7 days</option>
+            <option value="all">Stored history</option>
+          </select>
+        </label>
+        <button id="visionRefresh" type="button">Refresh</button>
+        <a class="dashboard-link" href="/dashboard">Admin dashboard</a>
+      </div>
+    </header>
+
+    <main class="vision-main">
+      <section class="vision-notice" id="visionNotice" role="status">
+        Loading recorded evidence…
+      </section>
+
+      <section class="state-grid" aria-label="Current AI state">
+        <article><span>Current symbol</span><strong id="stateSymbol">-</strong></article>
+        <article><span>Champion</span><strong id="stateChampion">-</strong></article>
+        <article><span>Regime</span><strong id="stateRegime">-</strong></article>
+        <article><span>Combined expected return</span><strong id="stateExpectedReturn">-</strong></article>
+        <article><span>Confidence / uncertainty</span><strong id="stateConfidence">-</strong></article>
+        <article><span>Expected transaction cost</span><strong id="stateCost">-</strong></article>
+        <article><span>Requested / approved exposure</span><strong id="stateExposure">-</strong></article>
+        <article><span>Open paper position</span><strong id="statePosition">-</strong></article>
+        <article><span>Unrealized PnL</span><strong id="statePnl">-</strong></article>
+        <article><span>External AI</span><strong id="stateExternal">-</strong></article>
+      </section>
+
+      <section class="vision-grid">
+        <article class="vision-card chart-card">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">RECORDED MARKET + DECISION OVERLAYS</p>
+              <h2 id="chartTitle">Market chart</h2>
+            </div>
+            <div class="chart-meta">
+              <span id="chartSource">-</span>
+              <span id="chartFreshness">-</span>
+            </div>
+          </div>
+          <div class="chart-wrap" id="chartWrap">
+            <div id="regimeBackdrop" aria-hidden="true"></div>
+            <div id="visionChart" aria-label="Stored candle chart"></div>
+          </div>
+          <div class="chart-legend">
+            <span><i class="legend-dot entry"></i>Paper entry / exit</span>
+            <span><i class="legend-dot forecast"></i>Recorded forecast</span>
+            <span><i class="legend-dot news"></i>News event</span>
+            <span><i class="legend-dot liquidation"></i>Liquidation event</span>
+            <span><i class="legend-dot conflict"></i>Model disagreement</span>
+          </div>
+          <p class="chart-note" id="chartNote">No explanation is generated beyond recorded evidence.</p>
+        </article>
+
+        <aside class="vision-card decision-card">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">CURRENT DECISION</p>
+              <h2>Recorded evidence</h2>
+            </div>
+            <span id="decisionSource" class="source-pill">-</span>
+          </div>
+          <dl class="decision-facts">
+            <div><dt>Feature snapshot</dt><dd id="factFeature">-</dd></div>
+            <div><dt>Portfolio target</dt><dd id="factTarget">-</dd></div>
+            <div><dt>Risk result</dt><dd id="factRisk">-</dd></div>
+            <div><dt>Local news model</dt><dd id="factNewsModel">-</dd></div>
+            <div><dt>Data freshness</dt><dd id="factFreshness">-</dd></div>
+          </dl>
+          <h3>Reason codes</h3>
+          <ul id="reasonCodes" class="reason-list">
+            <li>Loading recorded reason codes…</li>
+          </ul>
+          <p class="muted" id="decisionNote"></p>
+        </aside>
+      </section>
+
+      <section class="vision-card">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">NARROW-MODEL PANEL</p>
+            <h2>Supporting and conflicting models</h2>
+          </div>
+          <span class="muted" id="modelsStatus">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Family</th>
+                <th>View</th>
+                <th>Expected return</th>
+                <th>Confidence</th>
+                <th>Uncertainty</th>
+                <th>Weight</th>
+                <th>Health</th>
+                <th>Lifecycle</th>
+                <th>Last prediction</th>
+              </tr>
+            </thead>
+            <tbody id="modelsBody"><tr><td colspan="10" class="empty">Loading model evidence…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="lower-grid">
+        <article class="vision-card">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">PAPER TRADE HISTORY</p>
+              <h2>Stored outcomes</h2>
+            </div>
+            <span class="muted" id="historyStatus">-</span>
+          </div>
+          <div class="metric-grid history-metrics">
+            <div><span>Trades</span><strong id="metricTrades">-</strong></div>
+            <div><span>Wins / losses</span><strong id="metricWins">-</strong></div>
+            <div><span>Win rate</span><strong id="metricWinRate">-</strong></div>
+            <div><span>Net PnL</span><strong id="metricPnl">-</strong></div>
+            <div><span>Profit factor</span><strong id="metricProfitFactor">-</strong></div>
+            <div><span>Fees</span><strong id="metricFees">-</strong></div>
+            <div><span>Max drawdown</span><strong id="metricDrawdown">-</strong></div>
+            <div><span>Slippage / funding</span><strong id="metricCosts">Not recorded</strong></div>
+          </div>
+          <p class="muted" id="historyNote"></p>
+        </article>
+
+        <article class="vision-card">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">DECISION REPLAY</p>
+              <h2>Recorded timeline</h2>
+            </div>
+            <span class="muted">Select a decision</span>
+          </div>
+          <div class="replay-layout">
+            <ol id="decisionList" class="decision-list"><li>Loading decisions…</li></ol>
+            <ol id="replayTimeline" class="timeline"><li>Select a recorded decision to inspect its timeline.</li></ol>
+          </div>
+        </article>
+      </section>
+
+      <section class="vision-card research-card">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">RESEARCH / CONTROLLED PROMOTION</p>
+            <h2>Registry and health snapshot</h2>
+          </div>
+          <span class="muted" id="researchStatus">-</span>
+        </div>
+        <div class="research-grid">
+          <div><h3>Champion assignments</h3><ul id="researchChampions" class="compact-list"></ul></div>
+          <div><h3>Candidate strategies</h3><ul id="researchCandidates" class="compact-list"></ul></div>
+          <div><h3>Model health</h3><ul id="researchModelHealth" class="compact-list"></ul></div>
+          <div><h3>Signal health</h3><ul id="researchSignalHealth" class="compact-list"></ul></div>
+          <div><h3>Promotion decisions</h3><ul id="researchPromotions" class="compact-list"></ul></div>
+          <div><h3>Sandbox accounts</h3><ul id="researchSandboxes" class="compact-list"></ul></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/vision.js?v=anata-v2"></script>
+  </body>
+</html>

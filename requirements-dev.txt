@@ -1,0 +1,2 @@
+# Test-only tools. Keep these out of the Railway runtime image.
+pytest>=8,<9

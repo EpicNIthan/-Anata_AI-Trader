@@ -209,6 +209,19 @@ def _symbol_values(session: Session, start: datetime | None, end: datetime | Non
 
 def _select_tables(options: dict[str, Any] | None = None) -> list[RawTableSpec]:
     options = options or {}
+    requested_tables = options.get("tables") or options.get("include_tables")
+    if requested_tables:
+        if isinstance(requested_tables, str):
+            table_names = [item.strip() for item in requested_tables.split(",") if item.strip()]
+        elif isinstance(requested_tables, list):
+            table_names = [str(item).strip() for item in requested_tables if str(item).strip()]
+        else:
+            raise ValueError("tables must be a comma-separated string or list.")
+        unknown = [name for name in table_names if name not in RAW_TABLES_BY_NAME]
+        if unknown:
+            raise ValueError(f"Unknown raw export table(s): {', '.join(unknown)}")
+        return [RAW_TABLES_BY_NAME[name] for name in table_names]
+
     if options.get("news_only"):
         return [RAW_TABLES_BY_NAME["news_articles"], RAW_TABLES_BY_NAME["news_sentiment"]]
 

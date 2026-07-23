@@ -539,6 +539,7 @@ class NewsCollector:
         stored = 0
         with SessionLocal() as session:
             for item in articles:
+                received_at = datetime.now(timezone.utc)
                 existing = session.scalar(
                     select(NewsArticle).where(
                         or_(
@@ -559,6 +560,8 @@ class NewsCollector:
                     title=item.title,
                     url=item.url,
                     published_at=item.published_at,
+                    event_time=item.published_at,
+                    received_time=received_at,
                     raw_text=item.raw_text,
                     raw={**item.raw_payload, "provider": item.provider},
                     raw_payload={**item.raw_payload, "provider": item.provider},
@@ -567,6 +570,11 @@ class NewsCollector:
                 session.flush()
 
                 sentiment = analyze_news(item.raw_text)
+                processed_at = datetime.now(timezone.utc)
+                # The row becomes usable only after deterministic sentiment processing
+                # has completed. Publication time must never stand in for availability.
+                article.processed_time = processed_at
+                article.available_to_model_time = processed_at
                 merged_symbols = sorted(set(sentiment.affected_symbols) | set(item.affected_symbols))
                 session.add(
                     NewsSentiment(

@@ -4,6 +4,7 @@ import argparse
 import gzip
 import json
 import math
+import shutil
 import tempfile
 import zipfile
 from datetime import datetime, timezone
@@ -63,6 +64,13 @@ CANDLE_FEATURE_COLUMNS = [
     *TIME_CONTEXT_FEATURE_COLUMNS,
 ]
 _PIPELINES: dict[str, Any] = {}
+RAW_FILES_USED = {
+    "candles.csv.gz",
+    "news_articles.jsonl.gz",
+    "external_data_events.jsonl.gz",
+    "experience_buffer.jsonl.gz",
+    "training_features.jsonl.gz",
+}
 
 
 def _load_pandas():
@@ -83,8 +91,7 @@ def _parse_json(value: Any) -> Any:
     return value
 
 
-def _read_jsonl_gz(root: Path, filename: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def _iter_jsonl_gz(root: Path, filename: str):
     for path in root.rglob(filename):
         with gzip.open(path, "rt", encoding="utf-8") as handle:
             for line in handle:
@@ -92,8 +99,24 @@ def _read_jsonl_gz(root: Path, filename: str) -> list[dict[str, Any]]:
                     continue
                 parsed = json.loads(line)
                 if isinstance(parsed, dict):
-                    rows.append(parsed)
+                    yield parsed
+
+
+def _read_jsonl_gz(root: Path, filename: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for parsed in _iter_jsonl_gz(root, filename):
+        rows.append(parsed)
     return rows
+
+
+def _experience_summary(root: Path) -> dict[str, Any]:
+    count = 0
+    action_balance: dict[str, int] = {}
+    for row in _iter_jsonl_gz(root, "experience_buffer.jsonl.gz"):
+        count += 1
+        action = str(row.get("action") or "UNKNOWN")
+        action_balance[action] = action_balance.get(action, 0) + 1
+    return {"count": count, "action_balance": action_balance}
 
 
 def _read_csv_gz(root: Path, filename: str):
@@ -109,7 +132,7 @@ def _extract_raw_zips(input_path: Path, temp_root: Path) -> Path:
         target = temp_root / input_path.stem
         target.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(input_path) as archive:
-            archive.extractall(target)
+            _extract_needed_raw_files(archive, target)
         return temp_root
 
     zip_paths = sorted(path for path in input_path.rglob("*.zip") if path.is_file()) if input_path.is_dir() else []
@@ -121,8 +144,14 @@ def _extract_raw_zips(input_path: Path, temp_root: Path) -> Path:
         target = temp_root / relative
         target.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path) as archive:
-            archive.extractall(target)
+            _extract_needed_raw_files(archive, target)
     return temp_root
+
+
+def _extract_needed_raw_files(archive: zipfile.ZipFile, target: Path) -> None:
+    for member in archive.infolist():
+        if Path(member.filename).name in RAW_FILES_USED:
+            archive.extract(member, target)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -132,6 +161,12 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _datetime_ns(values) -> Any:
+    pd, _ = _load_pandas()
+    timestamps = pd.Series(pd.to_datetime(values, utc=True, errors="coerce"))
+    return timestamps.dt.tz_convert("UTC").dt.tz_localize(None).astype("datetime64[ns]").astype("int64").to_numpy()
 
 
 def _keyword_any(text: str, words: list[str]) -> bool:
@@ -520,9 +555,8 @@ def _add_candle_features(frame, candles):
     return pd.concat(merged_rows, ignore_index=True).sort_values(["symbol", "as_of"]) if merged_rows else _time_context_frame(frame)
 
 
-def _aggregate_news_for_row(news, as_of, symbol: str, lookback_hours: float):
-    pd, np = _load_pandas()
-    zero = {
+def _zero_news_features() -> dict[str, float]:
+    return {
         "sentiment_score": 0.0,
         "sentiment_confidence": 0.0,
         "risk_score": 0.0,
@@ -539,10 +573,10 @@ def _aggregate_news_for_row(news, as_of, symbol: str, lookback_hours: float):
         "recency_weight": 0.0,
         "article_count_used": 0.0,
     }
-    if news.empty:
-        return zero
-    start = as_of - pd.Timedelta(hours=lookback_hours)
-    window = news[(news["event_time"] <= as_of) & (news["event_time"] >= start)].copy()
+
+
+def _aggregate_news_window(window, as_of, symbol: str, lookback_hours: float, np) -> dict[str, float]:
+    zero = _zero_news_features()
     if window.empty:
         return zero
     symbol_key = symbol.upper().replace("USDT", "").lower()
@@ -569,13 +603,51 @@ def _aggregate_news_for_row(news, as_of, symbol: str, lookback_hours: float):
 
 
 def _add_news_features(frame, news, lookback_hours: float):
+    pd, np = _load_pandas()
     if frame.empty:
         return frame
-    features = [
-        _aggregate_news_for_row(news, row.as_of, str(row.symbol), lookback_hours)
-        for row in frame[["as_of", "symbol"]].itertuples(index=False)
-    ]
-    news_features = _load_pandas()[0].DataFrame(features)
+    if news.empty:
+        features = [_zero_news_features() for _ in range(len(frame))]
+    else:
+        news = news.sort_values("event_time").reset_index(drop=True)
+        event_ns = _datetime_ns(news["event_time"])
+        lookback_ns = int(pd.Timedelta(hours=lookback_hours).value)
+        value_columns = [column for column in _zero_news_features() if column not in {"recency_weight", "article_count_used"}]
+        value_arrays = {
+            column: pd.to_numeric(news[column], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            for column in value_columns
+            if column in news.columns
+        }
+        related_arrays = {
+            column: pd.to_numeric(news[column], errors="coerce").fillna(0.0).to_numpy(dtype=float) > 0
+            for column in news.columns
+            if column.endswith("_related")
+        }
+        macro_related = related_arrays.get("macro_related", np.zeros(len(news), dtype=bool))
+        features = []
+        for row in frame[["as_of", "symbol"]].itertuples(index=False):
+            as_of_ns = row.as_of.value
+            start_index = int(np.searchsorted(event_ns, as_of_ns - lookback_ns, side="left"))
+            end_index = int(np.searchsorted(event_ns, as_of_ns, side="right"))
+            output = _zero_news_features()
+            if end_index > start_index:
+                indices = np.arange(start_index, end_index)
+                symbol_key = str(row.symbol).upper().replace("USDT", "").lower()
+                related = related_arrays.get(f"{symbol_key}_related")
+                if related is not None:
+                    filtered = indices[related[indices] | macro_related[indices]]
+                    if len(filtered):
+                        indices = filtered
+                age_hours = np.maximum((as_of_ns - event_ns[indices]) / 3_600_000_000_000.0, 0.0)
+                weights = np.exp(-age_hours / max(lookback_hours / 2.0, 1.0))
+                weight_sum = float(weights.sum()) or 1.0
+                for column in value_columns:
+                    values = value_arrays.get(column)
+                    output[column] = float((values[indices] * weights).sum() / weight_sum) if values is not None else 0.0
+                output["recency_weight"] = float(weights.max()) if len(weights) else 0.0
+                output["article_count_used"] = float(len(indices))
+            features.append(output)
+    news_features = pd.DataFrame(features)
     frame = frame.reset_index(drop=True).copy()
     news_features = news_features.reset_index(drop=True)
     for column in news_features.columns:
@@ -595,24 +667,59 @@ def _external_frame(root: Path):
 
 
 def _add_external_summary(frame, external, lookback_hours: float):
-    pd, _ = _load_pandas()
+    pd, np = _load_pandas()
     if frame.empty:
         return frame
     if external.empty:
         frame["external_event_count_24h"] = 0.0
         frame["external_numeric_mean_24h"] = 0.0
         return frame
+    external = external.sort_values("event_time").reset_index(drop=True)
+    lookback_ns = int(pd.Timedelta(hours=lookback_hours).value)
+
+    def build_arrays(rows):
+        event_ns = _datetime_ns(rows["event_time"])
+        numeric_values = pd.to_numeric(rows.get("numeric_value"), errors="coerce").to_numpy(dtype=float)
+        valid_numeric = (~np.isnan(numeric_values)).astype(float)
+        return (
+            event_ns,
+            np.concatenate([[0.0], np.nan_to_num(numeric_values, nan=0.0).cumsum()]),
+            np.concatenate([[0.0], valid_numeric.cumsum()]),
+        )
+
+    def summarize(arrays, as_of_ns: int) -> tuple[float, float, float]:
+        event_ns, numeric_cumsum, valid_cumsum = arrays
+        start_index = int(np.searchsorted(event_ns, as_of_ns - lookback_ns, side="left"))
+        end_index = int(np.searchsorted(event_ns, as_of_ns, side="right"))
+        count = float(end_index - start_index)
+        valid_count = float(valid_cumsum[end_index] - valid_cumsum[start_index])
+        total = float(numeric_cumsum[end_index] - numeric_cumsum[start_index])
+        return count, total, valid_count
+
+    if "symbol" in external.columns:
+        global_rows = external[external["symbol"].isna()]
+        symbol_rows = external[external["symbol"].notna()]
+    else:
+        global_rows = external
+        symbol_rows = external.iloc[0:0]
+    global_arrays = build_arrays(global_rows) if not global_rows.empty else None
+    symbol_arrays = {str(symbol): build_arrays(group) for symbol, group in symbol_rows.groupby("symbol", sort=False)}
+
     counts = []
     means = []
     for row in frame[["as_of", "symbol"]].itertuples(index=False):
-        start = row.as_of - pd.Timedelta(hours=lookback_hours)
-        window = external[(external["event_time"] <= row.as_of) & (external["event_time"] >= start)]
-        if "symbol" in window.columns:
-            symbol_window = window[(window["symbol"].isna()) | (window["symbol"] == row.symbol)]
-            if not symbol_window.empty:
-                window = symbol_window
-        counts.append(float(len(window)))
-        means.append(float(window["numeric_value"].dropna().mean()) if "numeric_value" in window and not window["numeric_value"].dropna().empty else 0.0)
+        as_of_ns = row.as_of.value
+        count = total = valid_count = 0.0
+        if global_arrays is not None:
+            count, total, valid_count = summarize(global_arrays, as_of_ns)
+        arrays = symbol_arrays.get(str(row.symbol))
+        if arrays is not None:
+            symbol_count, symbol_total, symbol_valid_count = summarize(arrays, as_of_ns)
+            count += symbol_count
+            total += symbol_total
+            valid_count += symbol_valid_count
+        counts.append(count)
+        means.append(float(total / valid_count) if valid_count else 0.0)
     frame["external_event_count_24h"] = counts
     frame["external_numeric_mean_24h"] = means
     return frame
@@ -683,7 +790,15 @@ def _add_labels(frame, candles, fee_rate: float):
     return pd.concat(result_rows, ignore_index=True).sort_values(["symbol", "as_of"])
 
 
-def _quality_report(frame, candles, news, external, experience_rows: list[dict[str, Any]], converter_model: str) -> dict[str, Any]:
+def _quality_report(
+    frame,
+    *,
+    candles_rows: int,
+    news_rows: int,
+    external_rows: int,
+    experience_summary: dict[str, Any],
+    converter_model: str,
+) -> dict[str, Any]:
     warnings = []
     total_rows = int(len(frame))
     labeled_rows = int(frame["target_trade_quality_score"].notna().sum()) if "target_trade_quality_score" in frame else 0
@@ -708,11 +823,7 @@ def _quality_report(frame, candles, news, external, experience_rows: list[dict[s
     target_distribution = {}
     if "target_direction_15m" in frame:
         target_distribution = {str(key): int(value) for key, value in frame["target_direction_15m"].value_counts(dropna=True).to_dict().items()}
-    action_balance = {}
-    if experience_rows:
-        for row in experience_rows:
-            action = str(row.get("action") or "UNKNOWN")
-            action_balance[action] = action_balance.get(action, 0) + 1
+    action_balance = experience_summary.get("action_balance", {}) if isinstance(experience_summary, dict) else {}
     return {
         "total_rows": total_rows,
         "labeled_rows": labeled_rows,
@@ -722,18 +833,18 @@ def _quality_report(frame, candles, news, external, experience_rows: list[dict[s
             "days": date_range_days,
         },
         "symbols": sorted(frame["symbol"].dropna().unique().tolist()) if total_rows and "symbol" in frame else [],
-        "candles_coverage_rows": int(len(candles)),
+        "candles_coverage_rows": int(candles_rows),
         "news_coverage_percentage": float((frame.get("article_count_used", 0) > 0).mean() * 100.0) if total_rows else 0.0,
         "derivatives_coverage_percentage": float((frame.get("external_event_count_24h", 0) > 0).mean() * 100.0) if total_rows else 0.0,
         "external_context_coverage_percentage": float((frame.get("external_event_count_24h", 0) > 0).mean() * 100.0) if total_rows else 0.0,
-        "experience_rows_used": len(experience_rows),
+        "experience_rows_used": int((experience_summary or {}).get("count", 0)),
         "duplicate_rows": duplicate_rows,
         "missing_columns": missing_columns,
         "target_distribution": target_distribution,
         "buy_sell_hold_balance": action_balance,
         "news_converter_model": converter_model,
-        "raw_news_rows": int(len(news)),
-        "external_rows": int(len(external)),
+        "raw_news_rows": int(news_rows),
+        "external_rows": int(external_rows),
         "future_leakage_detected": False,
         "warnings": warnings,
     }
@@ -745,7 +856,7 @@ def _process(root: Path, output_dir: Path, lookback_hours: float, fee_rate: floa
     candles = _candle_frame(root)
     news = _news_frame(root, news_converter)
     external = _external_frame(root)
-    experience_rows = _read_jsonl_gz(root, "experience_buffer.jsonl.gz")
+    experience_summary = _experience_summary(root)
     frame = _feature_rows(root)
     if frame.empty:
         frame = _rows_from_candles(candles)
@@ -765,10 +876,125 @@ def _process(root: Path, output_dir: Path, lookback_hours: float, fee_rate: floa
     dataset_path = output_dir / f"anata_training_ready_{stamp}.csv.gz"
     report_path = output_dir / f"data_quality_{stamp}.json"
     frame.to_csv(dataset_path, index=False, compression="gzip")
-    report = _quality_report(frame, candles, news, external, experience_rows, converter_model)
+    report = _quality_report(
+        frame,
+        candles_rows=len(candles),
+        news_rows=len(news),
+        external_rows=len(external),
+        experience_summary=experience_summary,
+        converter_model=converter_model,
+    )
     report["dataset_path"] = str(dataset_path)
     report["created_at"] = datetime.now(timezone.utc).isoformat()
     report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    return {
+        "status": "ok",
+        "dataset": str(dataset_path),
+        "quality_report": str(report_path),
+        "report": report,
+    }
+
+
+def _raw_zip_paths(input_path: Path) -> list[Path]:
+    if input_path.is_file() and input_path.suffix.lower() == ".zip":
+        return [input_path]
+    if not input_path.is_dir():
+        return []
+    return sorted(path for path in input_path.rglob("*.zip") if path.is_file())
+
+
+def _chunks(values: list[Path], size: int):
+    size = max(1, size)
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def _combine_action_balances(reports: list[dict[str, Any]]) -> dict[str, int]:
+    combined: dict[str, int] = {}
+    for report in reports:
+        for action, count in (report.get("buy_sell_hold_balance") or {}).items():
+            combined[str(action)] = combined.get(str(action), 0) + int(count or 0)
+    return combined
+
+
+def _process_daily_batches(
+    input_path: Path,
+    output_dir: Path,
+    lookback_hours: float,
+    fee_rate: float,
+    news_converter: str,
+    batch_size: int,
+    keep_batch_files: bool,
+) -> dict[str, Any] | None:
+    zip_paths = _raw_zip_paths(input_path)
+    if len(zip_paths) <= 1:
+        return None
+
+    pd, _ = _load_pandas()
+    converter_model = CONVERTER_MODEL_NAMES[news_converter]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    batch_dir = output_dir / f"_daily_batches_{stamp}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset_paths: list[Path] = []
+    batch_reports: list[dict[str, Any]] = []
+    batch_inputs: list[list[str]] = []
+    for batch_number, batch in enumerate(_chunks(zip_paths, batch_size), start=1):
+        with tempfile.TemporaryDirectory(prefix=f"anata_batch_{batch_number}_") as temp_dir:
+            temp_root = Path(temp_dir)
+            for zip_path in batch:
+                _extract_raw_zips(zip_path, temp_root)
+            result = _process(temp_root, batch_dir, lookback_hours, fee_rate, news_converter)
+        dataset_paths.append(Path(result["dataset"]))
+        batch_reports.append(result["report"])
+        batch_inputs.append([str(path) for path in batch])
+        print(f"processed batch {batch_number}: {', '.join(path.name for path in batch)}", flush=True)
+
+    frames = []
+    for dataset_path in dataset_paths:
+        frames.append(pd.read_csv(dataset_path))
+    frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if frame.empty:
+        raise SystemExit("Daily batches finished, but no processed rows were produced.")
+    frame["as_of"] = pd.to_datetime(frame["as_of"], utc=True, errors="coerce")
+    frame = frame.dropna(subset=["as_of", "symbol"]).sort_values(["symbol", "as_of"]).drop_duplicates(subset=["symbol", "as_of"], keep="last")
+    frame["news_converter_model"] = converter_model
+
+    dataset_path = output_dir / f"anata_training_ready_{stamp}_batched.csv.gz"
+    report_path = output_dir / f"data_quality_{stamp}_batched.json"
+    frame.to_csv(dataset_path, index=False, compression="gzip")
+
+    experience_summary = {
+        "count": sum(int(report.get("experience_rows_used", 0) or 0) for report in batch_reports),
+        "action_balance": _combine_action_balances(batch_reports),
+    }
+    report = _quality_report(
+        frame,
+        candles_rows=sum(int(report.get("candles_coverage_rows", 0) or 0) for report in batch_reports),
+        news_rows=sum(int(report.get("raw_news_rows", 0) or 0) for report in batch_reports),
+        external_rows=sum(int(report.get("external_rows", 0) or 0) for report in batch_reports),
+        experience_summary=experience_summary,
+        converter_model=converter_model,
+    )
+    report["dataset_path"] = str(dataset_path)
+    report["created_at"] = datetime.now(timezone.utc).isoformat()
+    report["batch_mode"] = "daily_zip_batches"
+    report["batch_size"] = int(batch_size)
+    report["batch_count"] = len(batch_reports)
+    report["batch_inputs"] = batch_inputs
+    if keep_batch_files:
+        report["batch_reports"] = batch_reports
+    else:
+        report["batch_reports"] = [
+            {key: value for key, value in batch_report.items() if key not in {"dataset_path", "created_at"}}
+            for batch_report in batch_reports
+        ]
+    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+
+    if not keep_batch_files:
+        shutil.rmtree(batch_dir, ignore_errors=True)
+
     return {
         "status": "ok",
         "dataset": str(dataset_path),
@@ -784,6 +1010,23 @@ def main() -> None:
     parser.add_argument("--news-lookback-hours", type=float, default=6.0)
     parser.add_argument("--fee-rate", type=float, default=0.0004)
     parser.add_argument(
+        "--batch-daily-files",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --input is a folder of daily ZIPs, process small ZIP batches and merge the final dataset. Default: enabled.",
+    )
+    parser.add_argument(
+        "--daily-batch-size",
+        type=int,
+        default=1,
+        help="Number of daily ZIPs to process at once in --batch-daily-files mode. Use 1 for lowest RAM, 2-3 for faster runs on stronger PCs.",
+    )
+    parser.add_argument(
+        "--keep-batch-files",
+        action="store_true",
+        help="Keep intermediate processed batch CSVs for debugging. The final merged dataset is always kept.",
+    )
+    parser.add_argument(
         "--news-converter",
         choices=["smart", "finbert", "cryptobert", "rule-based"],
         default="smart",
@@ -792,6 +1035,19 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        if args.batch_daily_files:
+            batch_result = _process_daily_batches(
+                args.input,
+                args.output_dir,
+                args.news_lookback_hours,
+                args.fee_rate,
+                args.news_converter,
+                args.daily_batch_size,
+                args.keep_batch_files,
+            )
+            if batch_result is not None:
+                print(json.dumps(batch_result, indent=2, default=str))
+                return
         if args.input.is_file() and args.input.suffix.lower() != ".zip":
             print(json.dumps(_process(args.input, args.output_dir, args.news_lookback_hours, args.fee_rate, args.news_converter), indent=2))
             return

@@ -45,6 +45,8 @@ from app.db.models import (
 from app.db.session import create_db_and_tables, get_session
 from app.features.feature_builder import FeatureBuilder
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, values_from_feature
+from app.pipeline.domain import ModelLifecycle
+from app.pipeline.registry import ArtifactValidator, ModelRegistry
 from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
 from app.services.data_bundles import (
@@ -2377,10 +2379,18 @@ def upload_model(
         version=version,
         feature_schema_version=str(metadata.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION),
         feature_columns=[str(column) for column in feature_columns],
-        path=str(metadata.get("package_path") or metadata.get("model_file")),
+        path=str(metadata.get("model_file") or metadata.get("package_path")),
         parent_model_id=metadata.get("parent_model_id"),
         checkpoint_path=metadata.get("checkpoint_path") or metadata.get("from_checkpoint"),
         status="candidate",
+        model_family=str(metadata.get("model_family") or metadata.get("model_type") or "alpha.uploaded_return"),
+        lifecycle_state=ModelLifecycle.TRAINED.value,
+        health_status="HEALTHY",
+        artifact_checksum=ArtifactValidator.checksum(Path(str(metadata.get("model_file") or metadata.get("package_path")))),
+        preprocessing_version=str(metadata.get("preprocessing_version") or "legacy-v1"),
+        training_dataset_version=metadata.get("training_dataset_version") or metadata.get("training_dataset_hash") or metadata.get("dataset_hash"),
+        forecast_horizon_seconds=int(metadata.get("forecast_horizon_seconds") or metadata.get("forecast_horizon") or 300),
+        package_manifest={"package_path": metadata.get("package_path"), "legacy_upload": True},
         metrics=metadata.get("metrics") if isinstance(metadata.get("metrics"), dict) else {},
         raw_payload=metadata,
     )
@@ -2389,12 +2399,12 @@ def upload_model(
     session.refresh(model)
     return {
         "status": "candidate",
-        "message": "Model uploaded and registered as candidate. Activate it explicitly after checking metrics.",
+        "message": "Model uploaded as a challenger. Use explicit promotion or an isolated shadow/sandbox transition.",
         "model": _model_payload(model),
     }
 
 
-@router.post("/models/activate")
+@router.post("/models/activate", deprecated=True)
 def activate_model(
     payload: dict[str, Any] | None = Body(default=None),
     session: Session = Depends(get_session),
@@ -2412,13 +2422,29 @@ def activate_model(
     if model is None:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    active_rows = session.scalars(select(ModelVersion).where(ModelVersion.status == "active", ModelVersion.id != model.id)).all()
-    for row in active_rows:
-        row.status = "inactive"
-    model.status = "active"
-    session.commit()
-    session.refresh(model)
-    return {"status": "active", "model": _model_payload(model)}
+    family = str(payload.get("model_family") or model.model_family or "alpha.uploaded_return")
+    if not model.model_family:
+        model.model_family = family
+    if not model.preprocessing_version:
+        model.preprocessing_version = "legacy-v1"
+    try:
+        promoted = ModelRegistry(session).promote(
+            model.id,
+            model_family=family,
+            symbol_scope=str(payload.get("symbol_scope") or "*").upper(),
+            actor="manual",
+            reason=str(payload.get("reason") or "Deprecated /api/models/activate compatibility request"),
+        )
+        session.commit()
+    except (PermissionError, ValueError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "status": "active",
+        "deprecated": True,
+        "message": "Compatibility activation was recorded as an explicit V2 champion promotion.",
+        "model": _model_payload(promoted),
+    }
 
 
 @router.get("/models/predict")

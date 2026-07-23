@@ -501,6 +501,14 @@ def values_from_feature(feature: Feature | dict[str, Any], feature_columns: list
         "sentiment_articles_used",
         "price_change",
         "final_ai_input",
+        "external_ai_available",
+        "external_ai_missing",
+        "external_ai_failed",
+        "external_ai_confidence",
+        "external_ai_age_seconds",
+        "external_ai_provider",
+        "external_ai_prompt_version",
+        "external_ai_direction_score",
     ):
         output.setdefault(optional_key, safe_values.get(optional_key, DEFAULT_FEATURE_VALUES.get(optional_key)))
     output["schema_version"] = schema_version

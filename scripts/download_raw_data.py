@@ -12,6 +12,15 @@ from pathlib import Path
 from urllib import error, request
 
 
+TRAINING_RAW_TABLES = [
+    "candles",
+    "news_articles",
+    "external_data_events",
+    "training_features",
+    "experience_buffer",
+]
+
+
 def _api(
     url: str,
     token: str,
@@ -81,6 +90,8 @@ def _compact_options(args: argparse.Namespace) -> dict:
         "finished_older_than_hours": args.finished_older_than_hours if args.finished_only else None,
         "daily_files": args.daily_files,
     }
+    if args.training_only:
+        payload["tables"] = TRAINING_RAW_TABLES
     if args.symbols:
         payload["symbols"] = [item.strip().upper() for item in args.symbols.split(",") if item.strip()]
     return {key: value for key, value in payload.items() if value is not None}
@@ -350,6 +361,11 @@ def main() -> None:
     parser.add_argument("--include-external", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-experience", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-models", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--training-only",
+        action="store_true",
+        help="Export only tables needed by scripts/prepare_training_data.py to reduce Railway memory/export size.",
+    )
     parser.add_argument("--symbols", default=None, help="Comma-separated symbols, for example BTCUSDT,ETHUSDT.")
     parser.add_argument(
         "--cleanup-after-download",

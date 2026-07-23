@@ -1,7 +1,15 @@
+"""Compatibility adapter for uploaded return-forecast artifacts.
+
+This module deliberately stops at a standardized forecast/direction representation.
+It never produces leverage, margin, notional, stops, holds, orders, or execution
+instructions. The V2 pipeline decides signal eligibility, portfolio exposure and risk.
+"""
+
 from __future__ import annotations
 
 import io
 import json
+import math
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,13 +41,17 @@ REGIME_ORDER = [
 
 @dataclass(frozen=True)
 class ModelDecision:
+    """Legacy display adapter: decision conveys direction only, never a trade plan."""
+
     decision: StrategyDecision
     model: ModelVersion
     prediction: dict[str, Any]
 
 
 class PriceModelStrategy:
-    name = "uploaded-model-inference"
+    """Load a frozen uploaded artifact and expose a return forecast for V2 migration."""
+
+    name = "uploaded-model-prediction-adapter"
 
     def __init__(self) -> None:
         self.last_fallback_reason: str | None = None
@@ -58,109 +70,62 @@ class PriceModelStrategy:
         if model is None:
             self.last_fallback_reason = "No active model is registered."
             return None
-
         payload = self._load_model_payload(model)
         if payload is None:
             self.last_fallback_reason = "Active model metadata or file could not be loaded."
             return None
-
         feature_columns = list(payload.get("feature_columns") or model.feature_columns or [])
         if not feature_columns:
             self.last_fallback_reason = "Active model has no feature_columns metadata."
             return None
-
-        vector = self._feature_vector(feature, feature_columns)
         values = values_from_feature(feature, feature_columns)
         values.update(symbol_identity_values(feature.symbol))
+        vector = self._feature_vector(feature, feature_columns)
         specialist_regime, specialist_file = self._select_specialist_model_file(payload, values)
-        prediction_source = "global_model"
-        predicted_return: float | None = None
-        if specialist_file:
-            predicted_return = self._predict_model_file(payload, specialist_file, vector)
-            if predicted_return is not None:
-                prediction_source = f"regime_specialist:{specialist_regime}"
-            else:
-                self.last_fallback_reason = None
+        predicted_return = self._predict_model_file(payload, specialist_file, vector) if specialist_file else None
+        prediction_source = f"regime_specialist:{specialist_regime}" if predicted_return is not None and specialist_regime else "global_model"
         if predicted_return is None:
             predicted_return = self._predict(payload, vector)
-        if predicted_return is None:
-            self.last_fallback_reason = self.last_fallback_reason or "Active model type is not compatible with Railway inference."
+        if predicted_return is None or not math.isfinite(predicted_return):
+            self.last_fallback_reason = self.last_fallback_reason or "Active model type is not compatible with safe server inference."
             return None
         required_edge = settings.paper_fee_rate * 2.0 + settings.strategy_min_edge_after_fees
         confidence = self._confidence(predicted_return, required_edge)
-        last_close = values.get("last_close")
-        trade_plan = self._trade_plan(payload=payload, vector=vector, confidence=confidence, predicted_return=predicted_return)
-
+        direction = "LONG" if predicted_return > required_edge else "SHORT" if predicted_return < -required_edge else "FLAT"
+        action = "BUY" if direction == "LONG" else "SELL" if direction == "SHORT" else "HOLD"
+        expected_volatility = max(abs(float(values.get("volatility") or 0.0)), abs(predicted_return) * 0.5, 0.0001)
+        probability_up = self._sigmoid(predicted_return / max(expected_volatility, 1e-6))
         prediction = {
             "model_id": model.model_id,
             "model_version": model.version,
+            "model_family": model.model_family or "uploaded.return_forecast",
             "feature_schema_version": model.feature_schema_version,
             "feature_columns": feature_columns,
             "predicted_return": predicted_return,
-            "required_edge_after_fees": required_edge,
+            "expected_return": predicted_return,
+            "expected_volatility": expected_volatility,
+            "probability_up": probability_up,
+            "probability_down": 1.0 - probability_up,
             "confidence": confidence,
-            "trade_plan": trade_plan,
-            "trade_plan_source": trade_plan.get("source"),
+            "uncertainty": max(0.0, min(1.0, 1.0 - confidence)),
+            "direction": direction,
+            "required_edge_after_fees": required_edge,
             "prediction_source": prediction_source,
             "specialist_regime": specialist_regime,
+            "legacy_sizing_targets_ignored": True,
         }
-
-        if abs(predicted_return) < required_edge:
-            return ModelDecision(
-                StrategyDecision(
-                    action="HOLD",
-                    confidence=max(0.50, confidence),
-                    reason=(
-                        "Trained model edge is too small after fees "
-                        f"({predicted_return:.4%} prediction vs {required_edge:.4%} required)."
-                    ),
-                    max_hold_seconds=int(trade_plan["max_hold_seconds"]),
-                ),
-                model,
-                prediction,
-            )
-
-        side = "LONG" if predicted_return > 0 else "SHORT"
-        action = "BUY" if side == "LONG" else "SELL"
-        return ModelDecision(
-            StrategyDecision(
-                action=action,
-                confidence=confidence,
-                reason=(
-                    f"Trained model trade plan ({prediction_source}): {predicted_return:.4%} {side.lower()} edge, "
-                    f"{trade_plan['margin_pct']:.2%} margin, {trade_plan['leverage']:.2f}x leverage."
-                ),
-                stop_loss=self._price_level(
-                    last_close,
-                    side,
-                    stop=True,
-                    predicted_return=predicted_return,
-                    planned_pct=float(trade_plan.get("stop_loss_pct") or 0.0),
-                ),
-                take_profit=self._price_level(
-                    last_close,
-                    side,
-                    stop=False,
-                    predicted_return=predicted_return,
-                    planned_pct=float(trade_plan.get("take_profit_pct") or 0.0),
-                ),
-                margin_pct=float(trade_plan["margin_pct"]),
-                leverage=float(trade_plan["leverage"]),
-                max_hold_seconds=int(trade_plan["max_hold_seconds"]),
-            ),
-            model,
-            prediction,
+        reason = (
+            f"Frozen uploaded model forecast ({prediction_source}) estimates {predicted_return:.4%} return; "
+            "V2 risk and portfolio policy own all sizing and execution."
         )
+        return ModelDecision(StrategyDecision(action=action, confidence=confidence, reason=reason), model, prediction)
 
     def _feature_vector(self, feature: Feature, feature_columns: list[str]) -> list[float]:
         if not any(column.startswith("symbol_") for column in feature_columns):
             return numeric_vector(feature, feature_columns)
         values = values_from_feature(feature, feature_columns)
         values.update(symbol_identity_values(feature.symbol))
-        vector: list[float] = []
-        for column in feature_columns:
-            vector.append(float(values.get(column, 0.0) or 0.0))
-        return vector
+        return [float(values.get(column, 0.0) or 0.0) for column in feature_columns]
 
     def _load_model_payload(self, model: ModelVersion) -> dict[str, Any] | None:
         payload = dict(model.raw_payload or {})
@@ -171,14 +136,14 @@ class PriceModelStrategy:
             return payload or None
         path = Path(str(path_value))
         if path.exists() and path.suffix.lower() == ".json":
-            file_payload = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                file_payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return payload or None
             if isinstance(file_payload, dict):
                 payload.update(file_payload)
-                payload.setdefault("model_file", str(path))
-                return payload
         if path.exists():
             payload.setdefault("model_file", str(path))
-            return payload
         return payload or None
 
     def _predict(self, payload: dict[str, Any], vector: list[float]) -> float | None:
@@ -186,30 +151,21 @@ class PriceModelStrategy:
         if isinstance(coefficients, list):
             try:
                 weights = [float(value or 0.0) for value in coefficients]
+                if len(weights) != len(vector):
+                    return None
+                return float(payload.get("intercept", 0.0) or 0.0) + sum(value * weight for value, weight in zip(vector, weights))
             except (TypeError, ValueError):
                 return None
-            if len(weights) != len(vector):
-                return None
-            intercept = float(payload.get("intercept", 0.0) or 0.0)
-            return intercept + sum(value * coefficient for value, coefficient in zip(vector, weights))
-
         model_file = payload.get("model_file")
+        return self._predict_model_file(payload, str(model_file), vector) if model_file else None
+
+    def _predict_model_file(self, payload: dict[str, Any], model_file: str | None, vector: list[float]) -> float | None:
         if not model_file:
             return None
-        return self._predict_model_file(payload, str(model_file), vector)
-
-    def _predict_plan_target(self, payload: dict[str, Any], target: str, vector: list[float]) -> float | None:
-        plan_files = payload.get("plan_model_files") if isinstance(payload.get("plan_model_files"), dict) else {}
-        plan_file = plan_files.get(target)
-        if not plan_file:
-            return None
-        return self._predict_model_file(payload, str(plan_file), vector)
-
-    def _predict_model_file(self, payload: dict[str, Any], model_file: str, vector: list[float]) -> float | None:
         try:
             import joblib
         except Exception:
-            self.last_fallback_reason = "joblib is not installed on the server, so uploaded sklearn model cannot run."
+            self.last_fallback_reason = "joblib is unavailable for uploaded sklearn inference."
             return None
         try:
             path = Path(model_file)
@@ -224,113 +180,44 @@ class PriceModelStrategy:
                     if member not in archive.namelist():
                         return None
                     estimator = joblib.load(io.BytesIO(archive.read(member)))
-            prediction = estimator.predict([vector])
+            result = estimator.predict([vector])[0]
+            return float(result[0] if isinstance(result, (list, tuple)) else result)
         except Exception as exc:
-            self.last_fallback_reason = f"Model inference failed: {type(exc).__name__}: {exc}"
-            return None
-        try:
-            first = prediction[0]
-            if isinstance(first, (list, tuple)):
-                first = first[0]
-            return float(first)
-        except (TypeError, ValueError, IndexError):
-            self.last_fallback_reason = "Model prediction was not a numeric scalar."
+            self.last_fallback_reason = f"Model inference failed: {type(exc).__name__}."
             return None
 
     def _select_specialist_model_file(self, payload: dict[str, Any], values: dict[str, Any]) -> tuple[str | None, str | None]:
-        specialist_files = payload.get("specialist_model_files") if isinstance(payload.get("specialist_model_files"), dict) else {}
-        if not specialist_files:
-            return None, None
+        files = payload.get("specialist_model_files") if isinstance(payload.get("specialist_model_files"), dict) else {}
         active = self._active_regime(values, list(payload.get("specialist_regime_order") or REGIME_ORDER))
-        if active and active in specialist_files:
-            return active, str(specialist_files[active])
-        return active, None
+        return active, str(files[active]) if active and active in files else None
 
-    def _active_regime(self, values: dict[str, Any], order: list[str]) -> str | None:
+    @staticmethod
+    def _active_regime(values: dict[str, Any], order: list[str]) -> str | None:
+        def value(key: str) -> float:
+            try:
+                return float(values.get(key, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
         checks = {
-            "news_shock": self._float(values.get("regime_news_shock_score")) >= 0.45,
-            "risk_off": self._float(values.get("regime_risk_off_score")) >= 0.45,
-            "liquidity_stress": self._float(values.get("regime_liquidity_stress_score")) >= 0.35,
-            "crowded_market": self._float(values.get("regime_crowd_pressure")) >= 0.35,
-            "breakout_pressure": self._float(values.get("regime_breakout_pressure")) >= 0.35,
-            "mean_reversion_pressure": self._float(values.get("regime_mean_reversion_pressure")) >= 0.35,
-            "trend_up": self._float(values.get("regime_trend_strength")) >= 0.35 and self._float(values.get("regime_direction_score")) > 0.10,
-            "trend_down": self._float(values.get("regime_trend_strength")) >= 0.35 and self._float(values.get("regime_direction_score")) < -0.10,
-            "range_low_volatility": self._float(values.get("regime_trend_strength")) < 0.25 and self._float(values.get("regime_volatility_score")) < 0.20,
-            "high_volatility": self._float(values.get("regime_volatility_score")) >= 0.35,
+            "news_shock": value("regime_news_shock_score") >= 0.45,
+            "risk_off": value("regime_risk_off_score") >= 0.45,
+            "liquidity_stress": value("regime_liquidity_stress_score") >= 0.35,
+            "crowded_market": value("regime_crowd_pressure") >= 0.35,
+            "breakout_pressure": value("regime_breakout_pressure") >= 0.35,
+            "mean_reversion_pressure": value("regime_mean_reversion_pressure") >= 0.35,
+            "trend_up": value("regime_trend_strength") >= 0.35 and value("regime_direction_score") > 0.10,
+            "trend_down": value("regime_trend_strength") >= 0.35 and value("regime_direction_score") < -0.10,
+            "range_low_volatility": value("regime_trend_strength") < 0.25 and value("regime_volatility_score") < 0.20,
+            "high_volatility": value("regime_volatility_score") >= 0.35,
         }
-        for regime in order:
-            if checks.get(regime):
-                return regime
-        return None
+        return next((regime for regime in order if checks.get(regime)), None)
 
-    def _float(self, value: Any, default: float = 0.0) -> float:
-        try:
-            return float(value if value is not None else default)
-        except (TypeError, ValueError):
-            return default
-
-    def _confidence(self, predicted_return: float, required_edge: float) -> float:
+    @staticmethod
+    def _confidence(predicted_return: float, required_edge: float) -> float:
         scale = abs(predicted_return) / max(required_edge * 4.0, 1e-9)
-        return max(settings.risk_min_confidence, min(0.95, 0.55 + scale * 0.40))
+        return max(0.0, min(0.95, 0.45 + scale * 0.35))
 
-    def _trade_plan(self, *, payload: dict[str, Any], vector: list[float], confidence: float, predicted_return: float) -> dict[str, float | int | str]:
-        learned = {
-            "margin_pct": self._predict_plan_target(payload, "target_best_margin_pct", vector),
-            "leverage": self._predict_plan_target(payload, "target_best_leverage", vector),
-            "stop_loss_pct": self._predict_plan_target(payload, "target_best_stop_loss_pct", vector),
-            "take_profit_pct": self._predict_plan_target(payload, "target_best_take_profit_pct", vector),
-            "max_hold_seconds": self._predict_plan_target(payload, "target_best_hold_seconds", vector),
-        }
-        if all(value is not None for value in learned.values()):
-            return {
-                "margin_pct": max(0.0001, min(float(learned["margin_pct"]), 1.0)),
-                "leverage": max(1.0, min(float(learned["leverage"]), settings.paper_max_leverage)),
-                "stop_loss_pct": max(0.0005, min(float(learned["stop_loss_pct"]), 0.50)),
-                "take_profit_pct": max(0.0005, min(float(learned["take_profit_pct"]), 1.00)),
-                "max_hold_seconds": int(max(60, min(float(learned["max_hold_seconds"]), 86400))),
-                "source": "learned_plan_models",
-            }
-
-        confidence_span = max(1.0 - settings.risk_min_confidence, 1e-9)
-        confidence_scale = max(0.0, min(1.0, (confidence - settings.risk_min_confidence) / confidence_span))
-        edge_scale = max(0.0, min(1.0, abs(predicted_return) / 0.02))
-        plan_scale = max(confidence_scale, edge_scale * 0.65)
-        max_margin_pct = min(max(settings.risk_max_trade_size_pct, 0.01), 1.0)
-        margin_pct = max(0.0025, max_margin_pct * plan_scale)
-        max_leverage = max(settings.paper_max_leverage, settings.paper_min_leverage, 1.0)
-        min_leverage = min(max(settings.paper_min_leverage, 1.0), max_leverage)
-        leverage = min_leverage + (max_leverage - min_leverage) * plan_scale
-        max_hold_seconds = int(900 + (settings.auto_max_hold_seconds - 900) * max(0.0, 1.0 - edge_scale))
-        return {
-            "margin_pct": margin_pct,
-            "leverage": leverage,
-            "stop_loss_pct": max(settings.auto_default_stop_loss_pct, min(0.08, abs(predicted_return) * 0.75)),
-            "take_profit_pct": max(settings.auto_default_take_profit_pct, min(0.20, abs(predicted_return) * 2.5)),
-            "max_hold_seconds": max_hold_seconds,
-            "source": "fallback_generated_plan",
-        }
-
-    def _price_level(
-        self,
-        price: Any,
-        side: str,
-        *,
-        stop: bool,
-        predicted_return: float = 0.0,
-        planned_pct: float = 0.0,
-    ) -> float | None:
-        try:
-            mark = float(price)
-        except (TypeError, ValueError):
-            return None
-        if mark <= 0:
-            return None
-        if stop:
-            offset = planned_pct if planned_pct > 0 else max(settings.auto_default_stop_loss_pct, min(0.08, abs(predicted_return) * 0.75))
-            multiplier = 1.0 - offset if side == "LONG" else 1.0 + offset
-            return round(mark * multiplier, 8)
-
-        offset = planned_pct if planned_pct > 0 else max(settings.auto_default_take_profit_pct, min(0.20, abs(predicted_return) * 2.5))
-        multiplier = 1.0 + offset if side == "LONG" else 1.0 - offset
-        return round(mark * multiplier, 8)
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        value = max(min(value, 20.0), -20.0)
+        return 1.0 / (1.0 + math.exp(-value))

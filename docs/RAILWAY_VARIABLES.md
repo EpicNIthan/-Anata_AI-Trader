@@ -17,9 +17,53 @@ DASHBOARD_PASSWORD=
 HF_API_TOKEN=
 ```
 
-## Optional paper data collection mode
+## Recommended V2 safety pins
 
-Use this only for paper/demo training-data collection. It does not enable real-money trading and should be paired with `TRADING_MODE=paper`.
+The application has safe code defaults, but pin these deployment invariants so a
+future default change cannot enable live-like behavior or automatic promotion:
+
+```text
+TRADING_MODE=paper
+WORKER_ROLE=all
+ANATA_V2_ENABLED=true
+AUTO_TRADER_ENABLED=false
+ENABLE_SERVER_TRAINING=false
+V2_AUTO_PROMOTE_CHAMPION=false
+RESEARCH_ENABLED=false
+RESEARCH_AUTO_PROMOTE=false
+EXTERNAL_AI_ENABLED=false
+RISK_CONFIGURATION_VERSION=v2-safe-defaults
+V2_MAX_POSITION_LEVERAGE=3
+RISK_MAX_PORTFOLIO_LEVERAGE=3
+V2_MAX_SYMBOL_EXPOSURE_PCT=0.10
+V2_MAX_GROSS_EXPOSURE_PCT=0.40
+V2_MAX_NET_EXPOSURE_PCT=0.25
+V2_SANDBOX_MAX_EXPOSURE_PCT=0.03
+PAPER_SIMULATED_SPREAD_PCT=0.0002
+PAPER_SIMULATED_SLIPPAGE_PCT=0.0001
+PAPER_SIMULATED_MARKET_IMPACT_COEFFICIENT=0
+PAPER_SIMULATED_VOLUME_PARTICIPATION=0.10
+PAPER_SIMULATED_PARTIAL_FILL_ENABLED=false
+PAPER_SIMULATED_FUNDING_RATE=0
+PAPER_SIMULATED_LATENCY_MS=0
+PAPER_SIMULATED_ORDER_TTL_SECONDS=300
+STORE_MARKET_TICKS=false
+```
+
+Enable `AUTO_TRADER_ENABLED=true` only after current candles, risk settings, the kill
+switch, and the V2 trace have been checked. All execution remains simulated.
+
+`WORKER_ROLE` accepts `all`, `web`, `collector`, `paper-trader`, or `enrichment`.
+`all` is the simplest single-service deployment. For separate Railway services sharing
+one PostgreSQL database, use `web` for the public service and assign the other roles to
+background services. There is no Railway research role; heavy research stays local.
+
+## Optional legacy paper data collection mode
+
+Use this only when intentionally exercising the legacy compatibility path for
+paper/demo training-data collection. The default V2 narrow pipeline does not use the
+legacy exploration branch. It does not enable real-money trading and must be paired
+with `TRADING_MODE=paper`.
 
 ```text
 TRADING_MODE=paper
@@ -39,6 +83,24 @@ MIN_PAPER_TRADE_NOTIONAL=50
 The same values are available in `presets/paper_data_collection.env`.
 
 Railway normally injects `PORT` automatically. You only need `PORT=8000` for local testing or a custom deployment.
+
+## Optional local student and external provider
+
+A compact local student needs only its artifact path; it does not need torch:
+
+```text
+WORKER_ROLE=enrichment
+ENRICHMENT_ENABLED=true
+LOCAL_NEWS_STUDENT_PATH=./models/news_student.json
+LOCAL_NEWS_STUDENT_VERSION=student-version
+EXTERNAL_AI_ENABLED=false
+```
+
+External AI is disabled by default. If enabled deliberately, configure a provider key,
+model, declared input/output prices, daily limit, and monthly budget. The runtime
+supports OpenAI-compatible Gemini, Groq, Hugging Face router, and generic endpoints.
+Unknown prices fail the pre-request budget gate. Never add provider secrets to source
+files or model metadata.
 
 ## Remove from Railway if you did not intentionally override them
 
@@ -128,13 +190,18 @@ DIAGNOSTIC_RETENTION_DAYS
 
 ## Important defaults now in code
 
-- Market collector: enabled by default.
-- News collector: enabled by default.
-- Derivatives collector: enabled by default, with cooldown when Binance Futures returns HTTP 451 from Railway.
+- Market collector: enabled by default when the role is `all` or `collector`.
+- News collector: enabled by default when the role is `all` or `collector`.
+- Derivatives collector: enabled by default for a collector role, with cooldown when Binance Futures returns HTTP 451 from Railway.
 - Fear/Greed, global market, stablecoin risk, and macro risk collectors: enabled by default.
-- Paper auto trader: enabled by default.
-- Paper runner starts in Bot mode by default. Switch to Trained AI in the dashboard only after uploading and activating a model you trust.
+- Paper auto trader: enabled by the code default only for `all` or `paper-trader`; pin
+  `AUTO_TRADER_ENABLED=false` during initial deployment.
+- With `ANATA_V2_ENABLED=true`, the runner uses the mandatory V2 pipeline. The legacy
+  Bot/Trained-AI selector is not a model-to-order bypass.
 - Exploration mode is intentionally off by default because it creates random/noisy paper trades.
 - Paper data collection mode is intentionally off by default. Enable it only with `TRADING_MODE=paper`.
 - Server training is disabled by default; train on your PC.
 - Raw ticks are disabled by default because they grow too fast.
+
+The complete local reference is `.env.example`. Do not paste every non-secret default
+into Railway; variables shown in the V2 safety block are intentional operational pins.

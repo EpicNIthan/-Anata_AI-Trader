@@ -67,6 +67,10 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "title": "TEXT",
         "url": "TEXT",
         "published_at": "TIMESTAMP WITH TIME ZONE",
+        "event_time": "TIMESTAMP WITH TIME ZONE",
+        "received_time": "TIMESTAMP WITH TIME ZONE",
+        "processed_time": "TIMESTAMP WITH TIME ZONE",
+        "available_to_model_time": "TIMESTAMP WITH TIME ZONE",
         "raw_text": "TEXT",
         "raw": "JSON",
         "raw_payload": "JSON",
@@ -90,6 +94,10 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "schema_version": "VARCHAR(64)",
         "source_name": "VARCHAR(128)",
         "as_of": "TIMESTAMP WITH TIME ZONE",
+        "event_time": "TIMESTAMP WITH TIME ZONE",
+        "received_time": "TIMESTAMP WITH TIME ZONE",
+        "processed_time": "TIMESTAMP WITH TIME ZONE",
+        "available_to_model_time": "TIMESTAMP WITH TIME ZONE",
         "price_change": "FLOAT DEFAULT 0",
         "volume_change": "FLOAT DEFAULT 0",
         "volatility": "FLOAT DEFAULT 0",
@@ -112,6 +120,10 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     },
     "paper_trades": {
         "symbol": "VARCHAR(32)",
+        "paper_account_id": "VARCHAR(128) DEFAULT 'champion'",
+        "risk_decision_id": "VARCHAR(64)",
+        "simulated_order_id": "VARCHAR(64)",
+        "decision_trace_id": "VARCHAR(64)",
         "action": "VARCHAR(16)",
         "side": "VARCHAR(16) DEFAULT 'LONG'",
         "quantity": "FLOAT DEFAULT 0",
@@ -128,6 +140,7 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     },
     "positions": {
         "symbol": "VARCHAR(32)",
+        "paper_account_id": "VARCHAR(128) DEFAULT 'champion'",
         "side": "VARCHAR(16) DEFAULT 'LONG'",
         "quantity": "FLOAT DEFAULT 0",
         "entry_price": "FLOAT DEFAULT 0",
@@ -153,6 +166,19 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "parent_model_id": "VARCHAR(128)",
         "checkpoint_path": "TEXT",
         "status": "VARCHAR(32) DEFAULT 'trained'",
+        "model_family": "VARCHAR(128)",
+        "lifecycle_state": "VARCHAR(32) DEFAULT 'TRAINED'",
+        "health_status": "VARCHAR(32) DEFAULT 'HEALTHY'",
+        "artifact_checksum": "VARCHAR(128)",
+        "preprocessing_version": "VARCHAR(128)",
+        "training_dataset_version": "VARCHAR(128)",
+        "training_start_at": "TIMESTAMP WITH TIME ZONE",
+        "training_end_at": "TIMESTAMP WITH TIME ZONE",
+        "forecast_horizon_seconds": "INTEGER",
+        "package_manifest": "JSON",
+        "promotion_history": "JSON",
+        "suspension_reason": "TEXT",
+        "retirement_reason": "TEXT",
         "metrics": "JSON",
         "raw_payload": "JSON",
         "created_at": "TIMESTAMP WITH TIME ZONE",
@@ -220,8 +246,14 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "archived_at": "TIMESTAMP WITH TIME ZONE",
         "created_at": "TIMESTAMP WITH TIME ZONE",
     },
+    # This V2 table may already exist on a deployment from an earlier rolling
+    # release.  create_all() does not retrofit its new symbol discriminator.
+    "external_ai_requests": {
+        "symbol": "VARCHAR(32)",
+    },
     "account_equity": {
         "timestamp": "TIMESTAMP WITH TIME ZONE",
+        "paper_account_id": "VARCHAR(128) DEFAULT 'champion'",
         "cash_balance": "FLOAT DEFAULT 0",
         "equity": "FLOAT DEFAULT 0",
         "realized_pnl": "FLOAT DEFAULT 0",
@@ -229,6 +261,36 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
         "drawdown": "FLOAT DEFAULT 0",
         "raw": "JSON",
     },
+}
+
+
+# Index creation is additive and idempotent on SQLite and PostgreSQL.  Existing
+# deployments created before V2 need these hot-path indexes because create_all() does
+# not retrofit indexes onto already-created tables.
+ADDITIVE_INDEXES: dict[str, tuple[str, ...]] = {
+    "news_articles": (
+        "CREATE INDEX IF NOT EXISTS ix_news_articles_available_to_model_time ON news_articles (available_to_model_time)",
+    ),
+    "features": (
+        "CREATE INDEX IF NOT EXISTS ix_features_available_to_model_time ON features (available_to_model_time)",
+    ),
+    "paper_trades": (
+        "CREATE INDEX IF NOT EXISTS ix_paper_trades_account_time ON paper_trades (paper_account_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_paper_trades_risk_decision ON paper_trades (risk_decision_id)",
+        "CREATE INDEX IF NOT EXISTS ix_paper_trades_trace ON paper_trades (decision_trace_id)",
+    ),
+    "positions": (
+        "CREATE INDEX IF NOT EXISTS ix_positions_account_symbol_status ON positions (paper_account_id, symbol, status)",
+    ),
+    "account_equity": (
+        "CREATE INDEX IF NOT EXISTS ix_account_equity_account_time ON account_equity (paper_account_id, timestamp)",
+    ),
+    "model_versions": (
+        "CREATE INDEX IF NOT EXISTS ix_model_versions_lifecycle_health ON model_versions (lifecycle_state, health_status)",
+    ),
+    "external_ai_requests": (
+        "CREATE INDEX IF NOT EXISTS ix_external_ai_requests_symbol_time ON external_ai_requests (symbol, requested_at)",
+    ),
 }
 
 
@@ -250,6 +312,14 @@ def run_additive_migrations(engine: Engine) -> dict[str, Any]:
                 logger.info("Adding missing column %s.%s", table_name, column_name)
                 conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
                 added_columns.append({"table": table_name, "column": column_name, "type": column_type})
+        # Re-inspect after column additions so a partially upgraded database never
+        # attempts an index against a missing legacy table.
+        current_tables = set(inspect(conn).get_table_names())
+        for table_name, statements in ADDITIVE_INDEXES.items():
+            if table_name not in current_tables:
+                continue
+            for statement in statements:
+                conn.execute(text(statement))
     refreshed_tables = set(inspect(engine).get_table_names())
     return {
         "status": "ok",

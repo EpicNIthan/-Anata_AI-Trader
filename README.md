@@ -20,6 +20,52 @@ No live exchange order APIs are wired. There are no real trading keys, no withdr
 - Versioned JSON feature schemas, model lineage metadata, and an experience replay buffer for continued training.
 - Autonomous paper-trading runner with API and dashboard controls.
 
+## Anata V2
+
+The default paper runner now follows the audited dependency direction:
+
+```text
+Public data -> point-in-time features -> narrow model predictions -> registered signals
+-> regime-aware ensemble -> portfolio target -> independent risk approval
+-> simulated paper order/fill -> monitoring and AI Vision
+```
+
+Models cannot choose margin, leverage, notional, or orders. V2 paper execution requires
+a persisted approved risk decision, and automatic champion promotion is disabled.
+External AI is optional news context with local fallback; it cannot modify risk or
+execution.
+
+Railway runs lightweight collection, frozen inference, risk, paper execution,
+monitoring, export, and the UI. The local computer owns the permanent data lake, heavy
+news preparation, fitting, historical/walk-forward evaluation, and candidate reports.
+
+Open the read-only V2 dashboard at `/vision` (or `/dashboard/vision`). Start with:
+
+```powershell
+Copy-Item .env.example .env
+python -m pip install -r requirements.txt
+python -c "from app.db.session import create_db_and_tables; print(create_db_and_tables())"
+python scripts/run_worker.py --role all --host 0.0.0.0 --port 8000
+```
+
+The V2-specific local training and registry CLIs are also executable directly:
+
+```powershell
+python scripts/train_narrow_return_model.py --input datasets/processed/YOUR_DATASET.csv.gz `
+  --output models/narrow_return_v1.json --target target_future_return_5m `
+  --report research_reports/narrow_return_v1.json
+
+python scripts/manage_model_registry.py register-challenger `
+  --artifact models/narrow_return_v1.json --name narrow-return `
+  --version v1 --model-family alpha.linear_return
+```
+
+The complete command matrix is in
+[`docs/OPERATIONS_RUNBOOK.md`](docs/OPERATIONS_RUNBOOK.md). Architecture, migration,
+risk, execution, external-AI, monitoring, and Vision details are indexed under
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). None of these components claims
+profitability, and the simulator is not a full exchange/order-book model.
+
 ## Local Setup
 
 ```powershell
@@ -347,28 +393,27 @@ Railway only collects raw news. Your laptop converts raw news text into smarter 
 $Url = "https://anataai-trader-production.up.railway.app"
 $Token = "YOUR_ADMIN_TOKEN"
 
-# 1. Download raw news from Railway.
-python scripts/download_raw_news.py --url $Url --token $Token --since-date 2026-06-24 --output datasets/latest_raw_news.csv.gz
+# 1. Download a verified raw-news archive from Railway.
+python scripts/download_raw_data.py --url $Url --token $Token --news-only `
+  --finished-only --daily-files --output-dir local_data/raw_news
 
 # 2. On your laptop, install heavy sentiment deps if you want Hugging Face locally.
 python -m pip install -r requirements-hf.txt
 
-# 3. Score raw news locally. If transformers is unavailable, this still writes a fallback file.
-python scripts/score_news_local.py --input datasets/latest_raw_news.csv.gz --output datasets/latest_news_sentiment.jsonl.gz
+# 3. Build point-in-time numeric data with local FinBERT/CryptoBERT conversion.
+python scripts/prepare_training_data.py --input local_data/raw_news `
+  --output-dir local_data/processed --news-converter smart
 
-# 4. Upload smarter sentiment rows back to Railway.
-python scripts/upload_sentiment.py --url $Url --token $Token --file datasets/latest_news_sentiment.jsonl.gz
-
-# 5. Rebuild compact training rows so they use the uploaded sentiment scores, then export/train.
-Invoke-RestMethod -Method Post -Uri "$Url/api/training/build-dataset" `
-  -Headers @{"x-admin-token"=$Token;"Content-Type"="application/json"} `
-  -Body '{"symbols":["BTCUSDT","ETHUSDT"],"days":14,"max_rows_per_symbol":5000,"stride":5,"backfill":false,"export":false}'
-
-python scripts/download_dataset.py --url $Url --token $Token --since-date 2026-06-24 --no-auto-build-labels --output datasets/latest.csv.gz
-python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type sklearn_hist_gradient_boosting --target target_trade_quality_score
+# 4. Train/package an uploaded-model candidate from the prepared dataset.
+python scripts/train_best_model.py `
+  --dataset local_data/processed/YOUR_DATASET.csv.gz `
+  --out-dir models --model-types sklearn_hist_gradient_boosting
 ```
 
-This loop can be repeated: collect more data on Railway, download raw news/dataset again, score/train on your laptop, upload a new candidate model, activate only after metrics look good.
+This loop can be repeated: collect more data on Railway, download it again, prepare and
+train on the laptop, upload a new challenger, then use shadow/sandbox and explicit
+manual promotion. The current checkout does not contain the older
+`download_raw_news.py`, `score_news_local.py`, or `upload_sentiment.py` wrappers.
 
 Simple laptop data-factory workflow:
 
@@ -378,21 +423,27 @@ Railway should be treated as a temporary collector, not your long-term warehouse
 $Url = "https://anataai-trader-production.up.railway.app"
 $Token = "YOUR_ADMIN_TOKEN"
 
-# Download raw news, labeled training dataset, and a collection report into local_data/YYYYMMDD_HHMMSS/.
-python scripts/sync_laptop_data.py --url $Url --token $Token --since-date 2026-06-24
+# Download verified training-useful daily files into the permanent local archive.
+python scripts/download_raw_data.py --url $Url --token $Token `
+  --finished-only --daily-files --training-only --output-dir local_data/raw_days
 
-# Same download, then compact Railway only after the files are written successfully.
-python scripts/sync_laptop_data.py --url $Url --token $Token --since-date 2026-06-24 --clear-railway-after-download --railway-keep-days 7
+# Same download, then delete matching finished Railway rows only after verification.
+python scripts/download_raw_data.py --url $Url --token $Token `
+  --finished-only --daily-files --training-only --output-dir local_data/raw_days `
+  --cleanup-after-download --delete-railway-db-rows
 ```
 
-The sync folder contains:
+The downloaded ZIPs contain the selected raw tables and manifest. Depending on the
+selected export, useful files include:
 
 - `training_dataset.csv.gz` for local model training.
 - `raw_news.csv.gz` for heavier local news-to-number processing.
 - `collection_report_before.json` showing what Railway collected.
 - `manifest.json` with file sizes, row counts, export IDs, and cleanup result.
 
-Use `local_data/` as your laptop data lake. Keep every dated folder. When training, combine the older local datasets with the newest download so the model learns from all history while Railway only stores recent working data.
+Use `local_data/` as your laptop data lake. Keep every dated file. When training,
+combine older local data with the newest verified download while Railway keeps only
+its intended operational window.
 
 To see what Railway is collecting right now:
 
@@ -410,23 +461,25 @@ Railway can package useful training data into one folder per UTC day. A complete
 $Url = "https://anataai-trader-production.up.railway.app"
 $Token = "YOUR_ADMIN_TOKEN"
 
-# Download all useful training history into local_data/daily_bundles/.
-python scripts/sync_daily_bundles.py --url $Url --token $Token --all-data --preset training
+# Download training-useful history as one verified ZIP per UTC day.
+python scripts/download_raw_data.py --url $Url --token $Token `
+  --use-all-data --daily-files --training-only --output-dir local_data/raw_days
 
 # Download, then delete finished Railway data. Today's unfinished day remains collecting.
-python scripts/sync_daily_bundles.py --url $Url --token $Token --all-data --preset training --delete-finished-from-railway
+python scripts/download_raw_data.py --url $Url --token $Token `
+  --finished-only --daily-files --training-only --output-dir local_data/raw_days `
+  --cleanup-after-download --delete-railway-db-rows
 
 # Full database-style snapshot for backup/research, not the normal training input.
-python scripts/sync_daily_bundles.py --url $Url --token $Token --all-data --preset all
+python scripts/download_raw_data.py --url $Url --token $Token `
+  --use-all-data --daily-files --output-dir local_data/raw_days_full
 
 # If Railway returns 502 during bundle build, wait for redeploy and try smaller first:
-python scripts/sync_daily_bundles.py --url $Url --token $Token --days 1
-
-# If it still fails, compact Railway first and build only the compact training-useful tables:
-python scripts/sync_daily_bundles.py --url $Url --token $Token --days 1 --compact-first
+python scripts/download_raw_data.py --url $Url --token $Token `
+  --date 2026-06-26 --training-only --output datasets/raw_2026-06-26.zip
 ```
 
-The normal `--preset training` bundle contains only useful training data:
+The normal `--training-only` archive contains only useful training data:
 
 - `candles.csv.gz` closed training-quality candles.
 - `news_articles.csv.gz` raw news for local news AI.
@@ -435,17 +488,19 @@ The normal `--preset training` bundle contains only useful training data:
 - `training_features.csv.gz` compact numeric feature/label rows.
 - `experience_buffer.csv.gz` compact action-result/reward memory.
 
-`--preset all` includes extra operational tables too, such as debug features, AI decisions, trades, equity, positions, model versions, and training runs. Use it when you want a full backup, but train primarily from the `training` preset because it avoids wasting space on rows the model cannot learn much from.
+Omitting `--training-only` includes extra operational tables too, such as debug
+features, AI decisions, trades, equity, positions, model versions, and training runs.
+Use that for a fuller backup, but train primarily from the compact training export.
 
 Recommended normal loop:
 
 1. Railway collects nonstop.
-2. Download daily bundles to your PC.
-3. Delete finished Railway data, keep unfinished day.
+2. Download verified daily raw files to your PC.
+3. Optionally delete matching finished Railway rows, keeping the unfinished day.
 4. Train locally using all folders in `local_data/daily_bundles/`.
 5. Upload model package as candidate.
-6. Activate the model.
-7. Choose `Bot` or `Trained AI` in the dashboard paper runner. Both modes still collect data for later training.
+6. Run it in shadow or an isolated paper sandbox.
+7. Promote manually only after review; the default V2 runner remains paper-only.
 
 Data lifecycle rules:
 
@@ -500,26 +555,28 @@ Train and package the best local model:
 python scripts/train_best_model.py --dataset datasets/processed/YOUR_PROCESSED_DATASET.csv.gz --target target_trade_quality_score
 ```
 
-Run the full one-command pipeline:
+Run the available explicit pipeline (there is no one-command wrapper in this checkout):
 
 ```powershell
-python scripts/run_full_training_pipeline.py `
-  --url $Url `
-  --token $Token `
-  --since-date 2026-06-26 `
-  --output-dir datasets/pipeline_runs `
-  --activate-if-pass `
-  --start-paper-trader-if-pass
+python scripts/download_raw_data.py --url $Url --token $Token `
+  --finished-only --daily-files --training-only --output-dir local_data/raw_days
+python scripts/prepare_training_data.py --input local_data/raw_days `
+  --output-dir local_data/processed --news-converter smart
+python scripts/train_best_model.py `
+  --dataset local_data/processed/YOUR_DATASET.csv.gz `
+  --out-dir models --model-types sklearn_hist_gradient_boosting
 ```
 
-Upload and activate manually if you trained separately:
+Upload as a challenger, then use the V2 shadow/sandbox/manual-promotion endpoints:
 
 ```powershell
 python scripts/upload_model.py --url $Url --token $Token --package models/model_package_VERSION.zip
-python scripts/activate_model.py --url $Url --token $Token --model-id MODEL_ID
+Invoke-RestMethod -Method Post "$Url/api/v2/models/123/shadow" `
+  -Headers @{"x-admin-token"=$Token;"Content-Type"="application/json"} `
+  -Body '{"reason":"technical review complete","confirm":true}'
 ```
 
-Start the paper trader after activation:
+Start the paper trader only after reviewing fresh data, risk limits, and a V2 trace:
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri "$Url/api/auto-trader/start" -Headers @{"x-admin-token"=$Token}
@@ -535,13 +592,18 @@ Invoke-RestMethod -Method Post -Uri "$Url/api/raw-data/export" -Headers @{"x-adm
 Safety rules:
 
 - All trading remains paper-only.
-- Failed models are uploaded/activated only if you explicitly force the workflow; default scripts do not activate failed models.
+- Upload creates a challenger only. Shadow, sandbox, and champion promotion are
+  separate explicit actions; no training script promotes a model.
 - The local converter prevents future leakage by using only news/external context published before each training row time.
 - Heavy model training stays on your PC; Railway does not need heavy training dependencies by default.
 
 ## Training Workflow
 
-Features are stored as versioned JSON payloads. The current schema is `price-news-market-v4`; `price-news-v3`, `price-news-v2`, and `price-news-v1` remain available for older models. Missing future values default to `0` or `null` so older models keep running when new data sources are added.
+Features are stored as versioned JSON payloads. The current schema is
+`price-news-market-v5`; v4, v3, v2, and v1 remain available for older models. V5 also
+carries explicit point-in-time/external-context metadata outside the numeric vector.
+Missing optional values remain explicit in metadata; compatibility extraction fills
+older numeric columns with their registered defaults.
 
 `price-news-v3` adds public trader-flow features:
 
@@ -553,7 +615,7 @@ Features are stored as versioned JSON payloads. The current schema is `price-new
 - combined `trader_crowd_score`
 - combined `crowd_risk_score`
 
-`price-news-market-v4` keeps all v3 columns and adds:
+`price-news-market-v4` and the compatible v5 numeric vector keep all v3 columns and add:
 
 - fear/greed value and 1d change
 - prompt-compatible aliases such as `fear_greed_change_24h`, `market_cap_change_24h`, `usdt_deviation`, and `stablecoin_supply_change_24h`
@@ -659,38 +721,32 @@ $Headers = @{
 # 1. Build labels first so export does not spend the whole request doing heavy label work.
 Invoke-RestMethod -Method Post -Uri "$Url/api/training/build-labels" -Headers $Headers -Body "{}"
 
-# 2. Export a date range and only print the dataset_id. Use a recent since_date if Railway is slow.
-$DatasetId = python scripts/download_dataset.py --url $Url --token $Token --since-date 2026-06-24 --no-auto-build-labels --timeout 600 --export-only
-$DatasetId
+# 2. Download verified training-useful raw data.
+python scripts/download_raw_data.py --url $Url --token $Token `
+  --finished-only --daily-files --training-only --output-dir local_data/raw_days
 
-# Optional full export after compaction/labeling:
-# $DatasetId = python scripts/download_dataset.py --url $Url --token $Token --use-all-data --no-auto-build-labels --timeout 900 --export-only
+# 3. Prepare point-in-time numeric data locally.
+python scripts/prepare_training_data.py --input local_data/raw_days `
+  --output-dir local_data/processed --news-converter smart
 
-# 3. Download by dataset_id. This can be retried without creating another export.
-python scripts/download_dataset.py --url $Url --token $Token --dataset-id $DatasetId --output datasets/latest.csv.gz --timeout 600
+# 4. Train/evaluate candidate model types and create a package.
+python scripts/train_best_model.py `
+  --dataset local_data/processed/YOUR_DATASET.csv.gz `
+  --out-dir models `
+  --model-types sklearn_hist_gradient_boosting,random_forest,lightgbm,xgboost
 
-# 4. Train locally.
-python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type sklearn_hist_gradient_boosting --target target_trade_quality_score
-
-python scripts/train_local_model.py --dataset datasets/latest.csv.gz --model-type lightgbm --target target_trade_quality_score
-
-python scripts/evaluate_local_model.py --dataset datasets/latest.csv.gz --model models/YOUR_MODEL.joblib
-
-# 5. Package, upload as candidate, then activate only after checking metrics.
-python scripts/package_model.py --model models/YOUR_MODEL.joblib
-
-python scripts/upload_model.py --url $Url --token $Token --package model_package_VERSION.zip
-
-python scripts/activate_model.py --url $Url --token $Token --model-id MODEL_ID
+# 5. Upload as a challenger. Shadow/sandbox/promotion remain separate explicit steps.
+python scripts/upload_model.py --url $Url --token $Token `
+  --package models/model_package_VERSION.zip
 ```
 
-For large Railway datasets, `scripts/download_dataset.py` supports:
+For large Railway datasets, `scripts/download_raw_data.py` supports bounded exports:
 
 ```powershell
-python scripts/download_dataset.py --url $Url --token $Token --since-date 2026-06-24 --timeout 600
-python scripts/download_dataset.py --url $Url --token $Token --use-all-data --timeout 900
-python scripts/download_dataset.py --url $Url --token $Token --since-date 2026-06-24 --export-only
-python scripts/download_dataset.py --url $Url --token $Token --dataset-id anata_dataset_YYYYMMDD_HHMMSS.csv.gz --output datasets/latest.csv.gz
+python scripts/download_raw_data.py --url $Url --token $Token --since-date 2026-06-24 --training-only --timeout 600
+python scripts/download_raw_data.py --url $Url --token $Token --use-all-data --training-only --timeout 900
+python scripts/download_raw_data.py --url $Url --token $Token --date 2026-06-26 --training-only --output datasets/raw_2026-06-26.zip
+python scripts/download_raw_data.py --url $Url --token $Token --finished-only --daily-files --training-only --output-dir local_data/raw_days
 ```
 
 If export times out, build labels first, run DB compact from the dashboard/Data tab, or retry with a smaller `--since-date` range.
@@ -702,18 +758,22 @@ Supported local model types:
 - `lightgbm` if installed locally
 - `xgboost` if installed locally
 
-If LightGBM or XGBoost fails to install/import on Windows, use `--model-type sklearn_hist_gradient_boosting`; the local scripts will print a clear message and keep the sklearn path available.
+If LightGBM or XGBoost fails to install/import on Windows, use
+`--model-types sklearn_hist_gradient_boosting`; the local script keeps the sklearn path
+available.
 
-Uploaded models are registered as `candidate` first. Activate only after checking metrics:
+Uploaded models are registered as challengers first. Promote only through the
+confirmed V2 endpoint after reviewing compatibility and evidence:
 
 ```powershell
-curl -X POST https://your-app.up.railway.app/api/models/activate `
+curl -X POST https://your-app.up.railway.app/api/v2/models/123/promote `
   -H "x-admin-token: YOUR_ADMIN_TOKEN" `
   -H "Content-Type: application/json" `
-  -d "{\"model_id\":\"MODEL_ID_FROM_UPLOAD\"}"
-
-python scripts/activate_model.py --url https://anataai-trader-production.up.railway.app --token YOUR_ADMIN_TOKEN --model-id MODEL_ID
+  -d "{\"model_family\":\"alpha.short_horizon_momentum\",\"symbol_scope\":\"BTCUSDT\",\"reason\":\"manual review completed\",\"confirm\":true}"
 ```
+
+`scripts/activate_model.py` and `/api/models/activate` remain deprecated legacy
+compatibility wrappers; new operations should use the V2 lifecycle API.
 
 Model endpoints:
 
@@ -725,7 +785,9 @@ curl -H "x-admin-token: YOUR_ADMIN_TOKEN" https://your-app.up.railway.app/api/mo
 
 Every saved model records `model_id`, `version`, `feature_schema_version`, `feature_columns`, `created_at`, metrics, model type, and training dataset hash. Old models are kept in `model_versions`; new models can use a larger feature list while old models keep reading only the columns they were trained on.
 
-The auto trader loads only the active model. If the active model is missing or incompatible, it falls back to the rule-based strategy and reports the fallback reason in status/diagnostics.
+With `ANATA_V2_ENABLED=true`, the auto trader runs the mandatory deterministic narrow
+pipeline. A registry assignment alone does not silently wire an arbitrary legacy
+artifact into a narrow family; verify the actual prediction/model IDs in Vision.
 
 ## Replay And Future Data
 
@@ -762,35 +824,24 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
 Set environment variables in Railway:
 
-- `DATABASE_URL`
-- `TRADING_MODE=paper`
-- `ADMIN_TOKEN=long_random_secret`
-- `ENABLE_SERVER_TRAINING=false`
-- `ENABLE_SERVER_INFERENCE=true`
-- `BINANCE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
-- `AUTO_TRADER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,LTCUSDT`
-- `AUTO_TRADER_USE_TRAINED_MODEL=true`
-- `DERIVATIVES_ENABLED=true`
-- `ENABLE_DERIVATIVES_COLLECTOR=true` if you want trader-flow data to run automatically
-- `PAPER_FEE_RATE=0.0004`
-- `PAPER_MIN_LEVERAGE=1`
-- `PAPER_MAX_LEVERAGE=125`
-- `PAPER_CONFIDENCE_LEVERAGE_ENABLED=true`
-- `RISK_MAX_TRADE_SIZE_PCT=0.50`
-- `RISK_MAX_ENTRY_FEE_PCT_OF_EQUITY=0.01`
-- `STORE_MARKET_TICKS=false`
-- `STRATEGY_MIN_EDGE_AFTER_FEES=0.001`
-- `AUTO_MIN_HOLD_SECONDS=900`
-- `AUTO_TAKE_PROFIT_MIN_HOLD_SECONDS=0`
-- `AUTO_FAST_PROFIT_EXIT_PCT=0.006`
-- `AUTO_POSITION_MAX_LOSS_PCT=0.10`
-- `AUTO_DEFAULT_STOP_LOSS_PCT=0.01`
-- `NEWS_PROVIDER=rss,gdelt,newsapi`
-- `RSS_NEWS_ENABLED=true`
-- `GDELT_ENABLED=true`
-- `NEWSAPI_ENABLED=false`
-- `NEWS_API_KEY` only if using NewsAPI fallback
-- risk settings such as `RISK_MAX_TRADE_SIZE_PCT`
+- `DATABASE_URL` from Railway PostgreSQL.
+- `ADMIN_TOKEN=long_random_secret` (or dashboard username/password).
+- `TRADING_MODE=paper`.
+- `WORKER_ROLE=all` for one service, or split `web`, `collector`, `enrichment`, and
+  `paper-trader` roles across services sharing the same database.
+- `ANATA_V2_ENABLED=true` and `V2_AUTO_PROMOTE_CHAMPION=false`.
+- `AUTO_TRADER_ENABLED=false` until a fresh-data/risk/trace check passes.
+- `ENABLE_SERVER_TRAINING=false`, `RESEARCH_ENABLED=false`, and
+  `RESEARCH_AUTO_PROMOTE=false`.
+- `EXTERNAL_AI_ENABLED=false` unless a bounded optional provider is intentionally
+  configured.
+- `STORE_MARKET_TICKS=false`.
+- Safe exposure/leverage pins such as `PAPER_MAX_LEVERAGE=3`,
+  `V2_MAX_POSITION_LEVERAGE=3`, `RISK_MAX_PORTFOLIO_LEVERAGE=3`,
+  `RISK_MAX_TRADE_SIZE_PCT=0.10`, and `V2_MAX_GROSS_EXPOSURE_PCT=0.40`.
+
+See `docs/RAILWAY_VARIABLES.md` and `RAILWAY_DEPLOY.md`; do not paste every code
+default or any private exchange credential into Railway.
 
 ## Safety Boundaries
 
