@@ -21,6 +21,28 @@ def _aware(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+# A deliberately small, deterministic baseline grouping. This is a final risk backstop,
+# not a claim that assets inside a group always have stable correlations. Research may
+# later supply a versioned dynamic mapping, but an upstream portfolio bug must not remove
+# the independent cluster cap in the meantime.
+_SYMBOL_CLUSTERS: dict[str, str] = {
+    "BTCUSDT": "proof_of_work_majors",
+    "LTCUSDT": "proof_of_work_majors",
+    "ETHUSDT": "smart_contract_platforms",
+    "SOLUSDT": "smart_contract_platforms",
+    "BNBUSDT": "smart_contract_platforms",
+    "ADAUSDT": "smart_contract_platforms",
+    "AVAXUSDT": "smart_contract_platforms",
+    "XRPUSDT": "payments",
+    "DOGEUSDT": "meme_assets",
+    "LINKUSDT": "oracle_infrastructure",
+}
+
+
+def _cluster_for_symbol(symbol: str) -> str:
+    return _SYMBOL_CLUSTERS.get(symbol.upper(), symbol.upper())
+
+
 @dataclass(frozen=True)
 class MarketSnapshot:
     symbol: str
@@ -49,6 +71,8 @@ class RiskInputs:
     current_gross_exposure: float = 0.0
     current_net_exposure: float = 0.0
     now: datetime | None = None
+    simulation_healthy: bool = True
+    spread_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +93,8 @@ class RiskPolicy:
     min_liquidity_score: float
     kill_switch_enabled: bool
     configuration_version: str
+    max_cluster_exposure_pct: float = 0.25
+    max_spread_pct: float = 0.005
 
     @classmethod
     def from_settings(cls) -> "RiskPolicy":
@@ -89,14 +115,16 @@ class RiskPolicy:
             min_liquidity_score=max(min(settings.v2_min_liquidity_score, 1.0), 0.0),
             kill_switch_enabled=settings.risk_kill_switch_enabled,
             configuration_version=settings.risk_configuration_version,
+            max_cluster_exposure_pct=max(settings.v2_max_cluster_exposure_pct, 0.0),
+            max_spread_pct=max(settings.risk_max_spread_pct, 0.0),
         )
 
 
 class PortfolioRiskEngine:
     """Apply all global controls to every exposure-increasing V2 proposal.
 
-    Model outputs have no sizing authority.  This engine chooses a safe leverage and
-    may resize a valid target, then records an immutable decision.  It has no import
+    Model outputs have no sizing authority. This engine chooses a safe leverage and
+    may resize a valid target, then records an immutable decision. It has no import
     of the paper engine, so execution cannot influence risk policy.
     """
 
@@ -133,6 +161,14 @@ class PortfolioRiskEngine:
                 upper = policy.max_net_exposure_pct - (inputs.current_net_exposure - current)
                 lower = -policy.max_net_exposure_pct - (inputs.current_net_exposure - current)
                 approved = min(max(approved, lower), upper)
+            approved = self._apply_cluster_cap(
+                target.symbol,
+                current=current,
+                approved=approved,
+                inputs=inputs,
+                triggered=triggered,
+                policy=policy,
+            )
             if abs(approved) > policy.max_margin_allocation_pct:
                 triggered.append("MAX_MARGIN_ALLOCATION")
                 approved = math.copysign(policy.max_margin_allocation_pct, approved)
@@ -140,7 +176,8 @@ class PortfolioRiskEngine:
                 rejection.append("MAX_EXPECTED_TRANSACTION_COST")
             if inputs.equity <= 0 or inputs.cash_balance <= 0:
                 rejection.append("NO_AVAILABLE_PAPER_EQUITY")
-            if abs(approved - current) * max(inputs.equity, 0.0) < settings.min_paper_trade_notional and abs(approved - current) > 1e-12:
+            minimum_notional = float(getattr(settings, "min_paper_trade_notional", 0.0))
+            if abs(approved - current) * max(inputs.equity, 0.0) < minimum_notional and abs(approved - current) > 1e-12:
                 rejection.append("BELOW_MINIMUM_PAPER_NOTIONAL")
             approved = self._apply_fee_cap(current, approved, inputs, triggered, policy=policy)
             if abs(approved - current) <= 1e-12 and abs(requested - current) > 1e-12:
@@ -191,11 +228,14 @@ class PortfolioRiskEngine:
             created_at=decision.created_at,
             payload={
                 "symbol": target.symbol,
+                "cluster": _cluster_for_symbol(target.symbol),
                 "market_price": inputs.market.price,
                 "market_observed_at": _aware(inputs.market.observed_at).isoformat() if _aware(inputs.market.observed_at) else None,
                 "cash_balance": inputs.cash_balance,
                 "equity": inputs.equity,
                 "expected_cost": inputs.expected_cost,
+                "spread_pct": self._spread_pct(inputs),
+                "simulation_healthy": inputs.simulation_healthy,
                 "model_health": inputs.model_health.value,
                 "signal_health": inputs.signal_health.value,
             },
@@ -219,6 +259,9 @@ class PortfolioRiskEngine:
         if inputs.confidence < policy.min_confidence:
             triggered.append("MIN_CONFIDENCE")
             rejection.append("CONFIDENCE_BELOW_MINIMUM")
+        if not inputs.simulation_healthy:
+            triggered.append("SIMULATION_HEALTH")
+            rejection.append("PAPER_EXECUTION_SIMULATION_UNHEALTHY")
         observed = _aware(inputs.market.observed_at)
         if inputs.market.price <= 0 or observed is None:
             triggered.append("MARKET_DATA")
@@ -229,6 +272,13 @@ class PortfolioRiskEngine:
         elif observed > now + timedelta(seconds=5):
             triggered.append("FUTURE_DATA")
             rejection.append("FUTURE_MARKET_DATA")
+        spread = self._spread_pct(inputs)
+        if spread is None or not math.isfinite(spread) or spread < 0:
+            triggered.append("SPREAD_DATA")
+            rejection.append("INVALID_SPREAD_DATA")
+        elif policy.max_spread_pct > 0 and spread > policy.max_spread_pct:
+            triggered.append("MAX_SPREAD")
+            rejection.append("MAX_SPREAD_EXCEEDED")
         if inputs.required_features_missing:
             triggered.append("MISSING_REQUIRED_FEATURES")
             rejection.append("MISSING_REQUIRED_FEATURES")
@@ -255,7 +305,6 @@ class PortfolioRiskEngine:
         open_count = self.session.scalar(
             select(func.count(Position.id)).where(Position.status == "OPEN", Position.paper_account_id == inputs.account_id)
         ) or 0
-        # It is only a new position if there is no open row for the target symbol.
         current_symbol = self.session.scalar(
             select(Position.id).where(
                 Position.status == "OPEN", Position.paper_account_id == inputs.account_id, Position.symbol == inputs.market.symbol.upper()
@@ -264,6 +313,72 @@ class PortfolioRiskEngine:
         if current_symbol is None and open_count >= policy.max_open_positions:
             triggered.append("MAX_OPEN_POSITIONS")
             rejection.append("MAX_OPEN_POSITIONS_REACHED")
+
+    def _apply_cluster_cap(
+        self,
+        symbol: str,
+        *,
+        current: float,
+        approved: float,
+        inputs: RiskInputs,
+        triggered: list[str],
+        policy: RiskPolicy,
+    ) -> float:
+        if policy.max_cluster_exposure_pct <= 0:
+            return 0.0
+        cluster_without_symbol = self._cluster_exposure_without_symbol(inputs.account_id, symbol, inputs.equity)
+        room = max(policy.max_cluster_exposure_pct - cluster_without_symbol, 0.0)
+        if abs(approved) > room:
+            triggered.append("MAX_CORRELATED_CLUSTER_EXPOSURE")
+            approved = math.copysign(room, approved)
+        return approved
+
+    def _cluster_exposure_without_symbol(self, account_id: str, symbol: str, equity: float) -> float:
+        if equity <= 0:
+            return 0.0
+        normalized = symbol.upper()
+        cluster = _cluster_for_symbol(normalized)
+        rows = self.session.scalars(
+            select(Position).where(
+                Position.paper_account_id == account_id,
+                Position.status == "OPEN",
+                Position.symbol != normalized,
+            )
+        )
+        total_notional = 0.0
+        for row in rows:
+            if _cluster_for_symbol(row.symbol) != cluster:
+                continue
+            notional = float(row.notional or 0.0)
+            if notional <= 0:
+                price = float(row.current_price or row.entry_price or 0.0)
+                notional = abs(float(row.quantity or 0.0) * price)
+            if math.isfinite(notional) and notional > 0:
+                total_notional += abs(notional)
+        return total_notional / equity
+
+    def _spread_pct(self, inputs: RiskInputs) -> float | None:
+        if inputs.spread_pct is not None:
+            try:
+                return float(inputs.spread_pct)
+            except (TypeError, ValueError):
+                return None
+        bid, ask = inputs.market.bid, inputs.market.ask
+        if bid is not None and ask is not None:
+            try:
+                bid_value, ask_value = float(bid), float(ask)
+            except (TypeError, ValueError):
+                return None
+            midpoint = (bid_value + ask_value) / 2.0
+            if midpoint <= 0 or ask_value < bid_value:
+                return None
+            return (ask_value - bid_value) / midpoint
+        # The simulator's configured spread is the deterministic fallback when no live
+        # bid/ask snapshot is available. Missing spread is never silently treated as zero.
+        try:
+            return float(getattr(settings, "paper_simulated_spread_pct", 0.0))
+        except (TypeError, ValueError):
+            return None
 
     def _apply_fee_cap(
         self,
@@ -275,11 +390,9 @@ class PortfolioRiskEngine:
         policy: RiskPolicy,
     ) -> float:
         delta = abs(approved - current)
-        # Portfolio exposure is already a notional/equity fraction. Leverage only
-        # determines the margin reserved by the paper ledger; multiplying here would
-        # apply leverage twice and violate the approved symbol/gross/net exposure.
         notional = delta * max(inputs.equity, 0.0)
-        fee = notional * max(settings.paper_fee_rate, 0.0)
+        fee_rate = max(float(getattr(settings, "paper_fee_rate", 0.0)), 0.0)
+        fee = notional * fee_rate
         cap = max(inputs.equity, 0.0) * policy.max_entry_fee_pct_of_equity
         if fee <= cap or fee <= 0:
             return approved
@@ -303,9 +416,6 @@ class PortfolioRiskEngine:
         latest = self.session.scalar(
             select(AccountEquity).where(AccountEquity.paper_account_id == account_id).order_by(desc(AccountEquity.timestamp)).limit(1)
         )
-        # Older paper rows stored drawdown as a negative return from the peak. New
-        # rows store the conventional positive loss fraction. Accept both during the
-        # additive migration period so historical risk cannot silently disappear.
         return abs(float(latest.drawdown or 0.0)) if latest else 0.0
 
     def _cooldown_active(self, account_id: str, equity: float, now: datetime, *, policy: RiskPolicy) -> bool:
@@ -329,11 +439,7 @@ class PortfolioRiskEngine:
         return bool(state and state.enabled)
 
     def _policy_for_account(self, account_id: str) -> tuple[RiskPolicy, float | None]:
-        """Apply a registered sandbox's persisted exposure ceiling independently.
-
-        The account row is the authority for sandbox isolation. A caller cannot gain
-        champion limits merely by invoking the ordinary pipeline with a sandbox id.
-        """
+        """Apply a registered sandbox's persisted exposure ceiling independently."""
         sandbox = self.session.scalar(
             select(PaperSandboxAccount)
             .where(PaperSandboxAccount.account_id == account_id)
@@ -353,12 +459,17 @@ class PortfolioRiskEngine:
                 max_symbol_exposure_pct=min(self.policy.max_symbol_exposure_pct, cap),
                 max_gross_exposure_pct=min(self.policy.max_gross_exposure_pct, cap),
                 max_net_exposure_pct=min(self.policy.max_net_exposure_pct, cap),
+                max_cluster_exposure_pct=min(self.policy.max_cluster_exposure_pct, cap),
             ),
             cap,
         )
 
     @staticmethod
     def _increases_exposure(current: float, requested: float) -> bool:
-        if abs(requested) <= abs(current) and (current == 0 or requested == 0 or math.copysign(1.0, requested) == math.copysign(1.0, current)):
+        if abs(requested) <= abs(current) and (
+            current == 0
+            or requested == 0
+            or math.copysign(1.0, requested) == math.copysign(1.0, current)
+        ):
             return False
         return abs(requested) > 1e-12
