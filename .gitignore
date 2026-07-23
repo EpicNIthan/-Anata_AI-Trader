@@ -1,14 +1,40 @@
 __pycache__/
 *.py[cod]
 .env
+.env.*
+!.env.example
 .venv/
 venv/
-trading_lab.db
-_smoke_trading_lab.db
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local databases and smoke-test output
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+_smoke_*
+_v2_*smoke*
+ci_trading_lab.db
+
+# Runtime logs and generated reports
+*.log
+uvicorn*.log
+research_reports/
+
+# Local datasets, registries, and trained artifacts
 models/
+models1/
+model_registry/
 datasets/
 finished_data/
 local_data/
-.pytest_cache/
-*.log
-uvicorn*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
