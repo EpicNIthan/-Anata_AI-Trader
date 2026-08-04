@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, JSON, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -250,6 +250,34 @@ class ModelVersion(Base):
     retirement_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ModelArtifactBlob(Base):
+    """Immutable durable bytes for one registered model version.
+
+    ``ModelVersion.path`` remains useful as an origin/audit hint, while runtime roles
+    can reconstruct the exact artifact from this database row when their container
+    does not share the uploader's filesystem.
+    """
+
+    __tablename__ = "model_artifact_blobs"
+    __table_args__ = (
+        UniqueConstraint("model_version_id", name="uq_model_artifact_blobs_model_version"),
+        Index("ix_model_artifact_blobs_sha256", "sha256"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    model_version_id: Mapped[int] = mapped_column(
+        ForeignKey("model_versions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -794,6 +822,14 @@ class ModelHealthSnapshot(Base):
     feature_drift: Mapped[float | None] = mapped_column(Float, nullable=True)
     ood_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     missing_feature_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    live_shadow_divergence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transaction_cost_increase: Mapped[float | None] = mapped_column(Float, nullable=True)
+    signal_correlation_increase: Mapped[float | None] = mapped_column(Float, nullable=True)
+    regime_dependence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    capacity_decline: Mapped[float | None] = mapped_column(Float, nullable=True)
+    consecutive_errors: Mapped[int] = mapped_column(Integer, default=0)
+    recommended_weight_multiplier: Mapped[float] = mapped_column(Float, default=1.0)
+    recommended_action: Mapped[str] = mapped_column(String(64), default="NORMAL_WEIGHT")
     reason_codes: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -801,7 +837,10 @@ class ModelHealthSnapshot(Base):
 
 class SignalHealthSnapshot(Base):
     __tablename__ = "signal_health_snapshots"
-    __table_args__ = (Index("ix_signal_health_signal_time", "signal_family", "observed_at"),)
+    __table_args__ = (
+        Index("ix_signal_health_signal_time", "signal_family", "observed_at"),
+        Index("ix_signal_health_symbol_family_time", "symbol", "signal_family", "observed_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     signal_family: Mapped[str] = mapped_column(String(128), index=True)
@@ -809,8 +848,19 @@ class SignalHealthSnapshot(Base):
     health_status: Mapped[str] = mapped_column(String(32), default="HEALTHY", index=True)
     rolling_information_coefficient: Mapped[float | None] = mapped_column(Float, nullable=True)
     rolling_net_expectancy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calibration_error: Mapped[float | None] = mapped_column(Float, nullable=True)
+    prediction_drift: Mapped[float | None] = mapped_column(Float, nullable=True)
+    feature_drift: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ood_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    missing_feature_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    live_shadow_divergence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transaction_cost_increase: Mapped[float | None] = mapped_column(Float, nullable=True)
     correlation_increase: Mapped[float | None] = mapped_column(Float, nullable=True)
+    regime_dependence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    capacity_decline: Mapped[float | None] = mapped_column(Float, nullable=True)
     consecutive_errors: Mapped[int] = mapped_column(Integer, default=0)
+    recommended_weight_multiplier: Mapped[float] = mapped_column(Float, default=1.0)
+    recommended_action: Mapped[str] = mapped_column(String(64), default="NORMAL_WEIGHT")
     reason_codes: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

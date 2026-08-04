@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import json
 import sys
@@ -47,11 +48,22 @@ def read_research_rows(path: Path) -> list[dict[str, Any]]:
 
     if not path.is_file():
         raise FileNotFoundError(f"Input does not exist: {path}")
-    suffix = path.suffix.lower()
+    suffixes = [item.lower() for item in path.suffixes]
+    compressed = bool(suffixes and suffixes[-1] == ".gz")
+    suffix = suffixes[-2] if compressed and len(suffixes) >= 2 else path.suffix.lower()
     if suffix == ".csv":
-        with path.open("r", encoding="utf-8", newline="") as handle:
+        handle_context = (
+            gzip.open(path, "rt", encoding="utf-8", newline="")
+            if compressed
+            else path.open("r", encoding="utf-8", newline="")
+        )
+        with handle_context as handle:
             return [{key: _coerce_value(value) for key, value in row.items()} for row in csv.DictReader(handle)]
-    raw = path.read_text(encoding="utf-8")
+    if compressed:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            raw = handle.read()
+    else:
+        raw = path.read_text(encoding="utf-8")
     if suffix == ".json":
         parsed = json.loads(raw)
         if not isinstance(parsed, list) or not all(isinstance(item, Mapping) for item in parsed):

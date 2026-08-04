@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,9 @@ from app.pipeline.domain import FeatureSnapshot
 from app.research import ResearchValidationError
 from scripts.manage_model_registry import _artifact_contract, _columns_from_payload, build_parser
 from scripts.run_worker import normalize_role
-from scripts.train_narrow_return_model import train_artifact
+from scripts.research_utils import read_research_rows
+from scripts.train_narrow_return_model import _dataset_schema_version, _infer_features, train_artifact
+from scripts.upload_model import upload_package
 
 
 class OperationalScriptTests(unittest.TestCase):
@@ -154,6 +157,109 @@ class OperationalScriptTests(unittest.TestCase):
 
     def test_worker_role_alias_is_normalized(self) -> None:
         self.assertEqual(normalize_role("paper_trader"), "paper-trader")
+
+    def test_gzip_csv_and_training_serving_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "prepared.csv.gz"
+            with gzip.open(path, "wt", encoding="utf-8", newline="") as handle:
+                handle.write("as_of,feature_schema_version,price_change,training_feature_id,target_future_return_5m\n")
+                handle.write("2026-01-01T00:00:00+00:00,price-news-market-v5,0.1,99,0.01\n")
+            rows = read_research_rows(path)
+        schema = _dataset_schema_version(rows, None)
+        features = _infer_features(
+            rows,
+            "target_future_return_5m",
+            allowed_features={"price_change"},
+        )
+        self.assertEqual(schema, "price-news-market-v5")
+        self.assertEqual(features, ["price_change"])
+        with self.assertRaisesRegex(ValueError, "does not match dataset schema"):
+            _dataset_schema_version(rows, "price-news-market-v4")
+
+    def test_trainer_drops_unlabeled_tail_rows(self) -> None:
+        rows = self._rows()
+        rows[-1]["actual_return"] = ""
+        artifact = train_artifact(
+            rows=rows,
+            feature_columns=("feature_a", "feature_b"),
+            target_name="actual_return",
+            feature_schema_version="unit-v1",
+            forecast_horizon_seconds=120,
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            alpha=1.0,
+            transaction_cost=0.0,
+            minimum_rows_per_split=5,
+            dataset_version="unit-dataset-v1",
+        )
+        self.assertEqual(artifact["missing_value_policy"]["dropped_unlabeled_rows"], 1)
+
+    def test_upload_helper_uses_header_and_accepts_candidate_only(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            @staticmethod
+            def read() -> bytes:
+                return json.dumps(
+                    {
+                        "status": "candidate",
+                        "model": {"id": 17, "status": "candidate", "lifecycle_state": "TRAINED"},
+                    }
+                ).encode("utf-8")
+
+        def opener(req: object, *, timeout: float) -> Response:
+            captured["request"] = req
+            captured["timeout"] = timeout
+            return Response()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "challenger.zip"
+            package.write_bytes(b"package-bytes")
+            result = upload_package(
+                url="https://anata.example",
+                token="header-secret",
+                package=package,
+                timeout_seconds=9.0,
+                opener=opener,
+            )
+
+        req = captured["request"]
+        self.assertEqual(req.full_url, "https://anata.example/api/models/upload")
+        self.assertEqual(req.get_header("X-admin-token"), "header-secret")
+        self.assertNotIn(b"header-secret", req.data)
+        self.assertEqual(captured["timeout"], 9.0)
+        self.assertEqual(result["model"]["id"], 17)
+
+    def test_upload_helper_rejects_unsafe_url_and_active_response(self) -> None:
+        class ActiveResponse:
+            def __enter__(self) -> "ActiveResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            @staticmethod
+            def read() -> bytes:
+                return b'{"status":"active","model":{"status":"active"}}'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "challenger.zip"
+            package.write_bytes(b"package-bytes")
+            with self.assertRaisesRegex(ValueError, "HTTP\\(S\\)"):
+                upload_package(url="file:///tmp", token="secret", package=package)
+            with self.assertRaisesRegex(ValueError, "non-candidate"):
+                upload_package(
+                    url="https://anata.example",
+                    token="secret",
+                    package=package,
+                    opener=lambda *_args, **_kwargs: ActiveResponse(),
+                )
 
 
 if __name__ == "__main__":

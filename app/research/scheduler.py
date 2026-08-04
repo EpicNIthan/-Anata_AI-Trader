@@ -439,7 +439,10 @@ class ResearchScheduler:
             raise ResearchValidationError(
                 "no evaluator was supplied and snapshot has no loaded rows with prediction/actual_return fields"
             )
-        result = evaluate_observations(snapshot.rows)
+        result = evaluate_observations(
+            snapshot.rows,
+            forecast_horizon_seconds=candidate.forecast_horizon,
+        )
         artifacts = [artifact.artifact_path] if artifact.artifact_path else []
         return make_experiment_report(
             definition,

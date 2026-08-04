@@ -53,9 +53,12 @@ python scripts/run_walk_forward_evaluation.py `
 ## Simulation limits
 
 The research evaluator accepts recorded cost inputs, but it does not infer real market
-microstructure. The current paper simulator applies configurable spread/slippage and an
-optional 50% partial fill. Funding is stored as a field but defaults to zero. Treat
-results as a controlled paper/research estimate, not execution evidence.
+microstructure. The current paper simulator applies configurable spread/slippage and
+optional partial fills. New V2 fills book the configured non-negative funding scenario
+cost into fake cash/PnL and retain signed attribution evidence; legacy fills without
+that evidence remain estimates. Funding defaults to zero and is not a directional,
+periodic venue model. Treat results as a controlled paper/research estimate, not
+execution evidence.
 
 Before promotion, inspect regime slices, cost sensitivity, correlation with existing
 signals, data coverage changes, and the difference between shadow/sandbox and historical

@@ -28,18 +28,25 @@ from app.db.models import (
     TradingSignalRecord,
 )
 from app.features.feature_builder import FeatureBuilder
+from app.features.schema import model_input_columns_for_schema
 from app.pipeline.artifact_models import ArtifactModelError, RegisteredArtifactModel
 from app.pipeline.data_quality import PointInTimeValidator
 from app.pipeline.domain import HealthStatus, ModelLifecycle, ModelPrediction, SignalLifecycle, new_id
 from app.pipeline.ensemble import DeterministicRegimeEnsemble
-from app.pipeline.execution import ExecutionOutcome, PaperExecutionSimulator
+from app.pipeline.execution import ExecutionOutcome, ExecutionResult, PaperExecutionSimulator
 from app.pipeline.monitoring import RollingHealthMonitor
-from app.pipeline.narrow_models import BaselineCostModel, BaselineReliabilityModel, NarrowModel, classify_regime, default_narrow_models
+from app.pipeline.narrow_models import (
+    BaselineCostModel,
+    BaselineReliabilityModel,
+    NarrowModel,
+    classify_regime,
+    default_market_condition_models,
+    default_narrow_models,
+)
 from app.pipeline.portfolio import DeterministicPortfolioConstructor, PortfolioContext
 from app.pipeline.registry import ModelRegistry
 from app.pipeline.risk import MarketSnapshot, PortfolioRiskEngine, RiskInputs
 from app.pipeline.signals import SignalFactory
-from app.trading.paper_engine import ExecutionResult
 
 
 @dataclass(frozen=True)
@@ -84,6 +91,7 @@ class V2PipelineService:
         self.monitor = RollingHealthMonitor(session)
         self.cost_model = BaselineCostModel()
         self.reliability_model = BaselineReliabilityModel()
+        self.condition_models = default_market_condition_models()
         self.signal_factory = SignalFactory(minimum_edge=settings.v2_min_net_edge, ttl_seconds=settings.v2_signal_ttl_seconds)
         self.ensemble = DeterministicRegimeEnsemble(
             minimum_edge=settings.v2_min_net_edge,
@@ -116,7 +124,11 @@ class V2PipelineService:
         candles = list(
             self.session.scalars(
                 select(Candle)
-                .where(Candle.symbol == normalized, Candle.interval == settings.paper_trade_timeframe)
+                .where(
+                    Candle.symbol == normalized,
+                    Candle.interval == settings.paper_trade_timeframe,
+                    Candle.is_closed.is_(True),
+                )
                 .order_by(desc(Candle.open_time))
                 .limit(60)
             )
@@ -124,6 +136,11 @@ class V2PipelineService:
         quality = self.validator.validate_candles(
             reversed(candles),
             interval=settings.paper_trade_timeframe,
+            stale_after_seconds=(
+                settings.risk_max_market_data_age_seconds
+                if settings.risk_require_fresh_data
+                else None
+            ),
         )
         if not quality.valid:
             snapshot = snapshot.model_copy(update={"missing_required_features": [*snapshot.missing_required_features, "DATA_QUALITY"]})
@@ -139,9 +156,70 @@ class V2PipelineService:
                     ["MONITORING_REFRESH_FAILED"],
                     {"error": f"{type(exc).__name__}: {exc}"[:500]},
                 )
-        cost = self.cost_model.estimate(snapshot, fee_rate=settings.paper_fee_rate)
-        reliability, _ = self.reliability_model.confidence(snapshot)
         resolved, resolution_reasons = self._resolve_active_models(normalized, account_id)
+        required_features = sorted(
+            {
+                feature_name
+                for required_set in (
+                    *(item.model.required_features for item in resolved),
+                    *(item.required_features for item in self.condition_models),
+                )
+                for feature_name in required_set
+            }
+        )
+        feature_quality = self.validator.validate_feature_payload(
+            snapshot.values,
+            required_features=required_features,
+            allowed_features=model_input_columns_for_schema(snapshot.schema_version),
+        )
+        missing_contract_features = sorted(
+            {
+                feature_name
+                for issue in feature_quality.issues
+                if issue.code == "MISSING_REQUIRED_FEATURES"
+                for feature_name in issue.context.get("features", [])
+            }
+        )
+        if missing_contract_features:
+            snapshot = snapshot.model_copy(
+                update={
+                    "missing_required_features": sorted(
+                        set(snapshot.missing_required_features) | set(missing_contract_features)
+                    )
+                }
+            )
+        self._timeline(
+            trace_id,
+            "DATA_QUALITY",
+            "VALID" if quality.valid and feature_quality.valid else "REJECTABLE",
+            [
+                *(issue.code for issue in quality.issues),
+                *(issue.code for issue in feature_quality.issues),
+            ] or ["POINT_IN_TIME_DATA_VALID"],
+            {
+                "candle_report": quality.as_dict(),
+                "feature_report": feature_quality.as_dict(),
+                "required_features": required_features,
+            },
+        )
+        cost = self.cost_model.estimate(snapshot, fee_rate=settings.paper_fee_rate)
+        reliability_estimate = self.reliability_model.assess(snapshot)
+        reliability, reliability_uncertainty = self.reliability_model.confidence(snapshot)
+        condition_estimates = [model.classify(snapshot) for model in self.condition_models]
+        self._timeline(
+            trace_id,
+            "MARKET_CONDITIONS",
+            "RECORDED",
+            [reason for item in condition_estimates for reason in item.reason_codes],
+            {
+                "conditions": [asdict(item) for item in condition_estimates],
+                "composite_regime": classify_regime(snapshot.values),
+                "cost": asdict(cost),
+                "reliability": asdict(reliability_estimate),
+                "combined_reliability": reliability,
+                "combined_reliability_uncertainty": reliability_uncertainty,
+            },
+        )
         prediction_inputs: list[tuple[ModelPrediction, HealthStatus, SignalLifecycle]] = []
         inference_errors: list[dict[str, Any]] = []
         for item in resolved:
@@ -222,7 +300,7 @@ class V2PipelineService:
         self._record_ensemble(ensemble, trace_id, ensemble_result.exclusions)
         self._timeline(trace_id, "ENSEMBLE", "RECORDED", ensemble.reason_codes, {"ensemble_decision_id": ensemble.ensemble_decision_id})
 
-        context = self._portfolio_context(account_id)
+        context = self._portfolio_context(account_id, target_symbol=normalized)
         context = PortfolioContext(
             equity=context.equity,
             exposures=context.exposures,
@@ -256,6 +334,8 @@ class V2PipelineService:
             required_features_missing=tuple(snapshot.missing_required_features),
             current_gross_exposure=context.gross_exposure,
             current_net_exposure=context.net_exposure,
+            current_correlated_cluster_exposure=context.cluster_exposure(normalized),
+            correlated_cluster_id=context.cluster_by_symbol.get(normalized, normalized),
         )
         risk = PortfolioRiskEngine(self.session).approve(target, risk_inputs, decision_trace_id=trace_id)
         self._timeline(
@@ -341,6 +421,8 @@ class V2PipelineService:
             row = self.session.get(ModelVersion, sandbox.model_version_id)
             if row is None:
                 return [], ["SANDBOX_MODEL_RECORD_MISSING"]
+            if row.model_family == "intelligence.news_student_naive_bayes":
+                return [], ["CONTEXT_ONLY_NEWS_STUDENT_FORBIDDEN_FROM_TRADING"]
             if row.lifecycle_state != ModelLifecycle.PAPER_SANDBOX.value:
                 return [], ["SANDBOX_MODEL_LIFECYCLE_MISMATCH"]
             if str(row.health_status or "").upper() in {
@@ -363,6 +445,7 @@ class V2PipelineService:
                 .where(
                     ChampionAssignment.active_to.is_(None),
                     ChampionAssignment.symbol_scope.in_((symbol.upper(), "*")),
+                    ChampionAssignment.model_family != "intelligence.news_student_naive_bayes",
                 )
                 .order_by(
                     case((ChampionAssignment.symbol_scope == symbol.upper(), 0), else_=1),
@@ -419,7 +502,10 @@ class V2PipelineService:
         rows = list(
             self.session.scalars(
                 select(ModelVersion)
-                .where(ModelVersion.lifecycle_state == ModelLifecycle.SHADOW.value)
+                .where(
+                    ModelVersion.lifecycle_state == ModelLifecycle.SHADOW.value,
+                    ModelVersion.model_family != "intelligence.news_student_naive_bayes",
+                )
                 .order_by(desc(ModelVersion.created_at))
                 .limit(50)
             )
@@ -626,7 +712,7 @@ class V2PipelineService:
         )
         self.session.flush()
 
-    def _portfolio_context(self, account_id: str) -> PortfolioContext:
+    def _portfolio_context(self, account_id: str, *, target_symbol: str | None = None) -> PortfolioContext:
         account = self._latest_account(account_id)
         positions = list(self.session.scalars(select(Position).where(Position.status == "OPEN", Position.paper_account_id == account_id)))
         exposures: dict[str, float] = {}
@@ -634,7 +720,29 @@ class V2PipelineService:
             notional = (position.quantity * (position.current_price or position.entry_price)) if position.quantity else position.notional
             signed = abs(notional) / max(account.equity, 1e-9)
             exposures[position.symbol] = signed if position.side.upper() == "LONG" else -signed
-        return PortfolioContext(equity=account.equity, exposures=exposures)
+        clustered_symbols = set(exposures)
+        if target_symbol:
+            clustered_symbols.add(target_symbol.upper())
+        cluster_by_symbol = {symbol: self._correlated_cluster(symbol) for symbol in clustered_symbols}
+        return PortfolioContext(
+            equity=account.equity,
+            exposures=exposures,
+            cluster_by_symbol=cluster_by_symbol,
+        )
+
+    @staticmethod
+    def _correlated_cluster(symbol: str) -> str:
+        """Return a conservative deterministic cluster when covariance is absent.
+
+        The runtime universe is crypto. Stable-quoted and major crypto-quoted pairs
+        therefore share one crypto-beta cluster instead of silently behaving as
+        independent symbols. Unknown instruments remain isolated by symbol.
+        """
+        normalized = symbol.strip().upper()
+        crypto_quotes = ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH")
+        if any(len(normalized) > len(quote) and normalized.endswith(quote) for quote in crypto_quotes):
+            return "crypto-beta"
+        return normalized
 
     def _latest_account(self, account_id: str) -> AccountEquity:
         row = self.session.scalar(

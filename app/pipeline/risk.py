@@ -48,6 +48,10 @@ class RiskInputs:
     required_features_missing: tuple[str, ...] = ()
     current_gross_exposure: float = 0.0
     current_net_exposure: float = 0.0
+    # None preserves older callers using a conservative symbol-only fallback.
+    # Runtime V2 supplies the measured deterministic cluster exposure explicitly.
+    current_correlated_cluster_exposure: float | None = None
+    correlated_cluster_id: str | None = None
     now: datetime | None = None
 
 
@@ -69,6 +73,15 @@ class RiskPolicy:
     min_liquidity_score: float
     kill_switch_enabled: bool
     configuration_version: str
+    # Kept last with a conservative compatibility default so existing explicit
+    # RiskPolicy constructors remain valid while runtime settings enforce the
+    # configured crypto-cluster ceiling.
+    max_correlated_cluster_exposure_pct: float = 1.0
+
+    def __post_init__(self) -> None:
+        value = float(self.max_correlated_cluster_exposure_pct)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("max_correlated_cluster_exposure_pct must be between 0 and 1")
 
     @classmethod
     def from_settings(cls) -> "RiskPolicy":
@@ -89,6 +102,7 @@ class RiskPolicy:
             min_liquidity_score=max(min(settings.v2_min_liquidity_score, 1.0), 0.0),
             kill_switch_enabled=settings.risk_kill_switch_enabled,
             configuration_version=settings.risk_configuration_version,
+            max_correlated_cluster_exposure_pct=float(settings.v2_max_cluster_exposure_pct),
         )
 
 
@@ -136,6 +150,25 @@ class PortfolioRiskEngine:
             if abs(approved) > policy.max_margin_allocation_pct:
                 triggered.append("MAX_MARGIN_ALLOCATION")
                 approved = math.copysign(policy.max_margin_allocation_pct, approved)
+            if inputs.current_correlated_cluster_exposure is None:
+                cluster_exposure = abs(current)
+            else:
+                try:
+                    cluster_exposure = float(inputs.current_correlated_cluster_exposure)
+                except (TypeError, ValueError):
+                    cluster_exposure = math.nan
+            if not math.isfinite(cluster_exposure) or cluster_exposure < 0.0:
+                triggered.append("CORRELATED_CLUSTER_DATA")
+                rejection.append("INVALID_CORRELATED_CLUSTER_EXPOSURE")
+            elif cluster_exposure + 1e-12 < abs(current):
+                triggered.append("CORRELATED_CLUSTER_DATA")
+                rejection.append("INCONSISTENT_CORRELATED_CLUSTER_EXPOSURE")
+            else:
+                cluster_without_symbol = max(cluster_exposure - abs(current), 0.0)
+                cluster_room = max(policy.max_correlated_cluster_exposure_pct - cluster_without_symbol, 0.0)
+                if abs(approved) > cluster_room:
+                    triggered.append("MAX_CORRELATED_CLUSTER_EXPOSURE")
+                    approved = math.copysign(cluster_room, approved)
             if inputs.expected_cost > policy.max_expected_cost_pct:
                 rejection.append("MAX_EXPECTED_TRANSACTION_COST")
             if inputs.equity <= 0 or inputs.cash_balance <= 0:
@@ -162,7 +195,14 @@ class PortfolioRiskEngine:
             kill_switch_state=self._kill_switch_active(),
             created_at=now,
         )
-        self.persist(decision, target=target, account_id=inputs.account_id, decision_trace_id=decision_trace_id, inputs=inputs)
+        self.persist(
+            decision,
+            target=target,
+            account_id=inputs.account_id,
+            decision_trace_id=decision_trace_id,
+            inputs=inputs,
+            policy=policy,
+        )
         return decision
 
     def persist(
@@ -173,7 +213,18 @@ class PortfolioRiskEngine:
         account_id: str,
         decision_trace_id: str,
         inputs: RiskInputs,
+        policy: RiskPolicy | None = None,
     ) -> RiskDecisionRecord:
+        effective_policy = policy or self.policy
+        cluster_source = "explicit"
+        if inputs.current_correlated_cluster_exposure is None:
+            cluster_exposure = abs(float(target.current_exposure))
+            cluster_source = "symbol_only_compatibility_fallback"
+        else:
+            try:
+                cluster_exposure = float(inputs.current_correlated_cluster_exposure)
+            except (TypeError, ValueError):
+                cluster_exposure = math.nan
         row = RiskDecisionRecord(
             risk_decision_id=decision.risk_decision_id,
             decision_trace_id=decision_trace_id,
@@ -196,6 +247,10 @@ class PortfolioRiskEngine:
                 "cash_balance": inputs.cash_balance,
                 "equity": inputs.equity,
                 "expected_cost": inputs.expected_cost,
+                "correlated_cluster_id": inputs.correlated_cluster_id,
+                "current_correlated_cluster_exposure": cluster_exposure if math.isfinite(cluster_exposure) else None,
+                "correlated_cluster_exposure_source": cluster_source,
+                "max_correlated_cluster_exposure_pct": effective_policy.max_correlated_cluster_exposure_pct,
                 "model_health": inputs.model_health.value,
                 "signal_health": inputs.signal_health.value,
             },
@@ -353,6 +408,7 @@ class PortfolioRiskEngine:
                 max_symbol_exposure_pct=min(self.policy.max_symbol_exposure_pct, cap),
                 max_gross_exposure_pct=min(self.policy.max_gross_exposure_pct, cap),
                 max_net_exposure_pct=min(self.policy.max_net_exposure_pct, cap),
+                max_correlated_cluster_exposure_pct=min(self.policy.max_correlated_cluster_exposure_pct, cap),
             ),
             cap,
         )

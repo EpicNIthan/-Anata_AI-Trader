@@ -157,7 +157,7 @@ class Settings:
     # Paper bot defaults live here. Railway only needs to override these when you intentionally want a different mode.
     enable_market_collector: bool = field(default_factory=lambda: _bool("ENABLE_MARKET_COLLECTOR", True))
     enable_news_collector: bool = field(default_factory=lambda: _bool("ENABLE_NEWS_COLLECTOR", True))
-    auto_trader_enabled: bool = field(default_factory=lambda: _bool("AUTO_TRADER_ENABLED", True))
+    auto_trader_enabled: bool = field(default_factory=lambda: _bool("AUTO_TRADER_ENABLED", False))
     auto_trader_use_trained_model: bool = field(default_factory=lambda: _bool("AUTO_TRADER_USE_TRAINED_MODEL", False))
     auto_trader_interval_seconds: int = field(default_factory=lambda: _int("AUTO_TRADER_INTERVAL_SECONDS", 60))
     auto_trader_symbols: list[str] = field(default_factory=lambda: _csv(os.getenv("AUTO_TRADER_SYMBOLS"), DEFAULT_SYMBOLS))
@@ -254,6 +254,9 @@ class Settings:
     external_ai_circuit_breaker_failures: int = field(default_factory=lambda: _int("EXTERNAL_AI_CIRCUIT_BREAKER_FAILURES", 3))
     external_ai_circuit_breaker_seconds: int = field(default_factory=lambda: _int("EXTERNAL_AI_CIRCUIT_BREAKER_SECONDS", 300))
     external_ai_cache_ttl_seconds: int = field(default_factory=lambda: _int("EXTERNAL_AI_CACHE_TTL_SECONDS", 86400))
+    external_ai_provider_min_interval_seconds: float = field(
+        default_factory=lambda: _float("EXTERNAL_AI_PROVIDER_MIN_INTERVAL_SECONDS", 1.0)
+    )
     generic_ai_base_url: str | None = field(default_factory=lambda: os.getenv("GENERIC_AI_BASE_URL") or None)
     generic_ai_api_key: str | None = field(default_factory=lambda: _secret("GENERIC_AI_API_KEY"))
     external_ai_generic_model: str = os.getenv("EXTERNAL_AI_GENERIC_MODEL", "structured-news-context")
@@ -292,22 +295,33 @@ class Settings:
     monitoring_outcome_batch_size: int = field(default_factory=lambda: _int("MONITORING_OUTCOME_BATCH_SIZE", 250))
     monitoring_health_window: int = field(default_factory=lambda: _int("MONITORING_HEALTH_WINDOW", 100))
     health_min_observations: int = field(default_factory=lambda: _int("HEALTH_MIN_OBSERVATIONS", 20))
+    health_min_reference_observations: int = field(default_factory=lambda: _int("HEALTH_MIN_REFERENCE_OBSERVATIONS", 10))
+    health_watch_min_information_coefficient: float = field(default_factory=lambda: _float("HEALTH_WATCH_MIN_INFORMATION_COEFFICIENT", 0.0))
+    health_degraded_min_information_coefficient: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_MIN_INFORMATION_COEFFICIENT", -0.10))
+    health_watch_min_net_expectancy: float = field(default_factory=lambda: _float("HEALTH_WATCH_MIN_NET_EXPECTANCY", 0.0))
+    health_degraded_min_net_expectancy: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_MIN_NET_EXPECTANCY", -0.001))
     health_watch_calibration_error: float = field(default_factory=lambda: _float("HEALTH_WATCH_CALIBRATION_ERROR", 0.25))
     health_degraded_calibration_error: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_CALIBRATION_ERROR", 0.40))
     health_watch_missing_feature_rate: float = field(default_factory=lambda: _float("HEALTH_WATCH_MISSING_FEATURE_RATE", 0.10))
     health_degraded_missing_feature_rate: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_MISSING_FEATURE_RATE", 0.25))
-    health_watch_prediction_drift: float = field(default_factory=lambda: _float("HEALTH_WATCH_PREDICTION_DRIFT", 2.0))
-    health_degraded_prediction_drift: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_PREDICTION_DRIFT", 4.0))
-    health_watch_feature_drift: float = field(default_factory=lambda: _float("HEALTH_WATCH_FEATURE_DRIFT", 2.0))
-    health_degraded_feature_drift: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_FEATURE_DRIFT", 4.0))
+    health_watch_prediction_drift: float = field(default_factory=lambda: _float("HEALTH_WATCH_PREDICTION_DRIFT", 0.25))
+    health_degraded_prediction_drift: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_PREDICTION_DRIFT", 0.50))
+    health_watch_feature_drift: float = field(default_factory=lambda: _float("HEALTH_WATCH_FEATURE_DRIFT", 0.25))
+    health_degraded_feature_drift: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_FEATURE_DRIFT", 0.50))
     health_watch_ood_rate: float = field(default_factory=lambda: _float("HEALTH_WATCH_OOD_RATE", 0.10))
     health_degraded_ood_rate: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_OOD_RATE", 0.25))
-    health_watch_correlation_increase: float = field(default_factory=lambda: _float("HEALTH_WATCH_CORRELATION_INCREASE", 0.20))
-    health_degraded_correlation_increase: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_CORRELATION_INCREASE", 0.40))
-    health_watch_transaction_cost_increase: float = field(default_factory=lambda: _float("HEALTH_WATCH_TRANSACTION_COST_INCREASE", 0.50))
-    health_degraded_transaction_cost_increase: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_TRANSACTION_COST_INCREASE", 1.00))
-    health_watch_capacity_decline: float = field(default_factory=lambda: _float("HEALTH_WATCH_CAPACITY_DECLINE", 0.20))
-    health_degraded_capacity_decline: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_CAPACITY_DECLINE", 0.40))
+    health_ood_zscore_threshold: float = field(default_factory=lambda: _float("HEALTH_OOD_ZSCORE_THRESHOLD", 4.0))
+    health_ood_feature_fraction: float = field(default_factory=lambda: _float("HEALTH_OOD_FEATURE_FRACTION", 0.10))
+    health_watch_live_shadow_divergence: float = field(default_factory=lambda: _float("HEALTH_WATCH_LIVE_SHADOW_DIVERGENCE", 0.30))
+    health_degraded_live_shadow_divergence: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_LIVE_SHADOW_DIVERGENCE", 0.60))
+    health_watch_transaction_cost_increase: float = field(default_factory=lambda: _float("HEALTH_WATCH_TRANSACTION_COST_INCREASE", 0.25))
+    health_degraded_transaction_cost_increase: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_TRANSACTION_COST_INCREASE", 0.75))
+    health_watch_correlation_increase: float = field(default_factory=lambda: _float("HEALTH_WATCH_CORRELATION_INCREASE", 0.15))
+    health_degraded_correlation_increase: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_CORRELATION_INCREASE", 0.30))
+    health_watch_regime_dependence: float = field(default_factory=lambda: _float("HEALTH_WATCH_REGIME_DEPENDENCE", 0.70))
+    health_degraded_regime_dependence: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_REGIME_DEPENDENCE", 0.90))
+    health_watch_capacity_decline: float = field(default_factory=lambda: _float("HEALTH_WATCH_CAPACITY_DECLINE", 0.15))
+    health_degraded_capacity_decline: float = field(default_factory=lambda: _float("HEALTH_DEGRADED_CAPACITY_DECLINE", 0.35))
     health_suspend_consecutive_errors: int = field(default_factory=lambda: _int("HEALTH_SUSPEND_CONSECUTIVE_ERRORS", 5))
     research_enabled: bool = field(default_factory=lambda: _bool("RESEARCH_ENABLED", False))
     research_auto_promote: bool = field(default_factory=lambda: _bool("RESEARCH_AUTO_PROMOTE", False))
@@ -339,6 +353,69 @@ class Settings:
     dashboard_password: str | None = field(default_factory=lambda: _secret("DASHBOARD_PASSWORD"))
     admin_token: str | None = field(default_factory=lambda: _secret("ADMIN_TOKEN"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+
+    def __post_init__(self) -> None:
+        if self.external_ai_provider_min_interval_seconds <= 0.0:
+            raise ValueError("EXTERNAL_AI_PROVIDER_MIN_INTERVAL_SECONDS must be positive")
+        if self.monitoring_health_window < 2:
+            raise ValueError("MONITORING_HEALTH_WINDOW must be at least 2")
+        if not 2 <= self.health_min_reference_observations <= self.monitoring_health_window:
+            raise ValueError(
+                "HEALTH_MIN_REFERENCE_OBSERVATIONS must be between 2 and MONITORING_HEALTH_WINDOW"
+            )
+        if not 2 <= self.health_min_observations <= self.monitoring_health_window:
+            raise ValueError("HEALTH_MIN_OBSERVATIONS must be between 2 and MONITORING_HEALTH_WINDOW")
+        if self.health_suspend_consecutive_errors < 1:
+            raise ValueError("HEALTH_SUSPEND_CONSECUTIVE_ERRORS must be at least 1")
+        unit_interval_fields = (
+            "v2_max_cluster_exposure_pct",
+            "health_watch_calibration_error",
+            "health_degraded_calibration_error",
+            "health_watch_missing_feature_rate",
+            "health_degraded_missing_feature_rate",
+            "health_watch_prediction_drift",
+            "health_degraded_prediction_drift",
+            "health_watch_feature_drift",
+            "health_degraded_feature_drift",
+            "health_watch_ood_rate",
+            "health_degraded_ood_rate",
+            "health_ood_feature_fraction",
+            "health_watch_live_shadow_divergence",
+            "health_degraded_live_shadow_divergence",
+            "health_watch_correlation_increase",
+            "health_degraded_correlation_increase",
+            "health_watch_regime_dependence",
+            "health_degraded_regime_dependence",
+            "health_watch_capacity_decline",
+            "health_degraded_capacity_decline",
+        )
+        for name in unit_interval_fields:
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name.upper()} must be between 0 and 1")
+        if self.health_ood_feature_fraction <= 0.0:
+            raise ValueError("HEALTH_OOD_FEATURE_FRACTION must be greater than 0")
+        if self.health_ood_zscore_threshold <= 0.0:
+            raise ValueError("HEALTH_OOD_ZSCORE_THRESHOLD must be positive")
+        if not -1.0 <= self.health_degraded_min_information_coefficient <= self.health_watch_min_information_coefficient <= 1.0:
+            raise ValueError("information-coefficient health thresholds are out of order")
+        if self.health_degraded_min_net_expectancy > self.health_watch_min_net_expectancy:
+            raise ValueError("net-expectancy health thresholds are out of order")
+        high_bad_pairs = (
+            ("calibration_error", self.health_watch_calibration_error, self.health_degraded_calibration_error),
+            ("missing_feature_rate", self.health_watch_missing_feature_rate, self.health_degraded_missing_feature_rate),
+            ("prediction_drift", self.health_watch_prediction_drift, self.health_degraded_prediction_drift),
+            ("feature_drift", self.health_watch_feature_drift, self.health_degraded_feature_drift),
+            ("ood_rate", self.health_watch_ood_rate, self.health_degraded_ood_rate),
+            ("live_shadow_divergence", self.health_watch_live_shadow_divergence, self.health_degraded_live_shadow_divergence),
+            ("transaction_cost_increase", self.health_watch_transaction_cost_increase, self.health_degraded_transaction_cost_increase),
+            ("correlation_increase", self.health_watch_correlation_increase, self.health_degraded_correlation_increase),
+            ("regime_dependence", self.health_watch_regime_dependence, self.health_degraded_regime_dependence),
+            ("capacity_decline", self.health_watch_capacity_decline, self.health_degraded_capacity_decline),
+        )
+        for name, watch, degraded in high_bad_pairs:
+            if watch < 0.0 or degraded < watch:
+                raise ValueError(f"{name} health thresholds are out of order")
 
     @property
     def is_paper_mode(self) -> bool:

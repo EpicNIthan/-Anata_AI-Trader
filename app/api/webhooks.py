@@ -55,6 +55,7 @@ def receive_signal(
         price=payload.price,
         quantity=payload.quantity,
         notional=payload.notional,
+        compatibility_source="api.signal",
     )
     execution = {
         "status": result.status,
@@ -62,6 +63,10 @@ def receive_signal(
         "trade_id": result.trade_id,
         "balance": result.balance,
         "equity": result.equity,
+        "risk_decision_id": result.risk_decision_id,
+        "decision_trace_id": result.decision_trace_id,
+        "triggered_limits": list(result.triggered_limits),
+        "rejection_reasons": list(result.rejection_reasons),
     }
     decision = AiDecision(
         symbol=payload.symbol,

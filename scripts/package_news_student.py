@@ -6,11 +6,15 @@ import argparse
 import hashlib
 import json
 import shutil
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from news_student_utils import sha256_file
+try:
+    from scripts.news_student_utils import sha256_file
+except ImportError:  # Direct ``python scripts/package_news_student.py`` execution.
+    from news_student_utils import sha256_file
 
 from app.intelligence.providers import validate_json_student_artifact
 
@@ -45,9 +49,13 @@ def main() -> None:
         "model_id": f"local-news-student:{artifact['version']}",
         "name": "local-news-student",
         "version": artifact["version"],
-        "model_family": "news_student_naive_bayes",
+        "model_family": "intelligence.news_student_naive_bayes",
         "artifact": artifact_name,
+        "model_file": artifact_name,
         "artifact_type": artifact["artifact_type"],
+        "feature_schema_version": "news-student-text-v1",
+        "feature_columns": ["text"],
+        "preprocessing_version": "news-tokenizer-v1",
         "teacher_versions": artifact.get("teacher_versions", []),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "paper_only": True,
@@ -79,6 +87,24 @@ def main() -> None:
         "activation": "manual",
     }
     _write_json(output_dir / "checksum_manifest.json", manifest)
+    upload_package = output_dir.with_suffix(".zip")
+    if upload_package.exists():
+        raise SystemExit(
+            f"Refusing to replace existing upload package: {upload_package}; choose a fresh output directory."
+        )
+    temporary_package = upload_package.with_suffix(upload_package.suffix + ".tmp")
+    with zipfile.ZipFile(
+        temporary_package,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as archive:
+        for source in sorted(path for path in output_dir.iterdir() if path.is_file()):
+            info = zipfile.ZipInfo(source.name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o600 << 16
+            archive.writestr(info, source.read_bytes())
+    temporary_package.replace(upload_package)
     print(
         json.dumps(
             {
@@ -86,7 +112,20 @@ def main() -> None:
                 "package_dir": str(output_dir),
                 "version": artifact["version"],
                 "files": len(manifest["files"]) + 1,
+                "upload_package": str(upload_package),
                 "activation": "manual; no model was uploaded or activated",
+                "next_steps": [
+                    (
+                        "python scripts/upload_model.py --url $Url --token $Token "
+                        f"--package {upload_package}"
+                    ),
+                    (
+                        "python scripts/promote_model.py --url $Url --token $Token "
+                        "--model-id MODEL_ID_FROM_UPLOAD "
+                        "--family intelligence.news_student_naive_bayes --symbol-scope '*' "
+                        "--reason 'Activate reviewed local news student' --confirm"
+                    ),
+                ],
             },
             indent=2,
         )

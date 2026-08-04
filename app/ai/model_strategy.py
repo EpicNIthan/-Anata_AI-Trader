@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.orm import Session
 
 from app.ai.strategy import StrategyDecision
@@ -23,6 +23,7 @@ from app.ai.symbol_identity import symbol_identity_values
 from app.config import settings
 from app.db.models import Feature, ModelVersion
 from app.features.schema import numeric_vector, values_from_feature
+from app.pipeline.artifact_store import ArtifactIntegrityError, resolve_model_artifact
 
 
 REGIME_ORDER = [
@@ -63,7 +64,13 @@ class PriceModelStrategy:
             return None
         model = session.scalar(
             select(ModelVersion)
-            .where(ModelVersion.status == "active")
+            .where(
+                ModelVersion.status == "active",
+                or_(
+                    ModelVersion.model_family.is_(None),
+                    ModelVersion.model_family != "intelligence.news_student_naive_bayes",
+                ),
+            )
             .order_by(desc(ModelVersion.created_at))
             .limit(1)
         )
@@ -129,20 +136,69 @@ class PriceModelStrategy:
 
     def _load_model_payload(self, model: ModelVersion) -> dict[str, Any] | None:
         payload = dict(model.raw_payload or {})
-        path_value = payload.get("model_file") or model.path
-        if payload and payload.get("coefficients") is not None:
-            return payload
-        if not path_value:
-            return payload or None
-        path = Path(str(path_value))
-        if path.exists() and path.suffix.lower() == ".json":
+        try:
+            path = resolve_model_artifact(model)
+        except ArtifactIntegrityError:
+            self.last_fallback_reason = "Registered artifact failed integrity or durable-storage checks."
+            return None
+        if path.suffix.lower() == ".json":
             try:
                 file_payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return payload or None
             if isinstance(file_payload, dict):
                 payload.update(file_payload)
-        if path.exists():
+                payload["model_file"] = str(path)
+        elif path.suffix.lower() == ".zip":
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    names = archive.namelist()
+                    declared = payload.get("model_member") or payload.get("model_file")
+                    member = None
+                    if declared:
+                        member = next(
+                            (
+                                name
+                                for name in names
+                                if name == str(declared)
+                                or Path(name).name == Path(str(declared)).name
+                            ),
+                            None,
+                        )
+                    if member is None:
+                        excluded = {
+                            "feature_schema.json",
+                            "model_metadata.json",
+                            "metadata.json",
+                            "training_metrics.json",
+                            "training_period.json",
+                            "required_features.json",
+                            "optional_features.json",
+                            "missing_value_policy.json",
+                            "news_student_version.json",
+                            "checksum_manifest.json",
+                        }
+                        member = next(
+                            (
+                                name
+                                for name in names
+                                if Path(name).suffix.lower()
+                                in {".json", ".joblib", ".pkl", ".pickle"}
+                                and Path(name).name.lower() not in excluded
+                            ),
+                            None,
+                        )
+                    if member is None:
+                        return payload or None
+                    payload["package_path"] = str(path)
+                    payload["model_file"] = member
+                    if Path(member).suffix.lower() == ".json":
+                        file_payload = json.loads(archive.read(member).decode("utf-8"))
+                        if isinstance(file_payload, dict):
+                            payload.update(file_payload)
+            except (OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError):
+                return payload or None
+        else:
             payload.setdefault("model_file", str(path))
         return payload or None
 
@@ -176,8 +232,15 @@ class PriceModelStrategy:
                 if not package_path.exists():
                     return None
                 with zipfile.ZipFile(package_path) as archive:
-                    member = Path(model_file).name
-                    if member not in archive.namelist():
+                    member = next(
+                        (
+                            name
+                            for name in archive.namelist()
+                            if name == model_file or Path(name).name == Path(model_file).name
+                        ),
+                        None,
+                    )
+                    if member is None:
                         return None
                     estimator = joblib.load(io.BytesIO(archive.read(member)))
             result = estimator.predict([vector])[0]

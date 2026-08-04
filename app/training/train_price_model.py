@@ -13,6 +13,7 @@ from app.config import settings
 from app.db.models import ModelVersion, TrainingRun
 from app.db.session import SessionLocal, create_db_and_tables
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema
+from app.pipeline.artifact_store import ModelArtifactStore, sha256_bytes
 from app.training.export_dataset import export_dataset, parse_since_date
 
 
@@ -152,11 +153,13 @@ def train_price_model(
             parent_model_id=parent_model_id,
             checkpoint_path=str(from_checkpoint) if from_checkpoint else None,
             status="candidate",
+            artifact_checksum=sha256_bytes(model_path.read_bytes()),
             metrics=payload["metrics"],
             raw_payload=payload,
         )
         session.add(model)
         session.flush()
+        ModelArtifactStore(session).put_path(model, model_path)
         session.add(
             TrainingRun(
                 model_name=payload["name"],

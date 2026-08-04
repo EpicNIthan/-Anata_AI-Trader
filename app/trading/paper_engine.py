@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import math
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
@@ -11,6 +13,7 @@ from app.config import settings
 from app.db.models import (
     AccountEquity,
     Candle,
+    EnsembleDecisionRecord,
     LiveCandleUpdate,
     PaperSandboxAccount,
     PaperTrade,
@@ -21,9 +24,12 @@ from app.db.models import (
 )
 from app.trading.risk_manager import RiskManager, RiskResult
 
+logger = logging.getLogger(__name__)
+
 BROKER_TAKER_FEE_RATE = 0.0004
 DUST_QUANTITY = 1e-8
 DUST_NOTIONAL = 0.01
+COMPATIBILITY_RISK_CONFIGURATION_VERSION = "legacy-compatibility-universal-risk-v1"
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,10 @@ class ExecutionResult:
     trade_id: int | None = None
     balance: float | None = None
     equity: float | None = None
+    risk_decision_id: str | None = None
+    decision_trace_id: str | None = None
+    triggered_limits: tuple[str, ...] = ()
+    rejection_reasons: tuple[str, ...] = ()
 
 
 class PaperEngine:
@@ -60,6 +70,8 @@ class PaperEngine:
         decision_trace_id: str | None = None,
         simulated_order_id: str | None = None,
         paper_account_id: str | None = None,
+        simulated_funding_cost: float = 0.0,
+        compatibility_source: str = "paper-engine.compatibility",
     ) -> ExecutionResult:
         if not settings.is_paper_mode:
             return ExecutionResult("REJECTED", "Trading mode is not paper; real order APIs are disabled.")
@@ -67,10 +79,16 @@ class PaperEngine:
         account_id = paper_account_id or self.paper_account_id
         normalized_symbol = symbol.upper()
         normalized_action = action.upper()
+        try:
+            funding_cost = float(simulated_funding_cost)
+        except (TypeError, ValueError):
+            return ExecutionResult("REJECTED", "Simulated funding cost must be numeric.")
+        if not math.isfinite(funding_cost) or funding_cost < 0:
+            return ExecutionResult("REJECTED", "Simulated funding cost must be finite and non-negative.")
         latest_account = self._latest_account(create=True, paper_account_id=account_id)
+        cash_balance = float(latest_account.cash_balance)
+        equity = float(latest_account.equity)
         mark_price, market_observed_at = self._resolve_market(normalized_symbol, price)
-        if normalized_action != "HOLD" and mark_price is None:
-            return ExecutionResult("REJECTED", "No price is available for this symbol.")
 
         existing_position = self._open_position(normalized_symbol, paper_account_id=account_id)
         requested_notional = notional
@@ -106,16 +124,73 @@ class PaperEngine:
                 market_observed_at=market_observed_at,
                 paper_account_id=account_id,
             )
+        if normalized_action != "HOLD" and mark_price is None:
+            risk = self._with_execution_precondition_failure(
+                risk,
+                reason="No price is available for this symbol.",
+                code="MISSING_EXECUTION_PRICE",
+            )
+
+        effective_risk_decision_id = risk_decision_id
+        effective_trace_id = decision_trace_id
+        if risk_decision_id is None:
+            audit_ids = self._persist_compatibility_risk_audit(
+                source=compatibility_source,
+                account_id=account_id,
+                symbol=normalized_symbol,
+                action=normalized_action,
+                confidence=confidence,
+                requested_notional=requested_notional,
+                requested_quantity=quantity,
+                requested_leverage=leverage,
+                requested_margin_pct=margin_pct,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                mark_price=mark_price,
+                market_observed_at=market_observed_at,
+                existing_position=existing_position,
+                cash_balance=cash_balance,
+                equity=equity,
+                risk=risk,
+            )
+            if audit_ids is None:
+                return ExecutionResult(
+                    "REJECTED",
+                    "Compatibility risk audit could not be persisted; paper execution failed closed.",
+                    balance=cash_balance,
+                    equity=equity,
+                    triggered_limits=tuple(sorted(set(risk.triggered_limits + ("RISK_AUDIT",)))),
+                    rejection_reasons=tuple(sorted(set(risk.rejection_reasons + ("RISK_AUDIT_PERSISTENCE_FAILED",)))),
+                )
+            effective_risk_decision_id, effective_trace_id = audit_ids
         if not risk.accepted:
-            return ExecutionResult("REJECTED", risk.reason, balance=latest_account.cash_balance, equity=latest_account.equity)
+            return ExecutionResult(
+                "REJECTED",
+                risk.reason,
+                balance=cash_balance,
+                equity=equity,
+                risk_decision_id=effective_risk_decision_id,
+                decision_trace_id=effective_trace_id,
+                triggered_limits=risk.triggered_limits,
+                rejection_reasons=risk.rejection_reasons,
+            )
 
         if normalized_action == "HOLD":
             equity_row = self._record_equity(latest_account.cash_balance, price_by_symbol={normalized_symbol: mark_price}, paper_account_id=account_id)
             self.session.commit()
-            return ExecutionResult("HELD", risk.reason, balance=equity_row.cash_balance, equity=equity_row.equity)
+            return ExecutionResult(
+                "HELD",
+                risk.reason,
+                balance=equity_row.cash_balance,
+                equity=equity_row.equity,
+                risk_decision_id=effective_risk_decision_id,
+                decision_trace_id=effective_trace_id,
+                triggered_limits=risk.triggered_limits,
+                rejection_reasons=risk.rejection_reasons,
+            )
 
         if risk.intent == "close":
-            return self._close(
+            result = self._close(
                 symbol=normalized_symbol,
                 price=mark_price or 0.0,
                 reason=reason,
@@ -123,13 +198,15 @@ class PaperEngine:
                 existing_position=existing_position,
                 requested_action=normalized_action,
                 paper_account_id=account_id,
-                risk_decision_id=risk_decision_id,
-                decision_trace_id=decision_trace_id,
+                risk_decision_id=effective_risk_decision_id,
+                decision_trace_id=effective_trace_id,
                 simulated_order_id=simulated_order_id,
+                funding_cost=funding_cost,
             )
+            return self._attach_risk_audit(result, risk, effective_risk_decision_id, effective_trace_id)
 
         if normalized_action in {"BUY", "SELL"}:
-            return self._open_or_add(
+            result = self._open_or_add(
                 symbol=normalized_symbol,
                 side="LONG" if normalized_action == "BUY" else "SHORT",
                 action=normalized_action,
@@ -142,12 +219,271 @@ class PaperEngine:
                 take_profit=take_profit,
                 existing_position=existing_position,
                 paper_account_id=account_id,
-                risk_decision_id=risk_decision_id,
-                decision_trace_id=decision_trace_id,
+                risk_decision_id=effective_risk_decision_id,
+                decision_trace_id=effective_trace_id,
                 simulated_order_id=simulated_order_id,
+                funding_cost=funding_cost,
             )
+            return self._attach_risk_audit(result, risk, effective_risk_decision_id, effective_trace_id)
 
-        return ExecutionResult("REJECTED", f"Unsupported action: {normalized_action}")
+        return ExecutionResult(
+            "REJECTED",
+            f"Unsupported action: {normalized_action}",
+            balance=cash_balance,
+            equity=equity,
+            risk_decision_id=effective_risk_decision_id,
+            decision_trace_id=effective_trace_id,
+            triggered_limits=risk.triggered_limits,
+            rejection_reasons=risk.rejection_reasons,
+        )
+
+    @staticmethod
+    def _attach_risk_audit(
+        result: ExecutionResult,
+        risk: RiskResult,
+        risk_decision_id: str | None,
+        decision_trace_id: str | None,
+    ) -> ExecutionResult:
+        return replace(
+            result,
+            risk_decision_id=risk_decision_id,
+            decision_trace_id=decision_trace_id,
+            triggered_limits=risk.triggered_limits,
+            rejection_reasons=risk.rejection_reasons,
+        )
+
+    @staticmethod
+    def _with_execution_precondition_failure(risk: RiskResult, *, reason: str, code: str) -> RiskResult:
+        rejection_reasons = tuple(sorted(set(risk.rejection_reasons + (code,))))
+        triggered_limits = tuple(sorted(set(risk.triggered_limits + ("EXECUTION_PRECONDITION",))))
+        message = reason if risk.accepted else f"{risk.reason} {reason}"
+        return replace(
+            risk,
+            accepted=False,
+            reason=message,
+            max_notional=0.0,
+            margin_required=0.0,
+            triggered_limits=triggered_limits,
+            rejection_reasons=rejection_reasons,
+        )
+
+    def _persist_compatibility_risk_audit(
+        self,
+        *,
+        source: str,
+        account_id: str,
+        symbol: str,
+        action: str,
+        confidence: float,
+        requested_notional: float | None,
+        requested_quantity: float | None,
+        requested_leverage: float | None,
+        requested_margin_pct: float | None,
+        stop_loss: float | None,
+        take_profit: float | None,
+        mark_price: float | None,
+        market_observed_at: datetime | None,
+        existing_position: Position | None,
+        cash_balance: float,
+        equity: float,
+        risk: RiskResult,
+    ) -> tuple[str, str] | None:
+        """Persist the synchronous authorization used by legacy paper callers.
+
+        The compatibility chain is deliberately not accepted by the V2 simulated-order
+        replay path.  Its approval is scoped to this method call and is committed before
+        a fill; the resulting trade links back to the risk decision.  Any persistence
+        failure rolls back the pending unit of work and makes execution fail closed.
+        """
+        now = datetime.now(timezone.utc)
+        token = uuid4().hex
+        trace_id = f"compat-trace-{token}"
+        ensemble_id = f"compat-ensemble-{token}"
+        target_id = f"compat-target-{token}"
+        risk_id = f"compat-risk-{token}"
+        current_exposure = self._position_exposure(existing_position, equity, mark_price)
+        requested_target = self._compatibility_target_exposure(
+            current_exposure=current_exposure,
+            existing_position=existing_position,
+            action=action,
+            requested_notional=requested_notional,
+            requested_quantity=requested_quantity,
+            mark_price=mark_price,
+            equity=equity,
+            risk=risk,
+            approved=False,
+        )
+        approved_target = self._compatibility_target_exposure(
+            current_exposure=current_exposure,
+            existing_position=existing_position,
+            action=action,
+            requested_notional=requested_notional,
+            requested_quantity=requested_quantity,
+            mark_price=mark_price,
+            equity=equity,
+            risk=risk,
+            approved=True,
+        )
+        source_name = (source or "paper-engine.compatibility").strip()[:128]
+        requested_notional_value = self._finite_number(requested_notional)
+        requested_quantity_value = self._finite_number(requested_quantity)
+        requested_leverage_value = self._finite_number(requested_leverage) or 0.0
+        requested_margin_value = self._finite_number(requested_margin_pct)
+        safe_confidence = self._finite_number(confidence) or 0.0
+        safe_mark_price = self._finite_number(mark_price)
+        observed_at = self._utc_isoformat(market_observed_at)
+        audit_payload = {
+            "compatibility_risk_audit": True,
+            "contract_version": COMPATIBILITY_RISK_CONFIGURATION_VERSION,
+            "source": source_name,
+            "authorization_scope": "synchronous_paper_engine_call",
+            "action": action,
+            "intent": risk.intent,
+            "risk_reason": risk.reason,
+            "untrusted_request": {
+                "requested_notional": requested_notional_value,
+                "requested_quantity": requested_quantity_value,
+                "requested_leverage": self._finite_number(requested_leverage),
+                "requested_margin_pct": requested_margin_value,
+                "stop_loss_present": stop_loss is not None,
+                "take_profit_present": take_profit is not None,
+            },
+            "evaluated_state": {
+                "cash_balance": cash_balance,
+                "equity": equity,
+                "mark_price": safe_mark_price,
+                "market_observed_at": observed_at,
+            },
+            "triggered_limits": list(risk.triggered_limits),
+            "rejection_reasons": list(risk.rejection_reasons),
+        }
+        try:
+            self.session.add_all(
+                [
+                    EnsembleDecisionRecord(
+                        ensemble_decision_id=ensemble_id,
+                        decision_trace_id=trace_id,
+                        symbol=symbol,
+                        generated_at=now,
+                        valid_until=now + timedelta(minutes=5),
+                        combined_expected_return=0.0,
+                        combined_expected_volatility=0.0,
+                        combined_uncertainty=1.0,
+                        combined_confidence=max(0.0, min(safe_confidence, 1.0)),
+                        supporting_signals=[],
+                        conflicting_signals=[],
+                        signal_weights={},
+                        decision_status="COMPATIBILITY_RISK_INPUT",
+                        reason_codes=["LEGACY_COMPATIBILITY_INPUT", *risk.rejection_reasons],
+                        payload=audit_payload,
+                    ),
+                    PortfolioTargetRecord(
+                        portfolio_target_id=target_id,
+                        decision_trace_id=trace_id,
+                        paper_account_id=account_id,
+                        symbol=symbol,
+                        current_exposure=current_exposure,
+                        requested_target_exposure=requested_target,
+                        requested_delta=requested_target - current_exposure,
+                        expected_return=0.0,
+                        expected_risk=0.0,
+                        risk_contribution=0.0,
+                        urgency=safe_confidence,
+                        source_ensemble_decision_id=ensemble_id,
+                        payload={**audit_payload, "audit_role": "compatibility_target"},
+                    ),
+                    RiskDecisionRecord(
+                        risk_decision_id=risk_id,
+                        decision_trace_id=trace_id,
+                        portfolio_target_id=target_id,
+                        paper_account_id=account_id,
+                        approved=risk.accepted,
+                        requested_exposure=requested_target,
+                        approved_exposure=approved_target,
+                        requested_leverage=requested_leverage_value,
+                        approved_leverage=risk.leverage if risk.accepted else 0.0,
+                        triggered_limits=list(risk.triggered_limits),
+                        rejection_reasons=list(risk.rejection_reasons),
+                        configuration_version=COMPATIBILITY_RISK_CONFIGURATION_VERSION,
+                        kill_switch_state=(
+                            "KILL_SWITCH" in risk.triggered_limits
+                            or "KILL_SWITCH_ACTIVE" in risk.rejection_reasons
+                        ),
+                        payload={**audit_payload, "audit_role": "compatibility_risk_decision"},
+                    ),
+                ]
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            logger.exception("Failed to persist compatibility risk audit for %s %s", source_name, symbol)
+            return None
+        return risk_id, trace_id
+
+    @staticmethod
+    def _finite_number(value: float | None) -> float | None:
+        try:
+            result = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+        return result if result is not None and math.isfinite(result) else None
+
+    @staticmethod
+    def _utc_isoformat(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        return normalized.isoformat()
+
+    @staticmethod
+    def _position_exposure(position: Position | None, equity: float, mark_price: float | None) -> float:
+        if position is None or equity <= 0:
+            return 0.0
+        price = mark_price or position.current_price or position.entry_price
+        notional = max(float(position.quantity or 0.0) * max(float(price or 0.0), 0.0), 0.0)
+        sign = -1.0 if position.side.upper() == "SHORT" else 1.0
+        return sign * notional / equity
+
+    @classmethod
+    def _compatibility_target_exposure(
+        cls,
+        *,
+        current_exposure: float,
+        existing_position: Position | None,
+        action: str,
+        requested_notional: float | None,
+        requested_quantity: float | None,
+        mark_price: float | None,
+        equity: float,
+        risk: RiskResult,
+        approved: bool,
+    ) -> float:
+        if equity <= 0 or action == "HOLD":
+            return current_exposure
+        if approved and not risk.accepted:
+            return current_exposure
+        if risk.intent == "close" and existing_position is not None:
+            if requested_quantity is None:
+                return 0.0
+            quantity_value = max(cls._finite_number(requested_quantity) or 0.0, 0.0)
+            original_quantity = max(float(existing_position.quantity or 0.0), 0.0)
+            remaining_fraction = 1.0 - min(quantity_value / original_quantity, 1.0) if original_quantity else 0.0
+            return current_exposure * remaining_fraction
+        if not approved:
+            requested_value = cls._finite_number(requested_notional)
+            if requested_value is None:
+                quantity_value = cls._finite_number(requested_quantity)
+                price_value = cls._finite_number(mark_price)
+                requested_value = (
+                    quantity_value * price_value
+                    if quantity_value is not None and price_value is not None
+                    else risk.max_notional
+                )
+            delta_notional = max(requested_value, 0.0)
+        else:
+            delta_notional = max(cls._finite_number(risk.max_notional) or 0.0, 0.0)
+        sign = -1.0 if risk.side == "SHORT" else 1.0
+        return current_exposure + sign * delta_notional / equity
 
     def snapshot(self, *, record: bool = True) -> dict[str, float]:
         latest = self._latest_account(create=True)
@@ -278,6 +614,7 @@ class PaperEngine:
         risk_decision_id: str | None,
         decision_trace_id: str | None,
         simulated_order_id: str | None,
+        funding_cost: float = 0.0,
     ) -> ExecutionResult:
         account = self._latest_account(create=True, paper_account_id=paper_account_id)
         if price <= 0:
@@ -294,13 +631,13 @@ class PaperEngine:
         quantity = notional / price
         fee_rate = self._paper_fee_rate()
         fee = self._paper_fee(notional, fee_rate)
-        realized_pnl = -fee
+        realized_pnl = -fee - funding_cost
         if quantity <= DUST_QUANTITY:
             return ExecutionResult("REJECTED", "Computed quantity was dust-sized.", balance=account.cash_balance, equity=account.equity)
         if fee <= 0:
             return ExecutionResult("REJECTED", "Computed fee was zero; paper trade is too small.", balance=account.cash_balance, equity=account.equity)
-        if margin_required + fee > account.cash_balance:
-            return ExecutionResult("REJECTED", "Not enough paper cash for margin plus fee.")
+        if margin_required + fee + funding_cost > account.cash_balance:
+            return ExecutionResult("REJECTED", "Not enough paper cash for margin, fee, and simulated funding.")
 
         if existing_position is not None and existing_position.side.upper() != side:
             return ExecutionResult("REJECTED", f"Cannot add {side} while {existing_position.side.upper()} is open; close first.")
@@ -344,7 +681,7 @@ class PaperEngine:
             )
             position = existing_position
 
-        cash_after = account.cash_balance - margin_required - fee
+        cash_after = account.cash_balance - margin_required - fee - funding_cost
         trade = PaperTrade(
             symbol=symbol,
             paper_account_id=paper_account_id,
@@ -364,6 +701,9 @@ class PaperEngine:
                 "paper_leverage": leverage,
                 "margin_required": margin_required,
                 "gross_pnl": 0.0,
+                "funding_cost": funding_cost,
+                "funding_cash_flow": -funding_cost,
+                "funding_booked": True,
                 "fee_rate": fee_rate,
                 "fee_model": "binance_usdm_futures_taker_style",
                 "intent": "open" if existing_position is None else "increase",
@@ -399,6 +739,7 @@ class PaperEngine:
         risk_decision_id: str | None,
         decision_trace_id: str | None,
         simulated_order_id: str | None,
+        funding_cost: float = 0.0,
     ) -> ExecutionResult:
         if existing_position is None:
             account = self._latest_account(create=True, paper_account_id=paper_account_id)
@@ -432,9 +773,9 @@ class PaperEngine:
         fee_rate = self._paper_fee_rate()
         fee = self._paper_fee(proceeds, fee_rate)
         gross_pnl = self._gross_pnl(existing_position.side, existing_position.entry_price, price, close_quantity)
-        realized_pnl = gross_pnl - fee
+        realized_pnl = gross_pnl - fee - funding_cost
         released_margin = margin_before * (close_quantity / original_quantity) if original_quantity else margin_before
-        cash_after = account.cash_balance + released_margin + gross_pnl - fee
+        cash_after = account.cash_balance + released_margin + gross_pnl - fee - funding_cost
 
         existing_position.quantity -= close_quantity
         existing_position.current_price = price
@@ -467,6 +808,9 @@ class PaperEngine:
                 "paper_leverage": existing_position.leverage or settings.paper_leverage,
                 "released_margin": released_margin,
                 "gross_pnl": gross_pnl,
+                "funding_cost": funding_cost,
+                "funding_cash_flow": -funding_cost,
+                "funding_booked": True,
                 "fee_rate": fee_rate,
                 "fee_model": "binance_usdm_futures_taker_style",
                 "requested_action": requested_action,
@@ -670,21 +1014,35 @@ class PaperEngine:
             return RiskResult(False, "Execution rejected: simulated order trace does not match its risk approval.", 0.0, rejection_reasons=("RISK_TRACE_MISMATCH",))
         if order.symbol.upper() != symbol.upper() or target.symbol.upper() != symbol.upper():
             return RiskResult(False, "Execution rejected: simulated order symbol does not match its risk approval.", 0.0, rejection_reasons=("RISK_SYMBOL_MISMATCH",))
-        if order.state != "ACKNOWLEDGED":
+        if order.state not in {"ACKNOWLEDGED", "PARTIALLY_FILLED"}:
             return RiskResult(False, "Execution rejected: simulated order is not executable in its current state.", 0.0, rejection_reasons=("INVALID_ORDER_STATE",))
         expires_at = order.expires_at
         if expires_at is not None:
             expires_at = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at.astimezone(timezone.utc)
             if datetime.now(timezone.utc) > expires_at:
                 return RiskResult(False, "Execution rejected: simulated order has expired.", 0.0, rejection_reasons=("ORDER_EXPIRED",))
-        consumed = self.session.scalar(
-            select(PaperTrade.id).where(PaperTrade.simulated_order_id == simulated_order_id).limit(1)
+        consumed_notional = float(
+            self.session.scalar(
+                select(func.coalesce(func.sum(PaperTrade.notional), 0.0)).where(
+                    PaperTrade.simulated_order_id == simulated_order_id,
+                    PaperTrade.status == "FILLED",
+                )
+            )
+            or 0.0
         )
-        if consumed is not None:
-            return RiskResult(False, "Execution rejected: simulated order was already filled.", 0.0, rejection_reasons=("RISK_APPROVAL_REPLAY",))
+        consumed_quantity = float(
+            self.session.scalar(
+                select(func.coalesce(func.sum(PaperTrade.quantity), 0.0)).where(
+                    PaperTrade.simulated_order_id == simulated_order_id,
+                    PaperTrade.status == "FILLED",
+                )
+            )
+            or 0.0
+        )
         intent, side = self.risk._intent(action, existing_position)
         if intent == "close":
-            if requested_quantity is None or requested_quantity <= 0 or requested_quantity > order.requested_quantity + 1e-12:
+            remaining_quantity = max(float(order.requested_quantity) - consumed_quantity, 0.0)
+            if requested_quantity is None or requested_quantity <= 0 or requested_quantity > remaining_quantity + 1e-12:
                 return RiskResult(False, "Execution rejected: close quantity exceeds the submitted order.", 0.0, intent=intent, side=side, rejection_reasons=("ORDER_QUANTITY_MISMATCH",))
             return RiskResult(
                 True,
@@ -700,7 +1058,8 @@ class PaperEngine:
         notional = max(float(requested_notional or 0.0), 0.0)
         if notional <= 0:
             return RiskResult(False, "Execution rejected: approved V2 order has no notional.", 0.0, intent=intent, side=side)
-        if notional > float(order.requested_notional) + max(abs(float(order.requested_notional)) * 1e-9, 1e-9):
+        remaining_notional = max(float(order.requested_notional) - consumed_notional, 0.0)
+        if notional > remaining_notional + max(abs(float(order.requested_notional)) * 1e-9, 1e-9):
             return RiskResult(False, "Execution rejected: order notional exceeds the submitted risk-approved order.", 0.0, intent=intent, side=side, rejection_reasons=("ORDER_NOTIONAL_MISMATCH",))
         approved_delta = abs(float(decision.approved_exposure) - float(target.current_exposure))
         approved_equity = (decision.payload or {}).get("equity")

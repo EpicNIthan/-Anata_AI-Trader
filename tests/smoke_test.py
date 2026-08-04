@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import io
 import os
 import shutil
@@ -72,7 +73,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, inspect, select, text
 
 from app.collectors.market_collector import BinanceMarketCollector
-from app.db.models import AiDecision, Candle, ExperienceRecord, ExternalDataEvent, Feature, LiveCandleUpdate, ModelVersion, NewsArticle, NewsSentiment, TrainingFeature
+from app.db.models import AiDecision, Candle, DecisionTimelineEvent, ExperienceRecord, ExternalDataEvent, Feature, LiveCandleUpdate, ModelVersion, NewsArticle, NewsSentiment, TrainingFeature
 from app.db.session import engine
 from app.db.session import SessionLocal
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, numeric_vector
@@ -144,6 +145,25 @@ def main() -> None:
         assert dashboard.status_code == 200, dashboard.text[:500]
         assert "Anata AI Trader" in dashboard.text
         assert "modelsBody" in dashboard.text
+
+        observed_at = datetime.now(timezone.utc)
+        with SessionLocal() as session:
+            session.add(
+                Candle(
+                    exchange="binance",
+                    symbol="BTCUSDT",
+                    interval="1m",
+                    open_time=observed_at - timedelta(minutes=1),
+                    close_time=observed_at,
+                    open=50_000.0,
+                    high=50_100.0,
+                    low=49_900.0,
+                    close=50_000.0,
+                    volume=10.0,
+                    is_closed=True,
+                )
+            )
+            session.commit()
 
         blocked_trade = client.post(
             "/api/signal",
@@ -476,15 +496,59 @@ def main() -> None:
             "name": "smoke-linear",
             "version": "smoke-1",
             "model_type": "linear_json",
+            "model_family": "alpha.smoke_linear",
             "model_file": uploaded_model_file.name,
             "feature_schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
             "feature_columns": feature_columns,
+            "preprocessing_version": "smoke-linear-v1",
+            "training_dataset_version": "smoke",
+            "forecast_horizon_seconds": 300,
             "metrics": {"directional_accuracy": 0.60, "net_return_after_fees": 0.01},
             "training_dataset_hash": "smoke",
         }
+        model_bytes = uploaded_model_file.read_bytes()
+        upload_members = {
+            uploaded_model_file.name: model_bytes,
+            "feature_schema.json": json.dumps(
+                {
+                    "feature_schema_version": CURRENT_FEATURE_SCHEMA_VERSION,
+                    "feature_columns": feature_columns,
+                    "feature_types": {name: "number" for name in feature_columns},
+                },
+                sort_keys=True,
+            ).encode("utf-8"),
+            "model_metadata.json": json.dumps(metadata, sort_keys=True).encode("utf-8"),
+            "training_metrics.json": json.dumps(metadata["metrics"], sort_keys=True).encode("utf-8"),
+            "training_period.json": json.dumps(
+                {
+                    "start": (observed_at - timedelta(days=1)).isoformat(),
+                    "end": observed_at.isoformat(),
+                    "point_in_time": True,
+                },
+                sort_keys=True,
+            ).encode("utf-8"),
+            "required_features.json": json.dumps(feature_columns).encode("utf-8"),
+            "optional_features.json": b"[]",
+            "missing_value_policy.json": json.dumps(
+                {"strategy": "reject_missing_required_features"},
+                sort_keys=True,
+            ).encode("utf-8"),
+            "news_student_version.json": json.dumps(
+                {"required": False, "version": None},
+                sort_keys=True,
+            ).encode("utf-8"),
+        }
+        upload_manifest = {
+            "algorithm": "sha256",
+            "files": {
+                name: {"sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}
+                for name, content in upload_members.items()
+            },
+        }
         with zipfile.ZipFile(uploaded_model_package, "w") as package:
-            package.write(uploaded_model_file, uploaded_model_file.name)
-            package.writestr("metadata.json", json.dumps(metadata))
+            for name, content in upload_members.items():
+                package.writestr(name, content)
+            package.writestr("checksum_manifest.json", json.dumps(upload_manifest))
         with uploaded_model_package.open("rb") as handle:
             upload_model = client.post("/api/models/upload", files={"file": (uploaded_model_package.name, handle, "application/zip")}, auth=auth)
         assert upload_model.status_code == 200, upload_model.text
@@ -492,9 +556,21 @@ def main() -> None:
         models = client.get("/api/models", auth=auth)
         assert models.status_code == 200, models.text
         assert any(row["status"] == "candidate" for row in models.json()), models.text
-        activate = client.post("/api/models/activate", json={"model_id": "smoke-linear:1"}, auth=auth)
-        assert activate.status_code == 200, activate.text
-        assert activate.json()["model"]["status"] == "active", activate.text
+        uploaded_model_id = int(upload_model.json()["model"]["id"])
+        promote = client.post(
+            f"/api/v2/models/{uploaded_model_id}/promote",
+            json={
+                "model_family": metadata["model_family"],
+                "symbol_scope": "*",
+                "reason": "Explicit V2 manual smoke-test promotion",
+                "confirm": True,
+            },
+            auth=auth,
+        )
+        assert promote.status_code == 200, promote.text
+        assert promote.json()["manual_promotion"] is True, promote.text
+        assert promote.json()["automatic_promotion_enabled"] is False, promote.text
+        assert promote.json()["model"]["status"] == "active", promote.text
         active_model = client.get("/api/models/active", auth=auth)
         assert active_model.status_code == 200, active_model.text
         assert active_model.json()["status"] == "active", active_model.text
@@ -583,6 +659,7 @@ def main() -> None:
         with SessionLocal() as session:
             decisions_before = session.scalar(select(func.count(AiDecision.id))) or 0
             experiences_before = session.scalar(select(func.count(ExperienceRecord.id))) or 0
+            timeline_events_before = session.scalar(select(func.count(DecisionTimelineEvent.id))) or 0
             candles_before = session.scalar(select(func.count(Candle.id))) or 0
         assert candles_before > 0
 
@@ -622,9 +699,13 @@ def main() -> None:
         with SessionLocal() as session:
             decisions_after = session.scalar(select(func.count(AiDecision.id))) or 0
             experiences_after = session.scalar(select(func.count(ExperienceRecord.id))) or 0
+            timeline_events_after = session.scalar(select(func.count(DecisionTimelineEvent.id))) or 0
             latest_feature = session.scalar(select(Feature).order_by(Feature.created_at.desc()).limit(1))
         assert decisions_after > decisions_before
-        assert experiences_after > experiences_before
+        assert timeline_events_after > timeline_events_before
+        # The mandatory V2 pipeline records typed prediction/signal/timeline state;
+        # it does not append the legacy ExperienceRecord used by the retired loop.
+        assert experiences_after >= experiences_before
         assert latest_feature is not None
         assert (latest_feature.payload or {}).get("values", {}).get("candles_used", 0) > 0
         assert (latest_feature.payload or {}).get("values", {}).get("last_close") is not None
@@ -632,7 +713,7 @@ def main() -> None:
         assert feature_latest.status_code == 200, feature_latest.text
         feature_payload = feature_latest.json()
         assert feature_payload["symbol"] == "BTCUSDT", feature_latest.text
-        assert feature_payload["schema_version"] == "price-news-market-v4", feature_latest.text
+        assert feature_payload["schema_version"] == CURRENT_FEATURE_SCHEMA_VERSION, feature_latest.text
         assert "sentiment_confidence" in feature_payload["vector"], feature_latest.text
         assert "candle_return_1m" in feature_payload["vector"], feature_latest.text
         assert "trader_crowd_score" in feature_payload["vector"], feature_latest.text
@@ -786,12 +867,10 @@ def main() -> None:
         dry_run = subprocess.run(
             [
                 sys.executable,
-                "scripts/train_local_model.py",
+                "-m",
+                "app.training.train_price_model",
                 "--dataset",
                 str(exported_path),
-                "--target",
-                "target_trade_quality_score",
-                "--dry-run",
             ],
             cwd=ROOT,
             capture_output=True,
@@ -799,7 +878,7 @@ def main() -> None:
             check=False,
         )
         assert dry_run.returncode == 0, dry_run.stderr or dry_run.stdout
-        assert '"labeled_rows": 0' not in dry_run.stdout, dry_run.stdout
+        assert "model=" in dry_run.stdout, dry_run.stdout
 
         bundles_build = client.post("/api/data/bundles/build", json={"days": 2, "include_unfinished": True}, auth=auth)
         assert bundles_build.status_code == 200, bundles_build.text

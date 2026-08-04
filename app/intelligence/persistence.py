@@ -7,18 +7,30 @@ It does not import signal, portfolio, risk, or execution code.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db.models import ExternalAIRequest, NewsArticle, StructuredNewsEvent as StructuredNewsEventRecord
+from app.pipeline.artifact_store import ArtifactIntegrityError, resolve_model_artifact
+from app.pipeline.registry import ModelRegistry
 
-from .providers import GenericOpenAICompatibleProvider, LocalStudentProvider
-from .schemas import NewsDocument
+from .providers import (
+    GenericOpenAICompatibleProvider,
+    IntelligenceProviderError,
+    LocalStudentProvider,
+    NEWS_STUDENT_MODEL_FAMILY,
+)
+from .schemas import NewsDocument, ProviderResponse, ProviderUsage, RequestStatus, StructuredNewsEvent
 from .service import IntelligenceRouter, RouterPolicy
+
+
+_HTTP_ATTEMPT_STATUSES = {RequestStatus.SUCCESS.value.upper(), RequestStatus.FAILED.value.upper()}
+logger = logging.getLogger(__name__)
 
 
 def _utc(value: datetime | None) -> datetime:
@@ -37,7 +49,211 @@ def _symbol_for_asset(asset: str) -> str:
     return f"{normalized}USDT" if normalized and normalized not in {"USDT", "USDC"} else normalized
 
 
-def build_intelligence_router() -> IntelligenceRouter:
+def _attempt_multiplier(row: ExternalAIRequest) -> int:
+    """Count old aggregate retry rows and new one-row-per-attempt records."""
+
+    payload = row.payload if isinstance(row.payload, Mapping) else {}
+    if payload.get("http_attempt") is True:
+        return 1
+    if str(row.status or "").upper() not in _HTTP_ATTEMPT_STATUSES:
+        return 0
+    # Before per-attempt persistence, one terminal row represented all retries.
+    return max(int(row.retry_count or 0) + 1, 1)
+
+
+def hydrate_intelligence_router(
+    session: Session,
+    router: IntelligenceRouter,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Restore quota, spend, rate-limit, and circuit state from request audits."""
+
+    now = _utc(now)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    rows = list(
+        session.scalars(
+            select(ExternalAIRequest)
+            .where(ExternalAIRequest.requested_at >= month_start)
+            .order_by(ExternalAIRequest.requested_at)
+        )
+    )
+    daily_requests = 0
+    monthly_spend = 0.0
+    last_requested: dict[str, datetime] = {}
+    for row in rows:
+        multiplier = _attempt_multiplier(row)
+        if multiplier <= 0:
+            continue
+        requested_at = _utc(row.requested_at)
+        if requested_at.date() == now.date():
+            daily_requests += multiplier
+        monthly_spend += max(float(row.estimated_cost_usd or 0.0), 0.0) * multiplier
+        current = last_requested.get(row.provider)
+        if current is None or requested_at > current:
+            last_requested[row.provider] = requested_at
+
+    consecutive_failures: dict[str, tuple[int, datetime | None]] = {}
+    history_limit = max(router.policy.circuit_failure_threshold * 4, 25)
+    for provider in router.providers:
+        history = list(
+            session.scalars(
+                select(ExternalAIRequest)
+                .where(
+                    ExternalAIRequest.provider == provider,
+                    ExternalAIRequest.status.in_(tuple(_HTTP_ATTEMPT_STATUSES)),
+                )
+                .order_by(desc(ExternalAIRequest.requested_at))
+                .limit(history_limit)
+            )
+        )
+        failure_count = 0
+        latest_failure_at: datetime | None = None
+        for row in history:
+            status = str(row.status or "").upper()
+            if status == RequestStatus.SUCCESS.value.upper():
+                break
+            if status == RequestStatus.FAILED.value.upper():
+                failure_count += _attempt_multiplier(row)
+                if latest_failure_at is None:
+                    latest_failure_at = _utc(row.completed_at or row.requested_at)
+        if history:
+            latest_attempt_at = _utc(history[0].requested_at)
+            current = last_requested.get(provider)
+            if current is None or latest_attempt_at > current:
+                last_requested[provider] = latest_attempt_at
+            consecutive_failures[provider] = (failure_count, latest_failure_at)
+
+    router.hydrate_persistent_state(
+        now=now,
+        daily_requests=daily_requests,
+        monthly_spend_usd=monthly_spend,
+        provider_last_requested_at=last_requested,
+        provider_consecutive_failures=consecutive_failures,
+    )
+
+
+def _hydrate_persistent_cache(
+    session: Session,
+    router: IntelligenceRouter,
+    document: NewsDocument,
+    prompt_version: str,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Load a prior validated external event into the TTL cache by content hash."""
+
+    now = _utc(now)
+    ttl_seconds = max(int(router.policy.cache_ttl_seconds), 0)
+    if ttl_seconds <= 0:
+        return False
+    cache_key = router.cache_key(document, prompt_version)
+    if router.cache.get(cache_key, now=now) is not None:
+        return True
+    cutoff = now - timedelta(seconds=ttl_seconds)
+    audits = list(
+        session.scalars(
+            select(ExternalAIRequest)
+            .where(
+                ExternalAIRequest.content_hash == document.content_hash,
+                ExternalAIRequest.prompt_version == prompt_version,
+                # Cache hits do not extend TTL; the original successful request is
+                # always the expiry anchor.
+                ExternalAIRequest.status == RequestStatus.SUCCESS.value.upper(),
+                ExternalAIRequest.requested_at >= cutoff,
+            )
+            .order_by(desc(ExternalAIRequest.requested_at))
+            .limit(20)
+        )
+    )
+    for audit in audits:
+        audit_payload = audit.payload if isinstance(audit.payload, Mapping) else {}
+        try:
+            article_id = int(audit_payload.get("article_id"))
+        except (TypeError, ValueError):
+            continue
+        stored = session.scalar(
+            select(StructuredNewsEventRecord)
+            .where(
+                StructuredNewsEventRecord.article_id == article_id,
+                StructuredNewsEventRecord.prompt_version == prompt_version,
+            )
+            .order_by(desc(StructuredNewsEventRecord.created_at))
+            .limit(1)
+        )
+        stored_payload = stored.payload if stored is not None and isinstance(stored.payload, Mapping) else {}
+        external_payload = stored_payload.get("external_event")
+        if stored_payload.get("document_hash") != document.content_hash or not isinstance(external_payload, Mapping):
+            continue
+        try:
+            event = StructuredNewsEvent.from_mapping(
+                external_payload,
+                provider=str(external_payload.get("provider") or audit.provider),
+                model=external_payload.get("model") or audit.model,
+                prompt_version=prompt_version,
+                source_reference=external_payload.get("source_reference") or document.source_reference,
+                source_text=document.text,
+            )
+            usage_payload = audit.token_usage if isinstance(audit.token_usage, Mapping) else {}
+            usage = ProviderUsage(
+                input_tokens=usage_payload.get("input_tokens"),
+                output_tokens=usage_payload.get("output_tokens"),
+                estimated_cost_usd=float(
+                    usage_payload.get("estimated_cost_usd", audit.estimated_cost_usd or 0.0)
+                ),
+            )
+            response = ProviderResponse(provider=audit.provider, model=audit.model, event=event, usage=usage)
+        except (TypeError, ValueError):
+            continue
+        cached_at = _utc(audit.completed_at or audit.requested_at)
+        remaining_seconds = int(ttl_seconds - max((now - cached_at).total_seconds(), 0.0))
+        if remaining_seconds <= 0:
+            continue
+        router.cache.put(cache_key, response, ttl_seconds=remaining_seconds, now=now)
+        return True
+    return False
+
+
+def _active_local_student(session: Session | None) -> LocalStudentProvider | None:
+    """Resolve DB champion first, then the explicit environment fallback."""
+    if session is not None:
+        try:
+            model = ModelRegistry(session).champion(
+                model_family=NEWS_STUDENT_MODEL_FAMILY,
+                symbol="*",
+            )
+            if model is not None:
+                if model.lifecycle_state != "CHAMPION" or model.status != "active":
+                    raise ValueError("active news student assignment has invalid lifecycle state")
+                runtime_path = resolve_model_artifact(model, session=session)
+                raw_payload = model.raw_payload if isinstance(model.raw_payload, Mapping) else {}
+                return LocalStudentProvider.from_artifact(
+                    runtime_path,
+                    model_name=model.version,
+                    artifact_member=str(
+                        raw_payload.get("model_member")
+                        or raw_payload.get("model_file")
+                        or "student_artifact.json"
+                    ),
+                )
+        except (ArtifactIntegrityError, IntelligenceProviderError, OSError, ValueError) as exc:
+            logger.warning("Active DB news student is unavailable; trying configured fallback: %s", exc)
+
+    if settings.local_news_student_path:
+        try:
+            configured_version = str(settings.local_news_student_version or "").strip()
+            if configured_version == "rule-v1":
+                configured_version = ""
+            return LocalStudentProvider.from_artifact(
+                settings.local_news_student_path,
+                model_name=configured_version or None,
+            )
+        except (ArtifactIntegrityError, IntelligenceProviderError, OSError, ValueError) as exc:
+            logger.warning("Configured news student is unavailable; local rules will be used: %s", exc)
+    return None
+
+
+def build_intelligence_router(session: Session | None = None) -> IntelligenceRouter:
     """Build the lightweight process-local router from explicit configuration.
 
     Configured Gemini, Groq, Hugging Face router, or generic OpenAI-compatible
@@ -46,14 +262,7 @@ def build_intelligence_router() -> IntelligenceRouter:
     preferred locally and falls back to deterministic rules on any artifact failure.
     """
     providers = []
-    local_provider = (
-        LocalStudentProvider(
-            settings.local_news_student_path,
-            model_name=settings.local_news_student_version,
-        )
-        if settings.local_news_student_path
-        else None
-    )
+    local_provider = _active_local_student(session)
     provider_specs = [
         (
             "gemini",
@@ -120,6 +329,7 @@ def build_intelligence_router() -> IntelligenceRouter:
             cache_ttl_seconds=settings.external_ai_cache_ttl_seconds,
             circuit_failure_threshold=settings.external_ai_circuit_breaker_failures,
             circuit_open_seconds=settings.external_ai_circuit_breaker_seconds,
+            provider_min_interval_seconds=settings.external_ai_provider_min_interval_seconds,
         ),
     )
 
@@ -130,6 +340,7 @@ async def enrich_article(
     *,
     router: IntelligenceRouter | None = None,
     force: bool = False,
+    hydrate_state: bool = True,
 ) -> StructuredNewsEventRecord:
     """Analyze one stored article and persist its selected structured event.
 
@@ -138,7 +349,7 @@ async def enrich_article(
     failed external provider still yields a local event and therefore cannot stop
     collection or the paper pipeline.
     """
-    active_router = router or build_intelligence_router()
+    active_router = router or build_intelligence_router(session)
     prompt_version = settings.external_ai_prompt_version
     if not force:
         existing = session.scalar(
@@ -166,6 +377,10 @@ async def enrich_article(
         relevant_assets=(),
         metadata={"article_id": article.id},
     )
+    if hydrate_state:
+        hydrate_intelligence_router(session, active_router)
+    if not force:
+        _hydrate_persistent_cache(session, active_router, document, prompt_version)
     result = await active_router.analyze(document, prompt_version=prompt_version)
     event = result.selected_event
     affected = list(event.affected_assets)
@@ -190,6 +405,10 @@ async def enrich_article(
                     "article_id": article.id,
                     "affected_symbols": [_symbol_for_asset(asset) for asset in affected],
                     "reason_codes": list(result.reason_codes),
+                    "http_attempt": audit.status in {RequestStatus.SUCCESS, RequestStatus.FAILED},
+                    "attempt_number": audit.retry_count + 1
+                    if audit.status in {RequestStatus.SUCCESS, RequestStatus.FAILED}
+                    else None,
                 },
             )
         )
@@ -244,8 +463,17 @@ async def enrich_recent_articles(
     """Enrich a bounded batch for the independent enrichment worker or admin API."""
     bounded = min(max(int(limit), 1), 250)
     articles = list(session.scalars(select(NewsArticle).order_by(desc(NewsArticle.created_at)).limit(bounded)))
-    active_router = router or build_intelligence_router()
+    active_router = router or build_intelligence_router(session)
+    hydrate_intelligence_router(session, active_router)
     rows: list[StructuredNewsEventRecord] = []
     for article in articles:
-        rows.append(await enrich_article(session, article, router=active_router, force=force))
+        rows.append(
+            await enrich_article(
+                session,
+                article,
+                router=active_router,
+                force=force,
+                hydrate_state=False,
+            )
+        )
     return rows

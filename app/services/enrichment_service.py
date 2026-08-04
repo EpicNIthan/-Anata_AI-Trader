@@ -36,7 +36,10 @@ class EnrichmentService:
         self.interval_seconds = max(int(interval_seconds or settings.enrichment_interval_seconds), 15)
         self.batch_size = min(max(int(batch_size or settings.enrichment_batch_size), 1), 250)
         self.state = EnrichmentState()
-        self.router = build_intelligence_router()
+        # Re-resolve the manually active DB artifact for each bounded pass so a
+        # separate Railway enrichment role observes explicit activations without a
+        # process restart. Persistent quota/circuit state is hydrated from the DB.
+        self.router = None
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -64,7 +67,8 @@ class EnrichmentService:
         self.state.last_started_at = datetime.now(timezone.utc).isoformat()
         with SessionLocal() as session:
             try:
-                rows = await enrich_recent_articles(session, limit=self.batch_size, router=self.router)
+                active_router = build_intelligence_router(session)
+                rows = await enrich_recent_articles(session, limit=self.batch_size, router=active_router)
                 session.commit()
                 self.state.rows_processed += len(rows)
                 self.state.last_error = None

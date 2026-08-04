@@ -15,14 +15,18 @@ def auth_enabled() -> bool:
     return bool(settings.admin_token or (settings.dashboard_username and settings.dashboard_password))
 
 
-def admin_token_query_is_valid(request: Request) -> bool:
-    token = request.query_params.get("admin_token") or request.query_params.get("token")
-    return _token_valid(token)
+def admin_token_is_valid(value: str | None) -> bool:
+    """Validate a token supplied outside the URL/query string."""
+
+    return _token_valid(value)
 
 
 def require_admin(request: Request) -> None:
     if not auth_enabled():
-        return
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin authentication is not configured; set ADMIN_TOKEN or dashboard credentials.",
+        )
     if _request_is_authorized(request):
         return
     raise HTTPException(
@@ -41,7 +45,6 @@ def _request_is_authorized(request: Request) -> bool:
     return (
         _token_valid(request.headers.get("x-admin-token"))
         or _token_valid(request.cookies.get(ADMIN_COOKIE_NAME))
-        or admin_token_query_is_valid(request)
     )
 
 

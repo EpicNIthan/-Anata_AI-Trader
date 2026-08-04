@@ -19,9 +19,10 @@ http://localhost:8000/vision
 ```
 
 `/dashboard/vision` is a compatibility alias. When `ADMIN_TOKEN` is configured, open
-`/vision?admin_token=YOUR_TOKEN` once; the route stores an HTTP-only cookie so browser
-polling can authenticate. With dashboard username/password configured, use browser
-Basic Auth. Do not place a production token in screenshots or shared links.
+`/admin/login?next=/vision`; the form sends the secret in the request body and stores
+it in a strict HTTP-only cookie so browser polling can authenticate. URL query tokens
+are rejected because URLs are commonly written to access logs. With dashboard
+username/password configured, use browser Basic Auth.
 
 Railway uses the same path: `https://YOUR-APP.up.railway.app/vision`.
 
@@ -32,15 +33,17 @@ Railway uses the same path: `https://YOUR-APP.up.railway.app/vision`.
 | Candles and live bar | `candles`, `live_candle_updates` |
 | Prediction/model views | `model_predictions`, `trading_signals`, ensemble weights |
 | Ensemble and disagreements | `ensemble_decisions` |
-| Requested/approved exposure | `portfolio_targets`, `risk_decisions` |
-| Orders, fills, trades, position/equity | V2 simulated records plus compatible legacy paper ledger |
-| News and external AI | `structured_news_events`, `external_ai_requests`, legacy news rows |
+| Requested/approved exposure | `portfolio_targets`, `risk_decisions`; both are marked on the main chart |
+| Orders, fills, trades, position/equity | V2 simulated records plus the account-scoped compatible paper ledger |
+| News and external AI | decision-linked `model_predictions`, structured/legacy news, and explicitly labeled latest fallbacks |
 | Research lifecycle | assignments, candidates, evaluations, health, promotions, sandboxes |
 | Decision replay | `decision_timeline_events` and stage-linked V2 records |
 
-The API labels legacy-only data as partial. It does not invent missing model,
-ensemble, risk, slippage, funding, or attribution stages. Staleness is computed from
-stored timestamps rather than the browser refresh time.
+The API labels legacy-only data as partial. A `PaperTrade` row with a
+`decision_trace_id` is labeled `v2-paper-ledger`; an older untraced row remains
+`legacy`. It does not invent missing model, ensemble, risk, slippage, funding, or
+attribution stages. Staleness is computed from stored timestamps rather than the
+browser refresh time.
 
 ## Read-only API
 
@@ -79,7 +82,16 @@ Invoke-RestMethod "http://localhost:8000/api/vision/decisions?symbol=BTCUSDT&sou
 `chart`, `overlays`, `history`, and `decisions` accept ISO-8601 `start` and `end`
 where applicable. `chart` also accepts a validated timeframe such as `1m`; list
 endpoints have bounded `limit` parameters. Use a registered sandbox account ID to
-inspect its isolated records.
+inspect its isolated records. Paper trades, open positions, equity snapshots,
+portfolio targets, risk decisions, simulated orders, and fills are queried with an
+exact `paper_account_id`; a sandbox request does not fall back to champion records.
+
+The state endpoint derives external-AI provider/prompt and local-news-model lineage
+from the predictions attached to the displayed `decision_trace_id`. If those
+prediction rows are unavailable, any latest symbol request or latest global news
+version is returned only with `lineage_match=false` and an explicit `*_fallback`
+source label. The page repeats that fallback label rather than presenting it as
+decision-linked evidence.
 
 ## Replay semantics
 
@@ -105,10 +117,16 @@ interface; use raw-data export for research history.
 
 ## Performance and attribution
 
-The history endpoint calculates basic paper-ledger metrics and includes trace-based V2
-attribution where records exist. It keeps an explicit unexplained residual and does
-not fabricate counterfactual ensemble, sizing, or broad-market contributions. Legacy
-opening fills may include entry fees in realized PnL, so Vision labels that limitation.
+The history endpoint calculates outcome metrics only from attribution rows where
+`is_closed_pnl=true`. `trade_count`, wins/losses, win rate, profit factor, expectancy,
+and `closed_paper_pnl` therefore exclude opening/increase ledger events. It exposes
+`ledger_event_count` and `ledger_total_paper_pnl` separately so entry fees and other
+non-close cash-flow events remain visible without being called losing trades.
+
+Trace-based V2 attribution remains bounded and includes per-event lineage, component
+methods/coverage, risk-resize and sizing dimensions, external-AI provider, and UTC
+time-period groups. It keeps an explicit unexplained residual and does not fabricate
+counterfactual ensemble, sizing, broad-market, or funding cash-flow contributions.
 
 ## Troubleshooting
 

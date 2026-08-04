@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import shutil
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -140,6 +142,54 @@ def _delete_archive(archive_id: str | None) -> dict[str, Any]:
     }
 
 
+def _verified_local_copy(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bind destructive Railway cleanup to the exact downloaded archive bytes."""
+
+    if payload.get("local_manifest_verified") is not True:
+        raise ValueError("Refusing cleanup without local_manifest_verified=true")
+    verification = payload.get("local_verification")
+    if not isinstance(verification, dict) or verification.get("valid") is not True:
+        raise ValueError("Refusing cleanup without a successful structured local verification report")
+    if verification.get("successful_local_file_close") is not True:
+        raise ValueError("Refusing cleanup because the local archive was not confirmed closed")
+    archive_id = payload.get("archive_id")
+    if not isinstance(archive_id, str) or Path(archive_id).name != archive_id or not archive_id.endswith(".zip"):
+        raise ValueError("Refusing cleanup with an invalid archive_id")
+    archive_path = (RAW_EXPORT_ROOT / archive_id).resolve()
+    root = RAW_EXPORT_ROOT.resolve()
+    if root not in archive_path.parents or not archive_path.is_file():
+        raise ValueError("Refusing cleanup because the Railway archive is unavailable for checksum comparison")
+    expected_digest = str(payload.get("local_archive_sha256") or "").lower()
+    if len(expected_digest) != 64 or any(character not in "0123456789abcdef" for character in expected_digest):
+        raise ValueError("Refusing cleanup because local_archive_sha256 is invalid")
+    digest = hashlib.sha256()
+    with archive_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual_digest = digest.hexdigest()
+    if not hmac.compare_digest(actual_digest, expected_digest):
+        raise ValueError("Refusing cleanup because the local and Railway archive checksums differ")
+    try:
+        local_size = int(payload.get("local_archive_size_bytes"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Refusing cleanup because local_archive_size_bytes is invalid") from exc
+    if local_size <= 0 or local_size != archive_path.stat().st_size:
+        raise ValueError("Refusing cleanup because the local and Railway archive sizes differ")
+    return {
+        "verified": True,
+        "archive_id": archive_id,
+        "sha256": actual_digest,
+        "size_bytes": local_size,
+        "row_counts": verification.get("row_counts") or {},
+        "first_timestamp": verification.get("first_timestamp"),
+        "last_timestamp": verification.get("last_timestamp"),
+        "missing_interval_summary": verification.get("missing_interval_summary") or {},
+        "news_count": int(verification.get("news_count") or 0),
+        "derivatives_count": int(verification.get("derivatives_count") or 0),
+        "successful_local_file_close": True,
+    }
+
+
 def _delete_finished_data(payload: dict[str, Any]) -> dict[str, Any]:
     deleted: list[str] = []
     missing: list[str] = []
@@ -251,6 +301,7 @@ def cleanup_downloaded_raw_data(session: Session, payload: dict[str, Any] | None
     """
 
     payload = payload or {}
+    verification = _verified_local_copy(payload)
     result: dict[str, Any] = {
         "status": "ok",
         "ran_at": datetime.now(timezone.utc).isoformat(),
@@ -258,6 +309,8 @@ def cleanup_downloaded_raw_data(session: Session, payload: dict[str, Any] | None
         "deleted_finished_data": None,
         "deleted_database_rows": None,
         "database_size_note": POSTGRES_SIZE_NOTE,
+        "local_copy_verification": verification,
+        "cleanup_confirmation": False,
     }
 
     if payload.get("delete_archive", True):
@@ -269,4 +322,5 @@ def cleanup_downloaded_raw_data(session: Session, payload: dict[str, Any] | None
     if payload.get("delete_db_rows", False):
         result["deleted_database_rows"] = delete_raw_database_rows(session, payload)
 
+    result["cleanup_confirmation"] = True
     return result

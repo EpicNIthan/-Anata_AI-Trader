@@ -367,6 +367,10 @@ class FeatureBuilder:
             "external_ai_provider": external_ai_features["external_ai_provider"],
             "external_ai_prompt_version": external_ai_features["external_ai_prompt_version"],
             "external_ai_direction_score": external_ai_features["external_ai_direction_score"],
+            # Local rule/student lineage is independent from the optional external
+            # overlay and is intentionally retained as non-numeric audit metadata.
+            "local_news_provider": news_features["local_news_provider"],
+            "local_news_model_version": news_features["local_news_model_version"],
         }
         inspector_vector = {
             key: values[key]
@@ -509,6 +513,9 @@ class FeatureBuilder:
                     "adx": 14,
                 },
                 "news_context": news_features["news_context"],
+                "local_news_provider": news_features["local_news_provider"],
+                "local_news_model_version": news_features["local_news_model_version"],
+                "base_news_source": news_features["base_news_source"],
                 "derivatives_context": derivatives_features["derivatives_context"],
                 "external_context": external_features["external_context"],
                 "external_ai_context": external_ai_features["external_ai_context"],
@@ -520,7 +527,8 @@ class FeatureBuilder:
             },
             sources={
                 "candles": "candles",
-                "news_sentiment": "news_sentiment",
+                "base_news": news_features["base_news_source"],
+                "news_sentiment": "legacy_fallback_only",
                 "derivatives": "external_data_events",
                 "market_context": "external_data_events",
                 "structured_news_events": "structured_news_events",
@@ -974,6 +982,220 @@ class FeatureBuilder:
         }
 
     def _recent_news_features(self, symbol: str, now: datetime) -> dict[str, Any]:
+        """Build base news features from the local event recorded by enrichment.
+
+        The selected structured-event columns may describe an optional external
+        overlay.  Base features therefore read only ``payload.local_event`` and use
+        the row's point-in-time availability.  Legacy ``news_sentiment`` is retained
+        only for databases that have not produced any structured local events yet.
+        """
+        local = self._recent_local_news_features(symbol, now)
+        if local is not None:
+            return local
+        return self._recent_legacy_news_features(symbol, now)
+
+    def _recent_local_news_features(self, symbol: str, now: datetime) -> dict[str, Any] | None:
+        now = _aware(now) or datetime.now(timezone.utc)
+        since = now - timedelta(hours=48)
+        rows = list(
+            self.session.execute(
+                select(StructuredNewsEvent, NewsArticle)
+                .outerjoin(NewsArticle, NewsArticle.id == StructuredNewsEvent.article_id)
+                .where(
+                    StructuredNewsEvent.available_to_model_time.is_not(None),
+                    StructuredNewsEvent.available_to_model_time >= since,
+                    StructuredNewsEvent.available_to_model_time <= now,
+                    or_(
+                        StructuredNewsEvent.validation_status.in_(
+                            ("VALID", "valid", "VALID_WITH_WARNINGS", "valid_with_warnings")
+                        ),
+                        StructuredNewsEvent.validation_status.is_(None),
+                    ),
+                )
+                .order_by(desc(StructuredNewsEvent.available_to_model_time))
+                .limit(200)
+            )
+        )
+        normalized_symbol = symbol.upper()
+        base_asset = normalized_symbol
+        for suffix in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH"):
+            if normalized_symbol.endswith(suffix) and len(normalized_symbol) > len(suffix):
+                base_asset = normalized_symbol[: -len(suffix)]
+                break
+        symbol_aliases = {normalized_symbol, base_asset}
+
+        parsed: list[dict[str, Any]] = []
+        for row, article in rows:
+            payload = row.payload if isinstance(row.payload, dict) else {}
+            local_event = payload.get("local_event")
+            if not isinstance(local_event, dict):
+                continue
+            affected_assets = tuple(
+                dict.fromkeys(
+                    str(value).upper()
+                    for value in (local_event.get("affected_assets") or ())
+                    if str(value).strip()
+                )
+            )
+            probability_payload = local_event.get("affected_asset_probabilities")
+            if not isinstance(probability_payload, dict):
+                metadata = local_event.get("metadata")
+                probability_payload = (
+                    metadata.get("affected_asset_probabilities", {})
+                    if isinstance(metadata, dict)
+                    else {}
+                )
+            asset_probabilities = {
+                str(asset).upper(): _clamp(_float(probability), 0.0, 1.0)
+                for asset, probability in probability_payload.items()
+            }
+            event_type = str(local_event.get("event_type") or "other").lower()
+            market_wide = not affected_assets or event_type in {"macro", "regulatory"}
+            matches = set(affected_assets) & symbol_aliases
+            if not market_wide and not matches:
+                parsed.append(
+                    {
+                        "relevant": False,
+                        "affected_assets": affected_assets,
+                        "event_type": event_type,
+                    }
+                )
+                continue
+            matching_probability = (
+                1.0
+                if market_wide
+                else max(
+                    [asset_probabilities.get(asset, 0.5) for asset in matches]
+                    or [0.5]
+                )
+            )
+            metadata = local_event.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            source_reliability = local_event.get(
+                "source_reliability", metadata.get("source_reliability", 0.5)
+            )
+            confidence = _clamp(_float(local_event.get("confidence"), 0.0), 0.0, 1.0)
+            reliability = _clamp(_float(source_reliability, 0.5), 0.0, 1.0)
+            recency = _recency_weight(row.available_to_model_time, now, horizon_hours=48.0)
+            parsed.append(
+                {
+                    "relevant": True,
+                    "row": row,
+                    "article": article,
+                    "event": local_event,
+                    "event_type": event_type,
+                    "affected_assets": affected_assets,
+                    "asset_probabilities": asset_probabilities,
+                    "sentiment": _clamp(_float(local_event.get("sentiment")), -1.0, 1.0),
+                    "severity": _clamp(_float(local_event.get("severity")), 0.0, 1.0),
+                    "importance": _clamp(_float(local_event.get("importance")), 0.0, 1.0),
+                    "novelty": _clamp(_float(local_event.get("novelty")), 0.0, 1.0),
+                    "confidence": confidence,
+                    "source_reliability": reliability,
+                    "recency": recency,
+                    "weight": max(recency, 0.01)
+                    * max(confidence, 0.05)
+                    * max(reliability, 0.05)
+                    * max(matching_probability, 0.05),
+                    "provider": str(local_event.get("provider") or "local_unknown"),
+                    "model": str(
+                        local_event.get("model")
+                        or metadata.get("local_model_version")
+                        or "unknown-local-model"
+                    ),
+                }
+            )
+        if not parsed:
+            return None
+
+        relevant = [item for item in parsed if item.get("relevant")]
+        all_assets = {
+            asset for item in parsed for asset in item.get("affected_assets", ())
+        }
+        btc_related = 1.0 if "BTC" in all_assets or "BTCUSDT" in all_assets else 0.0
+        eth_related = 1.0 if "ETH" in all_assets or "ETHUSDT" in all_assets else 0.0
+        macro_related = (
+            1.0
+            if any(item.get("event_type") in {"macro", "regulatory"} for item in parsed)
+            else 0.0
+        )
+        if not relevant:
+            return {
+                "sentiment_score": 0.0,
+                "sentiment_confidence": 0.0,
+                "risk_score": 0.0,
+                "impact_score": 0.0,
+                "recency_weight": 0.0,
+                "btc_related": btc_related,
+                "eth_related": eth_related,
+                "macro_related": macro_related,
+                "sentiment_articles_used": 0,
+                "news_context": [],
+                "local_news_provider": None,
+                "local_news_model_version": None,
+                "base_news_source": "structured_news_events.local_event",
+            }
+
+        total_weight = sum(float(item["weight"]) for item in relevant) or 1.0
+        weighted = lambda key: sum(float(item[key]) * float(item["weight"]) for item in relevant) / total_weight
+        sentiment_score = weighted("sentiment")
+        confidence = weighted("confidence")
+        severity = weighted("severity")
+        importance = weighted("importance")
+        novelty = weighted("novelty")
+        recency = mean(float(item["recency"]) for item in relevant)
+        impact_score = _clamp(
+            (abs(sentiment_score) * confidence * 0.25)
+            + (severity * 0.30)
+            + (importance * 0.30)
+            + (novelty * 0.10)
+            + (recency * 0.05),
+            0.0,
+            1.0,
+        )
+        latest = relevant[0]
+        return {
+            "sentiment_score": _clamp(sentiment_score, -1.0, 1.0),
+            "sentiment_confidence": _clamp(confidence, 0.0, 1.0),
+            "risk_score": _clamp(severity, 0.0, 1.0),
+            "impact_score": impact_score,
+            "recency_weight": _clamp(recency, 0.0, 1.0),
+            "btc_related": btc_related,
+            "eth_related": eth_related,
+            "macro_related": macro_related,
+            "sentiment_articles_used": len(relevant),
+            "local_news_provider": latest["provider"],
+            "local_news_model_version": latest["model"],
+            "base_news_source": "structured_news_events.local_event",
+            "news_context": [
+                {
+                    "structured_event_id": item["row"].id,
+                    "article_id": item["row"].article_id,
+                    "title": item["article"].title if item["article"] is not None else None,
+                    "source": (
+                        item["article"].source_name or item["article"].source
+                        if item["article"] is not None
+                        else None
+                    ),
+                    "event_type": item["event_type"],
+                    "affected_assets": list(item["affected_assets"]),
+                    "affected_asset_probabilities": item["asset_probabilities"],
+                    "sentiment_score": item["sentiment"],
+                    "sentiment_confidence": item["confidence"],
+                    "risk_score": item["severity"],
+                    "importance": item["importance"],
+                    "source_reliability": item["source_reliability"],
+                    "local_news_provider": item["provider"],
+                    "local_news_model_version": item["model"],
+                    "available_to_model_time": item["row"].available_to_model_time.isoformat()
+                    if item["row"].available_to_model_time
+                    else None,
+                }
+                for item in relevant[:5]
+            ],
+        }
+
+    def _recent_legacy_news_features(self, symbol: str, now: datetime) -> dict[str, Any]:
         now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
         since = now - timedelta(hours=48)
         available_at = func.coalesce(
@@ -1036,6 +1258,9 @@ class FeatureBuilder:
                 "macro_related": macro_related,
                 "sentiment_articles_used": 0,
                 "news_context": [],
+                "local_news_provider": "legacy_news_sentiment",
+                "local_news_model_version": "legacy-news-sentiment-fallback",
+                "base_news_source": "news_sentiment.legacy_fallback",
             }
 
         weights = [max(weight, 0.01) * (sentiment.confidence if sentiment.confidence is not None else 0.5) for sentiment, _, weight in relevant]
@@ -1056,6 +1281,9 @@ class FeatureBuilder:
             "eth_related": eth_related,
             "macro_related": macro_related,
             "sentiment_articles_used": len(relevant),
+            "local_news_provider": "legacy_news_sentiment",
+            "local_news_model_version": "legacy-news-sentiment-fallback",
+            "base_news_source": "news_sentiment.legacy_fallback",
             "news_context": [
                 {
                     "title": article.title,

@@ -142,14 +142,37 @@ class InMemoryUsageLedger:
     def last_requested_at(self, provider: str) -> datetime | None:
         return self._last_requested_at.get(provider)
 
-    def reserve_request(self, provider: str, now: datetime) -> None:
+    def reserve_request(self, provider: str, now: datetime, *, estimated_cost_usd: float = 0.0) -> None:
         day = self._day(now)
         self._daily_requests[day] = self._daily_requests.get(day, 0) + 1
         self._last_requested_at[provider] = now
+        self.record_spend(estimated_cost_usd, now)
 
     def record_spend(self, amount: float, now: datetime) -> None:
         month = self._month(now)
         self._monthly_spend[month] = self._monthly_spend.get(month, 0.0) + max(0.0, float(amount))
+
+    def hydrate(
+        self,
+        *,
+        now: datetime,
+        daily_requests: int,
+        monthly_spend_usd: float,
+        provider_last_requested_at: Mapping[str, datetime],
+    ) -> None:
+        """Merge persisted accounting without double-counting live reservations."""
+
+        day = self._day(now)
+        month = self._month(now)
+        self._daily_requests[day] = max(self._daily_requests.get(day, 0), max(int(daily_requests), 0))
+        self._monthly_spend[month] = max(
+            self._monthly_spend.get(month, 0.0),
+            max(float(monthly_spend_usd), 0.0),
+        )
+        for provider, requested_at in provider_last_requested_at.items():
+            current = self._last_requested_at.get(provider)
+            if current is None or requested_at > current:
+                self._last_requested_at[provider] = requested_at
 
 
 @dataclass
@@ -231,6 +254,35 @@ class IntelligenceRouter:
         }
         self._state_lock = asyncio.Lock()
 
+    def hydrate_persistent_state(
+        self,
+        *,
+        now: datetime,
+        daily_requests: int,
+        monthly_spend_usd: float,
+        provider_last_requested_at: Mapping[str, datetime],
+        provider_consecutive_failures: Mapping[str, tuple[int, datetime | None]],
+    ) -> None:
+        """Merge restart-safe request-ledger state before routing a batch.
+
+        The database adapter calls this before any concurrent requests use the
+        process-local router. It deliberately accepts aggregate values rather than
+        importing the ORM into the provider boundary.
+        """
+
+        self.usage_ledger.hydrate(
+            now=now,
+            daily_requests=daily_requests,
+            monthly_spend_usd=monthly_spend_usd,
+            provider_last_requested_at=provider_last_requested_at,
+        )
+        for provider, (failure_count, latest_failure_at) in provider_consecutive_failures.items():
+            breaker = self.circuit_breakers.setdefault(provider, CircuitBreaker())
+            breaker.failure_count = max(int(failure_count), 0)
+            breaker.open_until = None
+            if latest_failure_at is not None and breaker.failure_count >= self.policy.circuit_failure_threshold:
+                breaker.open_until = latest_failure_at + timedelta(seconds=self.policy.circuit_open_seconds)
+
     @staticmethod
     def cache_key(document: NewsDocument, prompt_version: str) -> str:
         return f"{document.content_hash}:{prompt_version}"
@@ -273,34 +325,43 @@ class IntelligenceRouter:
 
     async def _eligibility_audit(
         self, provider: IntelligenceProvider, document: NewsDocument, prompt_version: str, now: datetime
-    ) -> ProviderRequestAudit | None:
-        """Atomically determine whether one provider request may be attempted."""
+    ) -> tuple[ProviderRequestAudit | None, float]:
+        """Atomically reserve one real HTTP attempt or return its rejection audit."""
 
         async with self._state_lock:
             breaker = self.circuit_breakers.setdefault(provider.name, CircuitBreaker())
             if breaker.is_open(now):
-                return self._audit(provider, document, prompt_version, now, now, RequestStatus.CIRCUIT_OPEN)
+                return self._audit(provider, document, prompt_version, now, now, RequestStatus.CIRCUIT_OPEN), 0.0
             if self.policy.daily_request_limit == 0 or self.usage_ledger.daily_requests(now) >= self.policy.daily_request_limit:
-                return self._audit(provider, document, prompt_version, now, now, RequestStatus.QUOTA_EXHAUSTED)
+                return self._audit(provider, document, prompt_version, now, now, RequestStatus.QUOTA_EXHAUSTED), 0.0
             last_requested_at = self.usage_ledger.last_requested_at(provider.name)
             if (
                 last_requested_at is not None
                 and (now - last_requested_at).total_seconds() < self.policy.provider_min_interval_seconds
             ):
-                return self._audit(provider, document, prompt_version, now, now, RequestStatus.RATE_LIMITED)
+                return self._audit(provider, document, prompt_version, now, now, RequestStatus.RATE_LIMITED), 0.0
             estimated_cost = self._request_cost_estimate(provider)
             projected_spend = self.usage_ledger.monthly_spend(now) + estimated_cost
             if estimated_cost > 0.0 and (
                 self.policy.monthly_budget_usd <= 0.0 or projected_spend > self.policy.monthly_budget_usd
             ):
-                return self._audit(provider, document, prompt_version, now, now, RequestStatus.BUDGET_EXHAUSTED)
-            self.usage_ledger.reserve_request(provider.name, now)
-        return None
+                return self._audit(provider, document, prompt_version, now, now, RequestStatus.BUDGET_EXHAUSTED), 0.0
+            self.usage_ledger.reserve_request(provider.name, now, estimated_cost_usd=estimated_cost)
+        return None, estimated_cost
 
-    async def _record_success(self, provider: IntelligenceProvider, usage: ProviderUsage, now: datetime) -> None:
+    async def _record_success(
+        self,
+        provider: IntelligenceProvider,
+        usage: ProviderUsage,
+        reserved_cost_usd: float,
+        now: datetime,
+    ) -> None:
         async with self._state_lock:
             self.circuit_breakers.setdefault(provider.name, CircuitBreaker()).record_success()
-            self.usage_ledger.record_spend(usage.estimated_cost_usd, now)
+            self.usage_ledger.record_spend(
+                max(float(usage.estimated_cost_usd) - max(float(reserved_cost_usd), 0.0), 0.0),
+                now,
+            )
 
     async def _record_failure(self, provider: IntelligenceProvider, now: datetime) -> None:
         async with self._state_lock:
@@ -328,6 +389,7 @@ class IntelligenceRouter:
         status: RequestStatus,
         *,
         usage: ProviderUsage | None = None,
+        estimated_cost_usd: float | None = None,
         error_category: str | None = None,
         retry_count: int = 0,
         cache_hit: bool = False,
@@ -341,7 +403,11 @@ class IntelligenceRouter:
             completed_at=completed_at,
             status=status,
             token_usage=usage,
-            estimated_cost_usd=usage.estimated_cost_usd if usage else 0.0,
+            estimated_cost_usd=(
+                max(float(estimated_cost_usd), 0.0)
+                if estimated_cost_usd is not None
+                else usage.estimated_cost_usd if usage else 0.0
+            ),
             error_category=error_category,
             retry_count=retry_count,
             cache_hit=cache_hit,
@@ -422,15 +488,18 @@ class IntelligenceRouter:
         audits: list[ProviderRequestAudit] = []
         attempted = False
         for provider in external_providers:
-            requested_at = utc_now()
-            ineligible = await self._eligibility_audit(provider, document, prompt_version, requested_at)
-            if ineligible is not None:
-                audits.append(ineligible)
-                reasons.append(f"{provider.name}_{ineligible.status.value}")
-                continue
-            attempted = True
-            final_error: Exception | None = None
+            provider_attempted = False
             for retry in range(self.policy.max_retries + 1):
+                requested_at = utc_now()
+                ineligible, reserved_cost = await self._eligibility_audit(
+                    provider, document, prompt_version, requested_at
+                )
+                if ineligible is not None:
+                    audits.append(ineligible)
+                    reasons.append(f"{provider.name}_{ineligible.status.value}")
+                    break
+                attempted = True
+                provider_attempted = True
                 try:
                     response = await asyncio.wait_for(
                         provider.enrich(document, prompt_version=prompt_version), timeout=self.policy.timeout_seconds
@@ -438,7 +507,7 @@ class IntelligenceRouter:
                     if not isinstance(response, ProviderResponse):
                         raise IntelligenceProviderError("provider did not return ProviderResponse")
                     completed_at = utc_now()
-                    await self._record_success(provider, response.usage, completed_at)
+                    await self._record_success(provider, response.usage, reserved_cost, completed_at)
                     async with self._state_lock:
                         self.cache.put(cache_key, response, ttl_seconds=self.policy.cache_ttl_seconds, now=completed_at)
                     audits.append(
@@ -450,6 +519,7 @@ class IntelligenceRouter:
                             completed_at,
                             RequestStatus.SUCCESS,
                             usage=response.usage,
+                            estimated_cost_usd=max(reserved_cost, response.usage.estimated_cost_usd),
                             retry_count=retry,
                         )
                     )
@@ -461,24 +531,30 @@ class IntelligenceRouter:
                         audits=audits,
                     )
                 except Exception as exc:  # Provider failures deliberately cannot escape this boundary.
-                    final_error = exc
+                    completed_at = utc_now()
+                    await self._record_failure(provider, completed_at)
+                    audits.append(
+                        self._audit(
+                            provider,
+                            document,
+                            prompt_version,
+                            requested_at,
+                            completed_at,
+                            RequestStatus.FAILED,
+                            estimated_cost_usd=reserved_cost,
+                            error_category=self._error_category(exc),
+                            retry_count=retry,
+                        )
+                    )
                     if retry < self.policy.max_retries:
-                        await asyncio.sleep(self.policy.retry_backoff_seconds * (2**retry))
-            completed_at = utc_now()
-            await self._record_failure(provider, completed_at)
-            audits.append(
-                self._audit(
-                    provider,
-                    document,
-                    prompt_version,
-                    requested_at,
-                    completed_at,
-                    RequestStatus.FAILED,
-                    error_category=self._error_category(final_error or IntelligenceProviderError()),
-                    retry_count=self.policy.max_retries,
-                )
-            )
-            reasons.append(f"{provider.name}_failed")
+                        await asyncio.sleep(
+                            max(
+                                self.policy.retry_backoff_seconds * (2**retry),
+                                self.policy.provider_min_interval_seconds,
+                            )
+                        )
+            if provider_attempted:
+                reasons.append(f"{provider.name}_failed")
         return self._result(
             document,
             local_event,

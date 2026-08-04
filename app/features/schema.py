@@ -451,6 +451,25 @@ def columns_for_schema(schema_version: str | None = None) -> list[str]:
     return list(FEATURE_COLUMNS_BY_SCHEMA.get(version, FEATURE_COLUMNS_BY_SCHEMA[CURRENT_FEATURE_SCHEMA_VERSION]))
 
 
+MODEL_INPUT_OPTIONAL_COLUMNS = [
+    "last_close",
+    "candles_used",
+    "sentiment_articles_used",
+    "price_change",
+    "external_ai_available",
+    "external_ai_missing",
+    "external_ai_failed",
+    "external_ai_confidence",
+    "external_ai_age_seconds",
+    "external_ai_direction_score",
+]
+
+
+def model_input_columns_for_schema(schema_version: str | None = None) -> list[str]:
+    """Numeric columns that the live point-in-time snapshot can actually serve."""
+    return list(dict.fromkeys([*columns_for_schema(schema_version), *MODEL_INPUT_OPTIONAL_COLUMNS]))
+
+
 def feature_payload(
     *,
     schema_version: str,

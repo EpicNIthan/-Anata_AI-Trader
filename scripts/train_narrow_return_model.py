@@ -23,6 +23,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from app.research import chronological_split, ensure_utc, evaluate_predictions  # noqa: E402
 from app.research.evaluation import row_timestamp  # noqa: E402
+from app.features.schema import model_input_columns_for_schema  # noqa: E402
 from scripts.research_utils import read_research_rows, sha256_file  # noqa: E402
 
 
@@ -102,7 +103,12 @@ def _feature_file(path: Path | None) -> list[str]:
     return [str(value).strip() for value in payload if str(value).strip()]
 
 
-def _infer_features(rows: Sequence[Mapping[str, Any]], target: str) -> list[str]:
+def _infer_features(
+    rows: Sequence[Mapping[str, Any]],
+    target: str,
+    *,
+    allowed_features: set[str] | None = None,
+) -> list[str]:
     if not rows:
         return []
     first = rows[0]
@@ -112,12 +118,33 @@ def _infer_features(rows: Sequence[Mapping[str, Any]], target: str) -> list[str]
         lowered = name.lower()
         if name == target or lowered in NON_FEATURE_NAMES or lowered.startswith("target_"):
             continue
+        if allowed_features is not None and name not in allowed_features:
+            continue
         try:
             _finite(_nested_value(first, name), label=name)
         except (KeyError, ValueError):
             continue
         features.append(name)
     return features
+
+
+def _dataset_schema_version(rows: Sequence[Mapping[str, Any]], requested: str | None) -> str:
+    observed = {
+        str(row.get("feature_schema_version") or row.get("schema_version") or "").strip()
+        for row in rows
+        if str(row.get("feature_schema_version") or row.get("schema_version") or "").strip()
+    }
+    if len(observed) > 1:
+        raise ValueError("input contains multiple feature schema versions; train each schema separately")
+    dataset_schema = next(iter(observed), None)
+    if requested and dataset_schema and requested != dataset_schema:
+        raise ValueError(
+            f"requested feature schema {requested!r} does not match dataset schema {dataset_schema!r}"
+        )
+    schema = requested or dataset_schema
+    if not schema:
+        raise ValueError("feature schema version is missing; pass --feature-schema-version explicitly")
+    return schema
 
 
 def _validate_contract(features: Sequence[str], target: str) -> None:
@@ -207,7 +234,18 @@ def train_artifact(
         raise ValueError("transaction cost cannot be negative")
     _validate_contract(feature_columns, target_name)
 
-    normalized_rows = [dict(row) for row in rows]
+    normalized_rows: list[dict[str, Any]] = []
+    dropped_unlabeled_rows = 0
+    for row in rows:
+        candidate = dict(row)
+        try:
+            _finite(_nested_value(candidate, target_name), label=target_name)
+        except (KeyError, ValueError):
+            dropped_unlabeled_rows += 1
+            continue
+        normalized_rows.append(candidate)
+    if len(normalized_rows) < 3:
+        raise ValueError("too few rows with a finite future-return label")
     split = chronological_split(
         normalized_rows,
         train_fraction=train_fraction,
@@ -241,9 +279,19 @@ def train_artifact(
 
     import numpy as np
 
+    imputed_feature_values = 0
+
+    def feature_value(row: Mapping[str, Any], name: str) -> float:
+        nonlocal imputed_feature_values
+        try:
+            return _finite(_nested_value(row, name), label=name)
+        except (KeyError, ValueError):
+            imputed_feature_values += 1
+            return 0.0
+
     def matrix(indices: Sequence[int]) -> tuple[Any, Any]:
         x = np.asarray(
-            [[_finite(_nested_value(normalized_rows[index], name), label=name) for name in feature_columns] for index in indices],
+            [[feature_value(normalized_rows[index], name) for name in feature_columns] for index in indices],
             dtype=float,
         )
         y = np.asarray(
@@ -305,6 +353,11 @@ def train_artifact(
         "target_name": target_name,
         "feature_schema_version": feature_schema_version,
         "preprocessing_version": "raw-linear-v1",
+        "missing_value_policy": {
+            "strategy": "zero",
+            "imputed_feature_values": imputed_feature_values,
+            "dropped_unlabeled_rows": dropped_unlabeled_rows,
+        },
         "forecast_horizon_seconds": forecast_horizon_seconds,
         "training_dataset_version": dataset_version,
         "model_family": "alpha.linear_return",
@@ -349,7 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     feature_group = parser.add_mutually_exclusive_group()
     feature_group.add_argument("--features", help="Ordered, comma-separated numeric features.")
     feature_group.add_argument("--features-file", type=Path, help="JSON feature list/contract.")
-    parser.add_argument("--feature-schema-version", default="price-news-market-v5")
+    parser.add_argument("--feature-schema-version", help="Defaults to the single schema recorded in the dataset.")
     parser.add_argument("--forecast-horizon-seconds", type=int, default=300)
     parser.add_argument("--train-fraction", type=float, default=0.60)
     parser.add_argument("--validation-fraction", type=float, default=0.20)
@@ -369,20 +422,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     rows = read_research_rows(args.input)
     if not rows:
         raise SystemExit("no input rows found")
+    try:
+        feature_schema_version = _dataset_schema_version(rows, args.feature_schema_version)
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc), "paper_only": True}, indent=2), file=sys.stderr)
+        return 2
+    allowed_features = set(model_input_columns_for_schema(feature_schema_version))
     features = (
         [value.strip() for value in args.features.split(",") if value.strip()]
         if args.features
         else _feature_file(args.features_file)
     )
     if not features:
-        features = _infer_features(rows, args.target)
+        features = _infer_features(rows, args.target, allowed_features=allowed_features)
+    unsupported = sorted(set(features) - allowed_features)
+    if unsupported:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error": "features are not served by the live schema: " + ", ".join(unsupported),
+                    "paper_only": True,
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     dataset_version = args.dataset_version or f"sha256:{sha256_file(args.input)}"
     try:
         artifact = train_artifact(
             rows=rows,
             feature_columns=features,
             target_name=args.target,
-            feature_schema_version=args.feature_schema_version,
+            feature_schema_version=feature_schema_version,
             forecast_horizon_seconds=args.forecast_horizon_seconds,
             train_fraction=args.train_fraction,
             validation_fraction=args.validation_fraction,

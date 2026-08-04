@@ -85,6 +85,8 @@
           <div class="chart-legend">
             <span><i class="legend-dot entry"></i>Paper entry / exit</span>
             <span><i class="legend-dot forecast"></i>Recorded forecast</span>
+            <span><i class="legend-dot forecast"></i>Requested target</span>
+            <span><i class="legend-dot entry"></i>Approved risk target</span>
             <span><i class="legend-dot news"></i>News event</span>
             <span><i class="legend-dot liquidation"></i>Liquidation event</span>
             <span><i class="legend-dot conflict"></i>Model disagreement</span>
@@ -154,10 +156,12 @@
             <span class="muted" id="historyStatus">-</span>
           </div>
           <div class="metric-grid history-metrics">
-            <div><span>Trades</span><strong id="metricTrades">-</strong></div>
+            <div><span>Closed trades</span><strong id="metricTrades">-</strong></div>
+            <div><span>Ledger events</span><strong id="metricLedgerEvents">-</strong></div>
             <div><span>Wins / losses</span><strong id="metricWins">-</strong></div>
             <div><span>Win rate</span><strong id="metricWinRate">-</strong></div>
-            <div><span>Net PnL</span><strong id="metricPnl">-</strong></div>
+            <div><span>Closed-event PnL</span><strong id="metricPnl">-</strong></div>
+            <div><span>Ledger total PnL</span><strong id="metricLedgerPnl">-</strong></div>
             <div><span>Profit factor</span><strong id="metricProfitFactor">-</strong></div>
             <div><span>Fees</span><strong id="metricFees">-</strong></div>
             <div><span>Max drawdown</span><strong id="metricDrawdown">-</strong></div>
@@ -200,6 +204,6 @@
       </section>
     </main>
 
-    <script src="/static/vision.js?v=anata-v2"></script>
+    <script src="/static/vision.js?v=anata-v2-ledger-lineage"></script>
   </body>
 </html>

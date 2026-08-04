@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping, TYPE_CHECKING
 
 from app.pipeline.domain import FeatureSnapshot, HealthStatus, ModelPrediction
+from app.pipeline.artifact_store import ArtifactIntegrityError, resolve_model_artifact
 from app.pipeline.narrow_models import NarrowModel, PredictionDistribution, _clamp, _sigmoid, _value
 
 if TYPE_CHECKING:  # Keep the forecasting boundary usable without importing the ORM.
@@ -68,6 +69,7 @@ class RegisteredArtifactModel(NarrowModel):
     registry_model_version_id: int | None = None
     artifact_checksum: str | None = None
     artifact_member: str | None = None
+    required_news_student_version: str | None = None
     calibration_score: float = 0.50
     metrics: Mapping[str, Any] = field(default_factory=dict)
     _payload: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
@@ -80,6 +82,10 @@ class RegisteredArtifactModel(NarrowModel):
             raise ArtifactModelError("registered artifact has no feature column contract")
         if not row.path:
             raise ArtifactModelError("registered artifact path is empty")
+        try:
+            artifact_path = resolve_model_artifact(row)
+        except ArtifactIntegrityError as exc:
+            raise ArtifactModelError(f"registered artifact integrity check failed: {exc}") from exc
         metrics = dict(row.metrics or {})
         calibration = metrics.get("calibration_score", metrics.get("calibration", 0.50))
         try:
@@ -98,12 +104,17 @@ class RegisteredArtifactModel(NarrowModel):
             required_features=columns,
             optional_features=(),
             forecast_horizon=max(int(row.forecast_horizon_seconds or 300), 1),
-            artifact_path=row.path,
+            artifact_path=str(artifact_path),
             expected_feature_schema_version=row.feature_schema_version or "",
             preprocessing_version=row.preprocessing_version or "v1",
             registry_model_version_id=row.id,
             artifact_checksum=row.artifact_checksum,
-            artifact_member=(row.raw_payload or {}).get("model_file") if isinstance(row.raw_payload, dict) else None,
+            artifact_member=(
+                (row.raw_payload or {}).get("model_member")
+                or (row.raw_payload or {}).get("model_file")
+            )
+            if isinstance(row.raw_payload, dict)
+            else None,
             calibration_score=calibration_score,
             metrics=metrics,
         )
@@ -124,6 +135,17 @@ class RegisteredArtifactModel(NarrowModel):
                     missing.append(name)
             except (TypeError, ValueError):
                 missing.append(name)
+        if self.required_news_student_version:
+            observed_news_version = str(
+                snapshot.external_context.get("local_news_model_version") or ""
+            ).strip()
+            if not observed_news_version:
+                missing.append("LOCAL_NEWS_STUDENT_VERSION_MISSING")
+            elif observed_news_version != self.required_news_student_version:
+                missing.append(
+                    "LOCAL_NEWS_STUDENT_VERSION_MISMATCH:"
+                    f"{observed_news_version}!={self.required_news_student_version}"
+                )
         return sorted(set(missing))
 
     def predict_distribution(self, snapshot: FeatureSnapshot) -> PredictionDistribution:
@@ -158,6 +180,10 @@ class RegisteredArtifactModel(NarrowModel):
                     "registered_model_version_id": self.registry_model_version_id,
                     "artifact_checksum": self.artifact_checksum,
                     "preprocessing_version": self.preprocessing_version,
+                    "required_news_student_version": self.required_news_student_version,
+                    "observed_news_student_version": snapshot.external_context.get(
+                        "local_news_model_version"
+                    ),
                     "legacy_sizing_targets_ignored": True,
                 },
             }
@@ -174,6 +200,7 @@ class RegisteredArtifactModel(NarrowModel):
             "baseline": False,
             "registered_model_version_id": self.registry_model_version_id,
             "preprocessing_version": self.preprocessing_version,
+            "required_news_student_version": self.required_news_student_version,
             "legacy_sizing_targets_ignored": True,
         }
 
@@ -190,6 +217,7 @@ class RegisteredArtifactModel(NarrowModel):
             if not isinstance(payload, dict):
                 raise ArtifactModelError("registered JSON artifact must contain an object")
             self._payload = payload
+            self._set_news_student_contract(payload.get("news_student_version"))
             self._validate_json_payload()
             return
         if suffix == ".zip":
@@ -209,6 +237,11 @@ class RegisteredArtifactModel(NarrowModel):
                 if "model_metadata.json" in names:
                     raw = json.loads(archive.read("model_metadata.json").decode("utf-8"))
                     metadata = raw if isinstance(raw, dict) else {}
+                if "news_student_version.json" in names:
+                    contract = json.loads(
+                        archive.read("news_student_version.json").decode("utf-8")
+                    )
+                    self._set_news_student_contract(contract)
                 declared = self.artifact_member or metadata.get("model_file") or metadata.get("artifact_path")
                 candidates = []
                 if declared:
@@ -245,6 +278,20 @@ class RegisteredArtifactModel(NarrowModel):
                     self._validate_estimator()
         except (OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
             raise ArtifactModelError("registered model package is invalid") from exc
+
+    def _set_news_student_contract(self, value: Any) -> None:
+        if value is None:
+            self.required_news_student_version = None
+            return
+        if not isinstance(value, Mapping) or not isinstance(value.get("required"), bool):
+            raise ArtifactModelError("news student version contract is invalid")
+        version = value.get("version")
+        if value["required"]:
+            if not isinstance(version, str) or not version.strip():
+                raise ArtifactModelError("required news student version is missing")
+            self.required_news_student_version = version.strip()
+        else:
+            self.required_news_student_version = None
 
     def _validate_json_payload(self) -> None:
         coefficients = self._payload.get("coefficients")

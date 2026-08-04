@@ -11,6 +11,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib import error, request
 
+try:
+    from scripts.sync_verification import refresh_export_manifests, verify_export_archive
+except ModuleNotFoundError:  # Direct ``python scripts/download_raw_data.py`` execution.
+    from sync_verification import refresh_export_manifests, verify_export_archive
+
 
 TRAINING_RAW_TABLES = [
     "candles",
@@ -143,6 +148,7 @@ def _unique_sibling(path: Path, label: str) -> Path:
 
 
 def _zip_folder(folder: Path, output_path: Path) -> None:
+    refresh_export_manifests(folder)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for path in sorted(folder.rglob("*")):
@@ -311,11 +317,18 @@ def _split_daily_archive(
                 merge_existing=merge_existing,
                 overwrite=overwrite,
             )
+            verification_target = Path(str(entry.get("duplicate_path") or entry["path"]))
+            daily_verification = verify_export_archive(verification_target, require_checksums=True)
+            if not daily_verification["valid"]:
+                details = "; ".join(daily_verification.get("errors") or ["unknown verification failure"])
+                raise RuntimeError(f"Local daily archive failed verification: {verification_target}: {details}")
+            entry["verification"] = daily_verification
+            entry["verified_path"] = str(verification_target)
             entry["day"] = day_folder.name
             entries.append(entry)
     return {
         "daily_file_count": len(entries),
-        "daily_files": [str(entry["path"]) for entry in entries],
+        "daily_files": [str(entry["verified_path"]) for entry in entries],
         "daily_file_entries": entries,
     }
 
@@ -410,6 +423,10 @@ def main() -> None:
         output.write_bytes(_api(args.url, args.token, f"/api/raw-data/download/{archive_id}", timeout=args.timeout))
         local_manifest = _zip_manifest(output)
         manifest = export.get("manifest") or local_manifest
+        archive_verification = verify_export_archive(output, require_checksums=True)
+        if not archive_verification["valid"]:
+            details = "; ".join(archive_verification.get("errors") or ["unknown verification failure"])
+            raise RuntimeError(f"Downloaded archive failed local verification; cleanup was not attempted: {details}")
         split_result = (
             _split_daily_archive(
                 output,
@@ -437,6 +454,7 @@ def main() -> None:
             "time_range": manifest.get("time_range", {}),
             "symbols": manifest.get("symbols", []),
             "warnings": manifest.get("warnings", []),
+            "verification": archive_verification,
             "finished_days": finished_days,
             "unfinished_days": unfinished_days,
             "daily_split": split_result,
@@ -460,6 +478,9 @@ def main() -> None:
                 "delete_all_finished_data": args.delete_all_finished_data,
                 "delete_db_rows": args.delete_railway_db_rows,
                 "local_manifest_verified": True,
+                "local_verification": archive_verification,
+                "local_archive_sha256": archive_verification["archive_sha256"],
+                "local_archive_size_bytes": archive_verification["archive_size_bytes"],
                 "local_file_size_bytes": sum(Path(path).stat().st_size for path in (split_result or {}).get("daily_files", [])) if split_result else output.stat().st_size,
             }
             result["cleanup"] = _json_api(

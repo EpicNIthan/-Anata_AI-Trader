@@ -28,10 +28,11 @@ from app.db.models import (
     ShadowPrediction,
 )
 from app.db.session import get_session
+from app.pipeline.attribution import paper_pnl_attribution
 from app.pipeline.domain import ModelPrediction
 from app.pipeline.registry import ModelRegistry
 from app.pipeline.service import V2PipelineService
-from app.pipeline.monitoring import RollingHealthMonitor, paper_pnl_attribution
+from app.pipeline.monitoring import RollingHealthMonitor
 from app.security import require_admin
 
 
@@ -645,6 +646,9 @@ def run_monitoring(
 def get_paper_attribution(
     symbol: str | None = Query(default=None, min_length=3, max_length=32),
     paper_account_id: str | None = Query(default=None, min_length=1, max_length=128),
+    start: datetime | None = Query(default=None),
+    end: datetime | None = Query(default=None),
+    time_period: str = Query(default="day", pattern="^(hour|day|week|month)$"),
     limit: int = Query(default=2_000, ge=1, le=10_000),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
@@ -653,9 +657,14 @@ def get_paper_attribution(
     normalized = symbol.upper() if symbol else None
     if normalized and not _SYMBOL_PATTERN.fullmatch(normalized):
         raise HTTPException(status_code=422, detail="symbol contains unsupported characters")
+    if start and end and _aware(end) < _aware(start):
+        raise HTTPException(status_code=422, detail="end must be greater than or equal to start")
     return paper_pnl_attribution(
         session,
         symbol=normalized,
         account_id=paper_account_id,
+        start=start,
+        end=end,
         limit=limit,
+        time_period=time_period,
     )

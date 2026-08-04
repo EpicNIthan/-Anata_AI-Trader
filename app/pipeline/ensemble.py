@@ -17,6 +17,14 @@ from app.pipeline.domain import (
 )
 
 
+_TRADABLE_LIFECYCLES = {
+    SignalLifecycle.PAPER,
+    SignalLifecycle.LIMITED,
+    SignalLifecycle.PRODUCTION,
+    SignalLifecycle.REDUCED,
+}
+
+
 class EnsembleModel(Protocol):
     """Future learned meta-model contract; it receives signals, never orders."""
 
@@ -82,7 +90,7 @@ class DeterministicRegimeEnsemble:
                 exclusions[signal.signal_id] = "SYMBOL_MISMATCH"
             elif not signal.is_valid_at(now):
                 exclusions[signal.signal_id] = "EXPIRED"
-            elif signal.lifecycle_status in {SignalLifecycle.SHADOW, SignalLifecycle.SUSPENDED, SignalLifecycle.RETIRED}:
+            elif signal.lifecycle_status not in _TRADABLE_LIFECYCLES:
                 exclusions[signal.signal_id] = f"LIFECYCLE_{signal.lifecycle_status.value}"
             elif signal.health_status in {HealthStatus.SUSPENDED, HealthStatus.RETIRED}:
                 exclusions[signal.signal_id] = f"HEALTH_{signal.health_status.value}"

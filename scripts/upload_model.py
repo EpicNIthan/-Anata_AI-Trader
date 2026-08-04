@@ -5,7 +5,9 @@ import json
 import mimetypes
 import uuid
 from pathlib import Path
+from typing import Any, Callable
 from urllib import request
+from urllib.parse import urlsplit
 
 
 def _multipart_body(field_name: str, path: Path, boundary: str) -> bytes:
@@ -19,6 +21,54 @@ def _multipart_body(field_name: str, path: Path, boundary: str) -> bytes:
     return header + path.read_bytes() + footer
 
 
+def upload_package(
+    *,
+    url: str,
+    token: str,
+    package: Path,
+    timeout_seconds: float = 120.0,
+    opener: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Upload one checksummed package as a candidate; never activate it."""
+
+    if not token:
+        raise ValueError("admin token is required")
+    if not package.is_file() or package.suffix.lower() != ".zip":
+        raise ValueError("package must be an existing .zip file")
+    parsed_url = urlsplit(url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise ValueError("url must be an absolute HTTP(S) base URL")
+    if parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
+        raise ValueError("url must not contain credentials, a query, or a fragment")
+    boundary = f"----anata-{uuid.uuid4().hex}"
+    data = _multipart_body("file", package, boundary)
+    req = request.Request(
+        url.rstrip("/") + "/api/models/upload",
+        data=data,
+        method="POST",
+        headers={
+            "x-admin-token": token,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    active_opener = opener or request.urlopen
+    with active_opener(req, timeout=timeout_seconds) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("upload response must contain a JSON object")
+    model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
+    lifecycle = str(model.get("lifecycle_state") or "").upper()
+    if lifecycle and lifecycle != "TRAINED":
+        raise ValueError("upload endpoint returned a non-TRAINED lifecycle")
+    response_status = str(payload.get("status") or "").lower()
+    model_status = str(model.get("status") or "").lower()
+    if response_status and response_status not in {"candidate", "trained"}:
+        raise ValueError("upload endpoint returned a non-candidate status")
+    if model_status and model_status not in {"candidate", "trained"}:
+        raise ValueError("upload endpoint returned an active model")
+    return payload
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Upload a packaged model to Railway as a candidate.")
     parser.add_argument("--url", required=True)
@@ -26,19 +76,12 @@ def main() -> None:
     parser.add_argument("--package", type=Path, required=True)
     args = parser.parse_args()
 
-    boundary = f"----anata-{uuid.uuid4().hex}"
-    data = _multipart_body("file", args.package, boundary)
-    req = request.Request(
-        args.url.rstrip("/") + "/api/models/upload",
-        data=data,
-        method="POST",
-        headers={
-            "x-admin-token": args.token,
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
+    print(
+        json.dumps(
+            upload_package(url=args.url, token=args.token, package=args.package),
+            indent=2,
+        )
     )
-    with request.urlopen(req, timeout=120) as response:
-        print(json.dumps(json.loads(response.read().decode("utf-8")), indent=2))
 
 
 if __name__ == "__main__":

@@ -46,7 +46,8 @@ from app.db.session import create_db_and_tables, get_session
 from app.features.feature_builder import FeatureBuilder
 from app.features.schema import CURRENT_FEATURE_SCHEMA_VERSION, columns_for_schema, values_from_feature
 from app.pipeline.domain import ModelLifecycle
-from app.pipeline.registry import ArtifactValidator, ModelRegistry
+from app.pipeline.artifact_store import ArtifactIntegrityError, verify_package_checksum_manifest
+from app.pipeline.registry import ModelRegistry
 from app.security import require_admin
 from app.services.collector_status import latest_candles, latest_news, market_snapshot, news_snapshot
 from app.services.data_bundles import (
@@ -508,42 +509,96 @@ def _save_uploaded_model_package(upload: UploadFile) -> dict[str, Any]:
     package_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     safe_filename = Path(upload.filename or f"model_package_{timestamp}.zip").name
-    if not safe_filename.endswith(".zip"):
+    if not safe_filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Model package must be a .zip file")
     package_path = package_dir / f"{timestamp}_{safe_filename}"
     with package_path.open("wb") as handle:
         shutil.copyfileobj(upload.file, handle)
 
     try:
+        verify_package_checksum_manifest(
+            package_path.read_bytes(),
+            require_manifest=True,
+        )
         with zipfile.ZipFile(package_path) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)):
+                raise HTTPException(status_code=400, detail="Model package contains duplicate members")
+            for name in names:
+                _safe_zip_member_path(name)
+            prohibited = sorted(
+                name
+                for name in names
+                if Path(name).suffix.lower() in {".joblib", ".pkl", ".pickle"}
+            )
+            if prohibited:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Remote model uploads accept declarative JSON only; pickle/joblib members are forbidden",
+                )
+            non_json_members = sorted(
+                name for name in names if not name.endswith("/") and Path(name).suffix.lower() != ".json"
+            )
+            if non_json_members:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Remote model packages may contain declarative JSON members only",
+                )
             metadata = _find_model_metadata(archive)
-            model_file_hint = metadata.get("model_file") or metadata.get("model_path")
+            model_file_hint = metadata.get("model_file") or metadata.get("model_path") or metadata.get("artifact")
+            contract_names = {
+                "feature_schema.json",
+                "model_metadata.json",
+                "metadata.json",
+                "training_metrics.json",
+                "training_period.json",
+                "required_features.json",
+                "optional_features.json",
+                "missing_value_policy.json",
+                "news_student_version.json",
+                "checksum_manifest.json",
+            }
             model_names = [
                 name
-                for name in archive.namelist()
-                if Path(name).suffix.lower() in {".joblib", ".pkl", ".json"} and name != metadata.get("_metadata_file")
+                for name in names
+                if Path(name).suffix.lower() == ".json"
+                and Path(name).name.lower() not in contract_names
+                and name != metadata.get("_metadata_file")
             ]
             if model_file_hint:
                 hinted = str(model_file_hint)
-                if hinted in archive.namelist():
-                    model_names.insert(0, hinted)
-            model_member = next((name for name in model_names if Path(name).suffix.lower() in {".joblib", ".pkl"}), None)
-            model_member = model_member or next((name for name in model_names if Path(name).suffix.lower() == ".json"), None)
+                matched = next(
+                    (name for name in names if name == hinted or Path(name).name == Path(hinted).name),
+                    None,
+                )
+                if (
+                    matched
+                    and Path(matched).suffix.lower() == ".json"
+                    and Path(matched).name.lower() not in contract_names
+                ):
+                    model_names.insert(0, matched)
+            model_member = next(iter(dict.fromkeys(model_names)), None)
             if not model_member:
-                raise HTTPException(status_code=400, detail="Model package must include a .joblib, .pkl, or .json model file")
-            member_path = _safe_zip_member_path(model_member)
-            version = str(metadata.get("version") or timestamp)
-            extract_dir = settings.model_dir / "uploaded" / version
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            output_path = extract_dir / member_path.name
-            with archive.open(model_member) as source, output_path.open("wb") as target:
-                shutil.copyfileobj(source, target)
+                raise HTTPException(status_code=400, detail="Model package must include a declarative JSON artifact")
+            try:
+                artifact_payload = json.loads(archive.read(model_member).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=400, detail="Declarative model JSON is invalid") from exc
+            if not isinstance(artifact_payload, dict):
+                raise HTTPException(status_code=400, detail="Declarative model JSON must contain an object")
+            metadata["model_member"] = model_member
     except zipfile.BadZipFile as exc:
         package_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Invalid model package zip") from exc
+    except ArtifactIntegrityError as exc:
+        package_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Model package integrity check failed: {exc}") from exc
+    except HTTPException:
+        package_path.unlink(missing_ok=True)
+        raise
 
     metadata["package_path"] = str(package_path)
-    metadata["model_file"] = str(output_path)
+    metadata["model_file"] = str(metadata["model_member"])
     metadata.setdefault("version", timestamp)
     metadata.setdefault("created_at", datetime.now(timezone.utc).isoformat())
     return metadata
@@ -1661,6 +1716,7 @@ def create_paper_trade(
         price=payload.price,
         quantity=payload.quantity,
         notional=payload.notional,
+        compatibility_source="api.paper-trade",
     )
     execution = {
         "status": result.status,
@@ -1668,6 +1724,10 @@ def create_paper_trade(
         "trade_id": result.trade_id,
         "balance": result.balance,
         "equity": result.equity,
+        "risk_decision_id": result.risk_decision_id,
+        "decision_trace_id": result.decision_trace_id,
+        "triggered_limits": list(result.triggered_limits),
+        "rejection_reasons": list(result.rejection_reasons),
     }
     ai_decision = AiDecision(
         symbol=payload.symbol,
@@ -1709,6 +1769,7 @@ def run_strategy(
         reason=decision.reason,
         stop_loss=decision.stop_loss,
         take_profit=decision.take_profit,
+        compatibility_source="api.strategy-paper",
     )
     execution = {
         "status": engine_result.status,
@@ -1716,6 +1777,10 @@ def run_strategy(
         "trade_id": engine_result.trade_id,
         "balance": engine_result.balance,
         "equity": engine_result.equity,
+        "risk_decision_id": engine_result.risk_decision_id,
+        "decision_trace_id": engine_result.decision_trace_id,
+        "triggered_limits": list(engine_result.triggered_limits),
+        "rejection_reasons": list(engine_result.rejection_reasons),
     }
     ai_decision = AiDecision(
         symbol=symbol.upper(),
@@ -2373,29 +2438,42 @@ def upload_model(
     feature_columns = metadata.get("feature_columns") or metadata.get("features") or columns_for_schema(metadata.get("feature_schema_version"))
     if not isinstance(feature_columns, list):
         raise HTTPException(status_code=400, detail="Model metadata feature_columns must be a list")
-    model = ModelVersion(
-        model_id=model_id,
-        name=name,
-        version=version,
-        feature_schema_version=str(metadata.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION),
-        feature_columns=[str(column) for column in feature_columns],
-        path=str(metadata.get("model_file") or metadata.get("package_path")),
-        parent_model_id=metadata.get("parent_model_id"),
-        checkpoint_path=metadata.get("checkpoint_path") or metadata.get("from_checkpoint"),
-        status="candidate",
-        model_family=str(metadata.get("model_family") or metadata.get("model_type") or "alpha.uploaded_return"),
-        lifecycle_state=ModelLifecycle.TRAINED.value,
-        health_status="HEALTHY",
-        artifact_checksum=ArtifactValidator.checksum(Path(str(metadata.get("model_file") or metadata.get("package_path")))),
-        preprocessing_version=str(metadata.get("preprocessing_version") or "legacy-v1"),
-        training_dataset_version=metadata.get("training_dataset_version") or metadata.get("training_dataset_hash") or metadata.get("dataset_hash"),
-        forecast_horizon_seconds=int(metadata.get("forecast_horizon_seconds") or metadata.get("forecast_horizon") or 300),
-        package_manifest={"package_path": metadata.get("package_path"), "legacy_upload": True},
-        metrics=metadata.get("metrics") if isinstance(metadata.get("metrics"), dict) else {},
-        raw_payload=metadata,
-    )
-    session.add(model)
-    session.commit()
+    package_path = str(metadata["package_path"])
+    try:
+        model = ModelRegistry(session).register(
+            model_id=model_id,
+            name=name,
+            version=version,
+            feature_schema_version=str(metadata.get("feature_schema_version") or CURRENT_FEATURE_SCHEMA_VERSION),
+            feature_columns=[str(column) for column in feature_columns],
+            path=package_path,
+            parent_model_id=metadata.get("parent_model_id"),
+            model_family=str(
+                metadata.get("model_family")
+                or metadata.get("model_type")
+                or "alpha.uploaded_return"
+            ),
+            lifecycle=ModelLifecycle.TRAINED,
+            preprocessing_version=str(metadata.get("preprocessing_version") or "legacy-v1"),
+            training_dataset_version=(
+                metadata.get("training_dataset_version")
+                or metadata.get("training_dataset_hash")
+                or metadata.get("dataset_hash")
+            ),
+            forecast_horizon_seconds=int(
+                metadata.get("forecast_horizon_seconds")
+                or metadata.get("forecast_horizon")
+                or 300
+            ),
+            metrics=metadata.get("metrics") if isinstance(metadata.get("metrics"), dict) else {},
+            raw_payload=metadata,
+        )
+        model.checkpoint_path = metadata.get("checkpoint_path") or metadata.get("from_checkpoint")
+        session.commit()
+    except (ValueError, OSError) as exc:
+        session.rollback()
+        Path(package_path).unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.refresh(model)
     return {
         "status": "candidate",

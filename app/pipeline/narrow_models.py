@@ -114,7 +114,22 @@ class NarrowModel(ABC):
             feature_snapshot_id=snapshot.feature_snapshot_id,
             data_version=snapshot.data_version,
             external_context_available=bool(snapshot.external_context.get("external_ai_available", False)),
-            metadata={"missing_features": missing, "fit_metadata": self._fit_metadata, **self.metadata()},
+            metadata={
+                "missing_features": missing,
+                "fit_metadata": self._fit_metadata,
+                # Persist point-in-time provider lineage for later attribution.  The
+                # provider remains null when external context was unavailable; no
+                # request is inferred from timestamps.
+                "external_ai_provider": snapshot.external_context.get("external_ai_provider"),
+                "external_ai_prompt_version": snapshot.external_context.get("external_ai_prompt_version"),
+                "external_ai_available": bool(snapshot.external_context.get("external_ai_available", False)),
+                "external_ai_missing": bool(snapshot.external_context.get("external_ai_missing", True)),
+                "external_ai_failed": bool(snapshot.external_context.get("external_ai_failed", False)),
+                "external_ai_confidence": snapshot.external_context.get("external_ai_confidence"),
+                "local_news_provider": snapshot.external_context.get("local_news_provider"),
+                "local_news_model_version": snapshot.external_context.get("local_news_model_version"),
+                **self.metadata(),
+            },
         )
 
     def metadata(self) -> dict[str, Any]:
@@ -327,6 +342,183 @@ def classify_regime(values: dict[str, Any]) -> str:
 
 
 @dataclass(frozen=True)
+class MarketConditionEstimate:
+    """One bounded, explainable market-condition classification."""
+
+    model_id: str
+    model_family: str
+    label: str
+    score: float
+    confidence: float
+    reason_codes: tuple[str, ...] = ()
+
+
+class MarketConditionModel(ABC):
+    """Execution-independent interface for specialized regime classifiers."""
+
+    model_id: ClassVar[str]
+    model_family: ClassVar[str]
+    required_features: ClassVar[tuple[str, ...]] = ()
+
+    @abstractmethod
+    def classify(self, snapshot: FeatureSnapshot) -> MarketConditionEstimate:
+        """Classify one point-in-time snapshot without sizing or execution authority."""
+
+    def validate_inputs(self, snapshot: FeatureSnapshot) -> tuple[str, ...]:
+        return tuple(name for name in self.required_features if snapshot.values.get(name) in (None, ""))
+
+
+class TrendRegimeModel(MarketConditionModel):
+    model_id = "baseline-trend-regime"
+    model_family = "condition.trend_regime"
+    required_features = ("regime_trend_strength", "regime_direction_score")
+
+    def classify(self, snapshot: FeatureSnapshot) -> MarketConditionEstimate:
+        strength = _clamp(abs(_value(snapshot.values, "regime_trend_strength")), 0.0, 1.0)
+        direction = _value(snapshot.values, "regime_direction_score")
+        label = "range" if strength < 0.35 else "trend_up" if direction >= 0 else "trend_down"
+        return MarketConditionEstimate(
+            self.model_id,
+            self.model_family,
+            label,
+            _clamp(direction * strength, -1.0, 1.0),
+            _clamp(0.5 + strength * 0.5, 0.0, 1.0),
+            ("TREND_STRENGTH_CLASSIFIED",),
+        )
+
+
+class VolatilityRegimeModel(MarketConditionModel):
+    model_id = "baseline-volatility-regime"
+    model_family = "condition.volatility_regime"
+    required_features = ("regime_volatility_score",)
+
+    def classify(self, snapshot: FeatureSnapshot) -> MarketConditionEstimate:
+        score = _clamp(
+            max(
+                _value(snapshot.values, "regime_volatility_score"),
+                abs(_value(snapshot.values, "volatility")) * 40.0,
+            ),
+            0.0,
+            1.0,
+        )
+        label = "low_volatility" if score < 0.25 else "high_volatility" if score >= 0.60 else "normal_volatility"
+        return MarketConditionEstimate(
+            self.model_id,
+            self.model_family,
+            label,
+            score,
+            _clamp(0.55 + abs(score - 0.45) * 0.7, 0.0, 1.0),
+            ("VOLATILITY_LEVEL_CLASSIFIED",),
+        )
+
+
+class LiquidityRegimeModel(MarketConditionModel):
+    model_id = "baseline-liquidity-regime"
+    model_family = "condition.liquidity_regime"
+    required_features = ("regime_liquidity_stress_score",)
+
+    def classify(self, snapshot: FeatureSnapshot) -> MarketConditionEstimate:
+        spread_stress = _value(snapshot.values, "spot_bid_ask_spread_pct") * 150.0
+        score = _clamp(max(_value(snapshot.values, "regime_liquidity_stress_score"), spread_stress), 0.0, 1.0)
+        label = "liquidity_stress" if score >= 0.55 else "thin_liquidity" if score >= 0.30 else "normal_liquidity"
+        return MarketConditionEstimate(
+            self.model_id,
+            self.model_family,
+            label,
+            score,
+            _clamp(0.6 + abs(score - 0.4) * 0.5, 0.0, 1.0),
+            ("LIQUIDITY_STRESS_CLASSIFIED",),
+        )
+
+
+class CrowdingRegimeModel(MarketConditionModel):
+    model_id = "baseline-crowding-regime"
+    model_family = "condition.crowding_regime"
+    required_features = ("crowd_risk_score", "funding_rate")
+
+    def classify(self, snapshot: FeatureSnapshot) -> MarketConditionEstimate:
+        score = _clamp(
+            max(
+                _value(snapshot.values, "crowd_risk_score"),
+                abs(_value(snapshot.values, "funding_rate")) * 500.0,
+            ),
+            0.0,
+            1.0,
+        )
+        label = "crowded" if score >= 0.60 else "watch" if score >= 0.35 else "balanced"
+        return MarketConditionEstimate(
+            self.model_id,
+            self.model_family,
+            label,
+            score,
+            _clamp(0.55 + abs(score - 0.45) * 0.6, 0.0, 1.0),
+            ("CROWDING_CLASSIFIED",),
+        )
+
+
+class NewsShockRegimeModel(MarketConditionModel):
+    model_id = "baseline-news-shock-regime"
+    model_family = "condition.news_shock"
+    required_features = ("regime_news_shock_score",)
+
+    def classify(self, snapshot: FeatureSnapshot) -> MarketConditionEstimate:
+        score = _clamp(
+            max(
+                _value(snapshot.values, "regime_news_shock_score"),
+                _value(snapshot.values, "impact_score") * _value(snapshot.values, "recency_weight"),
+            ),
+            0.0,
+            1.0,
+        )
+        label = "news_shock" if score >= 0.55 else "news_active" if score >= 0.25 else "news_normal"
+        return MarketConditionEstimate(
+            self.model_id,
+            self.model_family,
+            label,
+            score,
+            _clamp(0.55 + abs(score - 0.4) * 0.6, 0.0, 1.0),
+            ("NEWS_SHOCK_CLASSIFIED",),
+        )
+
+
+class RiskAppetiteRegimeModel(MarketConditionModel):
+    model_id = "baseline-risk-appetite-regime"
+    model_family = "condition.risk_appetite"
+    required_features = ("regime_risk_off_score", "market_regime_score")
+
+    def classify(self, snapshot: FeatureSnapshot) -> MarketConditionEstimate:
+        risk_off = _clamp(
+            max(_value(snapshot.values, "regime_risk_off_score"), _value(snapshot.values, "macro_risk_score")),
+            0.0,
+            1.0,
+        )
+        risk_on = _clamp(max(_value(snapshot.values, "market_regime_score"), 0.0), 0.0, 1.0)
+        score = _clamp(risk_on - risk_off, -1.0, 1.0)
+        label = "risk_off" if score <= -0.25 else "risk_on" if score >= 0.25 else "risk_neutral"
+        return MarketConditionEstimate(
+            self.model_id,
+            self.model_family,
+            label,
+            score,
+            _clamp(0.55 + abs(score) * 0.4, 0.0, 1.0),
+            ("RISK_APPETITE_CLASSIFIED",),
+        )
+
+
+def default_market_condition_models() -> list[MarketConditionModel]:
+    """Return all functional lightweight condition-model families."""
+
+    return [
+        TrendRegimeModel(),
+        VolatilityRegimeModel(),
+        LiquidityRegimeModel(),
+        CrowdingRegimeModel(),
+        NewsShockRegimeModel(),
+        RiskAppetiteRegimeModel(),
+    ]
+
+
+@dataclass(frozen=True)
 class CostEstimate:
     spread: float
     slippage: float
@@ -339,35 +531,189 @@ class CostEstimate:
         return max(self.spread, 0.0) + max(self.slippage, 0.0) + max(self.fee, 0.0) + max(self.funding, 0.0)
 
 
+class SpreadEstimateModel:
+    model_id = "baseline-spread-estimate"
+    model_family = "cost.spread"
+
+    def estimate(self, snapshot: FeatureSnapshot) -> float:
+        observed = _value(snapshot.values, "spot_bid_ask_spread_pct")
+        fallback = min(abs(_value(snapshot.values, "volatility")) * 0.05, 0.002)
+        return _clamp(observed if observed > 0 else fallback, 0.0, 0.02)
+
+
+class SlippageEstimateModel:
+    model_id = "baseline-slippage-estimate"
+    model_family = "cost.slippage"
+
+    def estimate(self, snapshot: FeatureSnapshot) -> float:
+        volatility = abs(_value(snapshot.values, "volatility"))
+        stress = _clamp(_value(snapshot.values, "regime_liquidity_stress_score"), 0.0, 1.0)
+        return _clamp(0.00005 + volatility * 0.4 + stress * 0.001, 0.0, 0.01)
+
+
+class FundingCostEstimateModel:
+    model_id = "baseline-funding-cost"
+    model_family = "cost.funding"
+
+    def estimate(self, snapshot: FeatureSnapshot) -> float:
+        # One half funding interval is the conservative default forecast-horizon proxy.
+        return _clamp(abs(_value(snapshot.values, "funding_rate")) * 0.5, 0.0, 0.01)
+
+
+class FillProbabilityEstimateModel:
+    model_id = "baseline-fill-probability"
+    model_family = "cost.fill_probability"
+
+    def estimate(self, snapshot: FeatureSnapshot, *, spread: float | None = None) -> float:
+        spread = SpreadEstimateModel().estimate(snapshot) if spread is None else max(float(spread), 0.0)
+        stress = _clamp(_value(snapshot.values, "regime_liquidity_stress_score"), 0.0, 1.0)
+        missing_penalty = min(len(snapshot.missing_required_features) * 0.08, 0.40)
+        return _clamp(1.0 - max(spread * 150.0, stress) - missing_penalty, 0.0, 1.0)
+
+
+class TransactionCostEstimateModel:
+    model_id = "baseline-transaction-cost"
+    model_family = "cost.transaction"
+
+    @staticmethod
+    def estimate(*, spread: float, slippage: float, fee: float, funding: float) -> float:
+        return sum(max(float(value), 0.0) for value in (spread, slippage, fee, funding))
+
+
 class BaselineCostModel:
     """Estimate paper transaction costs from features without emitting an order."""
 
     model_id: ClassVar[str] = "baseline-cost-model"
     model_family: ClassVar[str] = "cost.transaction"
 
+    def __init__(self) -> None:
+        self.spread_model = SpreadEstimateModel()
+        self.slippage_model = SlippageEstimateModel()
+        self.funding_model = FundingCostEstimateModel()
+        self.fill_model = FillProbabilityEstimateModel()
+        self.transaction_model = TransactionCostEstimateModel()
+
     def estimate(self, snapshot: FeatureSnapshot, *, fee_rate: float = 0.0004) -> CostEstimate:
-        values = snapshot.values
-        spread = max(_value(values, "spot_bid_ask_spread_pct"), 0.0)
-        volatility = abs(_value(values, "volatility"))
-        liquidity_stress = _value(values, "regime_liquidity_stress_score")
-        slippage = min(0.01, 0.00005 + volatility * 0.4 + liquidity_stress * 0.001)
-        funding = abs(_value(values, "funding_rate")) * 0.5
-        liquidity = _clamp(1.0 - max(spread * 150.0, liquidity_stress), 0.0, 1.0)
+        spread = self.spread_model.estimate(snapshot)
+        slippage = self.slippage_model.estimate(snapshot)
+        funding = self.funding_model.estimate(snapshot)
+        liquidity = self.fill_model.estimate(snapshot, spread=spread)
+        self.transaction_model.estimate(
+            spread=spread,
+            slippage=slippage,
+            fee=max(fee_rate, 0.0),
+            funding=funding,
+        )
         return CostEstimate(spread=spread, slippage=slippage, fee=max(fee_rate, 0.0), funding=funding, fill_probability=liquidity)
 
 
+@dataclass(frozen=True)
+class ReliabilityEstimate:
+    calibration: float
+    uncertainty: float
+    feature_drift: float
+    out_of_distribution: float
+    data_quality_confidence: float
+
+    @property
+    def confidence(self) -> float:
+        return _clamp(
+            self.calibration
+            * (1.0 - self.uncertainty)
+            * (1.0 - self.feature_drift)
+            * (1.0 - self.out_of_distribution)
+            * self.data_quality_confidence,
+            0.0,
+            1.0,
+        )
+
+
+class PredictionCalibrationModel:
+    model_id = "baseline-prediction-calibration"
+    model_family = "reliability.calibration"
+
+    def estimate(self, snapshot: FeatureSnapshot) -> float:
+        return _clamp(_value(snapshot.values, "historical_calibration_score", 0.70), 0.0, 1.0)
+
+
+class PredictionUncertaintyModel:
+    model_id = "baseline-prediction-uncertainty"
+    model_family = "reliability.uncertainty"
+
+    def estimate(self, snapshot: FeatureSnapshot) -> float:
+        volatility = min(abs(_value(snapshot.values, "volatility")) * 10.0, 0.25)
+        missing = min(len(snapshot.missing_required_features) * 0.15, 0.60)
+        return _clamp(0.20 + volatility + missing, 0.0, 1.0)
+
+
+class FeatureDriftDetectionModel:
+    model_id = "baseline-feature-drift"
+    model_family = "reliability.feature_drift"
+
+    def estimate(self, snapshot: FeatureSnapshot) -> float:
+        return _clamp(_value(snapshot.values, "feature_drift_score", 0.0), 0.0, 1.0)
+
+
+class OutOfDistributionDetectionModel:
+    model_id = "baseline-out-of-distribution"
+    model_family = "reliability.out_of_distribution"
+
+    def estimate(self, snapshot: FeatureSnapshot) -> float:
+        explicit = _value(snapshot.values, "out_of_distribution_score", 0.0)
+        non_finite = sum(
+            1
+            for value in snapshot.values.values()
+            if isinstance(value, float) and not math.isfinite(value)
+        )
+        return _clamp(max(explicit, non_finite / max(len(snapshot.values), 1)), 0.0, 1.0)
+
+
+class DataQualityConfidenceModel:
+    model_id = "baseline-data-quality-confidence"
+    model_family = "reliability.data_quality"
+
+    def estimate(self, snapshot: FeatureSnapshot) -> float:
+        stale = max(snapshot.source_freshness_seconds.values(), default=0.0)
+        missing_penalty = min(len(snapshot.missing_required_features) * 0.15, 0.70)
+        stale_penalty = min(stale / 1800.0, 0.60)
+        return _clamp(1.0 - missing_penalty - stale_penalty, 0.0, 1.0)
+
+
 class BaselineReliabilityModel:
-    """Estimate data/prediction reliability from missingness and source freshness."""
+    """Compose independent reliability estimates into a bounded quality score."""
 
     model_id: ClassVar[str] = "baseline-reliability-model"
-    model_family: ClassVar[str] = "reliability.data_quality"
+    model_family: ClassVar[str] = "reliability.composite"
+
+    def __init__(self) -> None:
+        self.calibration_model = PredictionCalibrationModel()
+        self.uncertainty_model = PredictionUncertaintyModel()
+        self.drift_model = FeatureDriftDetectionModel()
+        self.ood_model = OutOfDistributionDetectionModel()
+        self.data_quality_model = DataQualityConfidenceModel()
+
+    def assess(self, snapshot: FeatureSnapshot) -> ReliabilityEstimate:
+        return ReliabilityEstimate(
+            calibration=self.calibration_model.estimate(snapshot),
+            uncertainty=self.uncertainty_model.estimate(snapshot),
+            feature_drift=self.drift_model.estimate(snapshot),
+            out_of_distribution=self.ood_model.estimate(snapshot),
+            data_quality_confidence=self.data_quality_model.estimate(snapshot),
+        )
 
     def confidence(self, snapshot: FeatureSnapshot) -> tuple[float, float]:
-        stale = max(snapshot.source_freshness_seconds.values(), default=0.0)
-        missing_penalty = min(len(snapshot.missing_required_features) * 0.15, 0.7)
-        stale_penalty = min(stale / 1800.0, 0.6)
-        uncertainty = _clamp(0.2 + missing_penalty + stale_penalty, 0.0, 1.0)
-        return 1.0 - uncertainty, uncertainty
+        estimate = self.assess(snapshot)
+        combined_uncertainty = _clamp(
+            max(
+                estimate.uncertainty,
+                estimate.feature_drift,
+                estimate.out_of_distribution,
+                1.0 - estimate.data_quality_confidence,
+            ),
+            0.0,
+            1.0,
+        )
+        return estimate.confidence, combined_uncertainty
 
 
 def default_narrow_models() -> list[NarrowModel]:

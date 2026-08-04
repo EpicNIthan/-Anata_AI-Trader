@@ -24,7 +24,9 @@ flowchart LR
 
 - Level 0: `LocalRuleProvider`, deterministic and always available.
 - Level 1: `LocalStudentProvider`, which loads the compact JSON Naive-Bayes
-  artifact produced by `scripts/train_news_student.py`; failure falls back to rules.
+  artifact produced by `scripts/train_news_student.py`; runtime resolves the manually
+  active durable database package first, an environment artifact second, and rules
+  on failure.
 - Level 2: `GenericOpenAICompatibleProvider`, an optional structured-JSON HTTP
   adapter shared by the configured Gemini, Groq, Hugging Face router, and generic
   endpoint entries. `build_intelligence_router()` is the runtime factory.
@@ -47,6 +49,8 @@ non-critical local output. Eligible requests then pass all of these controls:
 - daily request allowance;
 - declared input/output pricing and monthly budget allowance;
 - TTL cache lookup;
+- restart-safe content-hash and prompt-version cache hydration from PostgreSQL;
+- a positive per-provider minimum request interval;
 - per-provider retry and timeout policy;
 - per-provider circuit breaker;
 - strict enum, range, timestamp, factual-claim, and JSON-object validation.
@@ -58,8 +62,13 @@ into the paper loop.
 
 `external_ai_requests` records provider/model names, prompt version, content hash,
 timestamps, status, token counts, estimated cost, retry count, cache status, and a
-non-secret error category. `structured_news_events` records the selected validated
-event and point-in-time availability. Keys are never stored in either table.
+non-secret error category. Each real HTTP attempt, including every retry, gets its own
+row. On process start/batch entry, the router hydrates the current UTC-day quota,
+UTC-month spend, provider request times, and circuit state from these rows.
+`structured_news_events` records the selected validated event and point-in-time
+availability. A successful event can be reused by content hash plus prompt version
+across another URL or process restart until the configured TTL expires. Keys and raw
+provider errors are never stored in either table.
 
 ## Safe configuration
 
@@ -88,6 +97,7 @@ EXTERNAL_AI_MONTHLY_BUDGET_USD=0
 EXTERNAL_AI_DAILY_REQUEST_LIMIT=20
 EXTERNAL_AI_TIMEOUT_SECONDS=15
 EXTERNAL_AI_MAX_RETRIES=2
+EXTERNAL_AI_PROVIDER_MIN_INTERVAL_SECONDS=1
 ```
 
 The zero prices above are appropriate only for an endpoint whose use is genuinely
@@ -110,7 +120,9 @@ locally.
 ## Influence on the V2 ensemble
 
 `FeatureBuilder` reads only events whose `available_to_model_time` is known by the
-decision time. The V2 pipeline uses an external event only when
+decision time. Its base news features come from the persisted `payload.local_event`;
+the selected external event is retained as a separate overlay. The V2 pipeline uses
+an external event only when
 `external_ai_available` is true and converts direction × confidence to a small numeric
 adjustment. `V2_EXTERNAL_CONTEXT_MAX_ADJUSTMENT` is an absolute safety bound. Missing,
 stale, or failed external context contributes zero; it is not silently interpreted as

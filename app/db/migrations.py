@@ -251,6 +251,40 @@ ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "external_ai_requests": {
         "symbol": "VARCHAR(32)",
     },
+    "model_health_snapshots": {
+        "rolling_information_coefficient": "FLOAT",
+        "rolling_net_expectancy": "FLOAT",
+        "calibration_error": "FLOAT",
+        "prediction_drift": "FLOAT",
+        "feature_drift": "FLOAT",
+        "ood_rate": "FLOAT",
+        "missing_feature_rate": "FLOAT",
+        "live_shadow_divergence": "FLOAT",
+        "transaction_cost_increase": "FLOAT",
+        "signal_correlation_increase": "FLOAT",
+        "regime_dependence": "FLOAT",
+        "capacity_decline": "FLOAT",
+        "consecutive_errors": "INTEGER DEFAULT 0",
+        "recommended_weight_multiplier": "FLOAT DEFAULT 1.0",
+        "recommended_action": "VARCHAR(64) DEFAULT 'NORMAL_WEIGHT'",
+    },
+    "signal_health_snapshots": {
+        "rolling_information_coefficient": "FLOAT",
+        "rolling_net_expectancy": "FLOAT",
+        "calibration_error": "FLOAT",
+        "prediction_drift": "FLOAT",
+        "feature_drift": "FLOAT",
+        "ood_rate": "FLOAT",
+        "missing_feature_rate": "FLOAT",
+        "live_shadow_divergence": "FLOAT",
+        "transaction_cost_increase": "FLOAT",
+        "correlation_increase": "FLOAT",
+        "regime_dependence": "FLOAT",
+        "capacity_decline": "FLOAT",
+        "consecutive_errors": "INTEGER DEFAULT 0",
+        "recommended_weight_multiplier": "FLOAT DEFAULT 1.0",
+        "recommended_action": "VARCHAR(64) DEFAULT 'NORMAL_WEIGHT'",
+    },
     "account_equity": {
         "timestamp": "TIMESTAMP WITH TIME ZONE",
         "paper_account_id": "VARCHAR(128) DEFAULT 'champion'",
@@ -291,6 +325,13 @@ ADDITIVE_INDEXES: dict[str, tuple[str, ...]] = {
     "external_ai_requests": (
         "CREATE INDEX IF NOT EXISTS ix_external_ai_requests_symbol_time ON external_ai_requests (symbol, requested_at)",
     ),
+    "signal_health_snapshots": (
+        "CREATE INDEX IF NOT EXISTS ix_signal_health_signal_time ON signal_health_snapshots (signal_family, observed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_signal_health_symbol_family_time ON signal_health_snapshots (symbol, signal_family, observed_at)",
+    ),
+    "model_health_snapshots": (
+        "CREATE INDEX IF NOT EXISTS ix_model_health_model_time ON model_health_snapshots (model_version_id, observed_at)",
+    ),
 }
 
 
@@ -298,6 +339,16 @@ def run_additive_migrations(engine: Engine) -> dict[str, Any]:
     """Apply small nullable-column migrations for deployments without Alembic yet."""
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
+    created_tables: list[str] = []
+    if "model_versions" in existing_tables and "model_artifact_blobs" not in existing_tables:
+        # Existing deployments need the durable artifact table even though
+        # ``create_all`` cannot be assumed for every migration entry point.
+        from app.db.models import ModelArtifactBlob
+
+        ModelArtifactBlob.__table__.create(bind=engine, checkfirst=True)
+        created_tables.append("model_artifact_blobs")
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
     added_columns: list[dict[str, str]] = []
     skipped_missing_tables: list[str] = []
     with engine.begin() as conn:
@@ -325,6 +376,7 @@ def run_additive_migrations(engine: Engine) -> dict[str, Any]:
         "status": "ok",
         "added_columns": added_columns,
         "added_count": len(added_columns),
+        "created_tables": created_tables,
         "existing_tables": sorted(refreshed_tables),
         "skipped_missing_tables": skipped_missing_tables,
     }

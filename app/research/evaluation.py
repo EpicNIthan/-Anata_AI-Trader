@@ -38,6 +38,202 @@ _MISSING = object()
 _YEAR_SECONDS = 365.25 * 24 * 60 * 60
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionAssumptions:
+    """Deterministic, explicitly uncalibrated historical execution assumptions.
+
+    Rates are fractional portfolio-return costs. Partial-fill and volume limits alter
+    the requested position transition; unavailable or missing coverage can be skipped
+    explicitly instead of being treated as a zero-return observation.
+    """
+
+    fee_rate: float = 0.0
+    spread_rate: float = 0.0
+    slippage_rate: float = 0.0
+    latency_seconds: float = 0.0
+    latency_cost_rate_per_second: float = 0.0
+    funding_rate_per_period: float = 0.0
+    partial_fill_fraction: float = 1.0
+    max_volume_participation: float = 1.0
+    market_impact_rate: float = 0.0
+    missing_data_policy: str = "skip"
+    unavailable_symbol_policy: str = "skip"
+    coverage_change_policy: str = "record"
+    version: str = "deterministic-execution-v1"
+
+    def __post_init__(self) -> None:
+        non_negative = (
+            "fee_rate",
+            "spread_rate",
+            "slippage_rate",
+            "latency_seconds",
+            "latency_cost_rate_per_second",
+            "funding_rate_per_period",
+            "market_impact_rate",
+        )
+        for name in non_negative:
+            value = _as_finite_float(getattr(self, name), name)
+            if value < 0:
+                raise ResearchValidationError(f"{name} cannot be negative")
+            object.__setattr__(self, name, value)
+        partial = _as_finite_float(self.partial_fill_fraction, "partial_fill_fraction")
+        participation = _as_finite_float(self.max_volume_participation, "max_volume_participation")
+        if not 0.0 <= partial <= 1.0:
+            raise ResearchValidationError("partial_fill_fraction must be in [0, 1]")
+        if not 0.0 < participation <= 1.0:
+            raise ResearchValidationError("max_volume_participation must be in (0, 1]")
+        object.__setattr__(self, "partial_fill_fraction", partial)
+        object.__setattr__(self, "max_volume_participation", participation)
+        for name in ("missing_data_policy", "unavailable_symbol_policy", "coverage_change_policy"):
+            value = str(getattr(self, name)).lower()
+            if value not in {"allow", "record", "skip"}:
+                raise ResearchValidationError(f"{name} must be allow, record, or skip")
+            object.__setattr__(self, name, value)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> "ExecutionAssumptions":
+        payload = dict(value or {})
+        payload.pop("calibrated", None)
+        return cls(**payload)
+
+    def model_dump(self, **_: Any) -> dict[str, JSONValue]:
+        return {
+            "version": self.version,
+            "calibrated": False,
+            "fee_rate": self.fee_rate,
+            "spread_rate": self.spread_rate,
+            "slippage_rate": self.slippage_rate,
+            "latency_seconds": self.latency_seconds,
+            "latency_cost_rate_per_second": self.latency_cost_rate_per_second,
+            "funding_rate_per_period": self.funding_rate_per_period,
+            "partial_fill_fraction": self.partial_fill_fraction,
+            "max_volume_participation": self.max_volume_participation,
+            "market_impact_rate": self.market_impact_rate,
+            "missing_data_policy": self.missing_data_policy,
+            "unavailable_symbol_policy": self.unavailable_symbol_policy,
+            "coverage_change_policy": self.coverage_change_policy,
+        }
+
+
+def annualization_factor_from_horizon(forecast_horizon_seconds: float) -> float:
+    """Annualize forecast returns by their economic horizon, not row frequency."""
+
+    horizon = _as_finite_float(forecast_horizon_seconds, "forecast_horizon_seconds")
+    if horizon <= 0:
+        raise ResearchValidationError("forecast_horizon_seconds must be positive")
+    return _YEAR_SECONDS / horizon
+
+
+def apply_execution_assumptions(
+    observations: Sequence[EvaluationObservation],
+    assumptions: ExecutionAssumptions,
+) -> tuple[EvaluationObservation, ...]:
+    """Apply one transparent cost/fill contract to chronological observations."""
+
+    positions_by_symbol: dict[str, float] = {}
+    applied: list[EvaluationObservation] = []
+    for observation in observations:
+        symbol_key = str(observation.symbol or "*")
+        previous = positions_by_symbol.get(symbol_key, 0.0)
+        metadata = dict(observation.metadata)
+        reason_codes: list[str] = []
+        missing_data = bool(metadata.get("missing_data") or metadata.get("data_missing"))
+        symbol_available = metadata.get("symbol_available", metadata.get("symbol_is_available", True)) is not False
+        coverage_changed = bool(metadata.get("coverage_changed") or metadata.get("data_coverage_changed"))
+        skip = False
+        if missing_data:
+            if assumptions.missing_data_policy == "skip":
+                reason_codes.append("MISSING_DATA_SKIPPED")
+                skip = True
+            elif assumptions.missing_data_policy == "record":
+                reason_codes.append("MISSING_DATA_RECORDED")
+        if not symbol_available:
+            if assumptions.unavailable_symbol_policy == "skip":
+                reason_codes.append("UNAVAILABLE_SYMBOL_SKIPPED")
+                skip = True
+            elif assumptions.unavailable_symbol_policy == "record":
+                reason_codes.append("UNAVAILABLE_SYMBOL_RECORDED")
+        if coverage_changed:
+            if assumptions.coverage_change_policy == "skip":
+                reason_codes.append("DATA_COVERAGE_CHANGE_SKIPPED")
+                skip = True
+            elif assumptions.coverage_change_policy == "record":
+                reason_codes.append("DATA_COVERAGE_CHANGED")
+
+        desired = observation.position if observation.position is not None else _sign(observation.prediction)
+        fill_fraction = assumptions.partial_fill_fraction
+        requested_participation_raw = metadata.get("requested_volume_participation")
+        requested_participation: float | None = None
+        if requested_participation_raw not in (None, ""):
+            requested_participation = max(
+                0.0,
+                _as_finite_float(requested_participation_raw, "requested_volume_participation"),
+            )
+            if requested_participation > assumptions.max_volume_participation:
+                fill_fraction = min(
+                    fill_fraction,
+                    assumptions.max_volume_participation / requested_participation,
+                )
+                reason_codes.append("VOLUME_PARTICIPATION_CAPPED")
+        if fill_fraction < 1.0:
+            reason_codes.append("PARTIAL_FILL_APPLIED")
+        if skip:
+            filled_position = 0.0
+            fill_fraction = 0.0
+        else:
+            filled_position = previous + (desired - previous) * fill_fraction
+        turnover = abs(filled_position - previous)
+        fee_cost = turnover * assumptions.fee_rate
+        spread_cost = turnover * assumptions.spread_rate
+        slippage_cost = turnover * assumptions.slippage_rate
+        latency_cost = turnover * assumptions.latency_seconds * assumptions.latency_cost_rate_per_second
+        funding_cost = abs(filled_position) * assumptions.funding_rate_per_period
+        market_impact_cost = turnover * turnover * assumptions.market_impact_rate
+        components = {
+            "recorded_cost": observation.transaction_cost,
+            "fees": fee_cost,
+            "spread": spread_cost,
+            "slippage": slippage_cost,
+            "latency": latency_cost,
+            "funding": funding_cost,
+            "market_impact": market_impact_cost,
+        }
+        total_cost = sum(components.values())
+        metadata["execution"] = {
+            "assumptions_version": assumptions.version,
+            "calibrated": False,
+            "requested_position": desired,
+            "previous_position": previous,
+            "filled_position": filled_position,
+            "fill_fraction": fill_fraction,
+            "requested_volume_participation": requested_participation,
+            "max_volume_participation": assumptions.max_volume_participation,
+            "cost_components": components,
+            "reason_codes": reason_codes,
+        }
+        positions_by_symbol[symbol_key] = filled_position
+        applied.append(
+            EvaluationObservation(
+                timestamp=observation.timestamp,
+                prediction=observation.prediction,
+                actual_return=observation.actual_return,
+                symbol=observation.symbol,
+                signal_id=observation.signal_id,
+                model_family=observation.model_family,
+                regime=observation.regime,
+                position=filled_position,
+                transaction_cost=total_cost,
+                holding_seconds=observation.holding_seconds,
+                external_ai_available=observation.external_ai_available,
+                available_to_model_time=observation.available_to_model_time,
+                label_available_time=observation.label_available_time,
+                feature_families=observation.feature_families,
+                metadata=metadata,
+            )
+        )
+    return tuple(applied)
+
+
 def _row_value(row: Record, *names: str, default: Any = _MISSING) -> Any:
     """Read a field from a mapping, dataclass-like object, or SQLAlchemy row."""
 
@@ -528,6 +724,7 @@ def evaluate_predictions(
     timestamps: Sequence[datetime | str] | None = None,
     holding_seconds: Sequence[float | None] | None = None,
     annualization_factor: float | None = None,
+    forecast_horizon_seconds: float | None = None,
 ) -> dict[str, float | int | None]:
     """Calculate signal and paper-simulation metrics from aligned observations.
 
@@ -603,7 +800,11 @@ def evaluate_predictions(
     equity_curve, drawdowns = _drawdown_path(net_returns)
     gross_equity_curve, _ = _drawdown_path(gross_returns)
     max_drawdown = max(drawdowns) if drawdowns else None
-    annualizer = annualization_factor if annualization_factor is not None else _infer_annualization_factor(normalized_timestamps)
+    annualizer = annualization_factor
+    if annualizer is None and forecast_horizon_seconds is not None:
+        annualizer = annualization_factor_from_horizon(forecast_horizon_seconds)
+    if annualizer is None:
+        annualizer = _infer_annualization_factor(normalized_timestamps)
     annualizer = _as_finite_float(annualizer, "annualization_factor")
     if annualizer <= 0:
         raise ResearchValidationError("annualization_factor must be positive")
@@ -729,6 +930,20 @@ def observation_from_row(row: Record, *, prediction: float | None = None) -> Eva
     actual_return = _row_value(row, "actual_return", "realized_return", "target_return", "label_return", "target")
     timestamp = row_timestamp(row)
     available = _row_value(row, "available_to_model_time", default=timestamp)
+    metadata = dict(_row_value(row, "metadata", default={}) or {})
+    for name in (
+        "missing_data",
+        "data_missing",
+        "symbol_available",
+        "symbol_is_available",
+        "coverage_changed",
+        "data_coverage_changed",
+        "requested_volume_participation",
+    ):
+        if isinstance(row, Mapping) and name in row:
+            metadata.setdefault(name, row[name])
+        elif hasattr(row, name):
+            metadata.setdefault(name, getattr(row, name))
     return EvaluationObservation(
         timestamp=timestamp,
         prediction=row_prediction,
@@ -744,11 +959,16 @@ def observation_from_row(row: Record, *, prediction: float | None = None) -> Eva
         available_to_model_time=available,
         label_available_time=_row_value(row, "label_available_time", "label_end_time", "label_end", default=None),
         feature_families=_row_value(row, "feature_families", default=()),
-        metadata=_row_value(row, "metadata", default={}),
+        metadata=metadata,
     )
 
 
-def _group_metrics(observations: Sequence[EvaluationObservation], attr: str) -> dict[str, dict[str, Any]]:
+def _group_metrics(
+    observations: Sequence[EvaluationObservation],
+    attr: str,
+    *,
+    annualization_factor: float | None = None,
+) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[EvaluationObservation]] = defaultdict(list)
     for observation in observations:
         value = getattr(observation, attr)
@@ -762,6 +982,7 @@ def _group_metrics(observations: Sequence[EvaluationObservation], attr: str) -> 
             transaction_costs=[item.transaction_cost for item in items],
             timestamps=[item.timestamp for item in items],
             holding_seconds=[item.holding_seconds for item in items],
+            annualization_factor=annualization_factor,
         )
         for key, items in sorted(grouped.items())
     }
@@ -771,12 +992,26 @@ def evaluate_observations(
     observations: Sequence[EvaluationObservation | Mapping[str, Any] | Any],
     *,
     annualization_factor: float | None = None,
+    forecast_horizon_seconds: float | None = None,
+    execution_assumptions: ExecutionAssumptions | Mapping[str, Any] | None = None,
 ) -> EvaluationResult:
     """Evaluate point-in-time rows and produce core plus segmented metrics."""
 
     normalized = [observation_from_row(item) for item in observations]
     normalized.sort(key=lambda item: item.timestamp)
     assert_point_in_time_availability(normalized)
+    assumptions = (
+        execution_assumptions
+        if isinstance(execution_assumptions, ExecutionAssumptions)
+        else ExecutionAssumptions.from_mapping(execution_assumptions)
+        if execution_assumptions is not None
+        else None
+    )
+    if assumptions is not None:
+        normalized = list(apply_execution_assumptions(normalized, assumptions))
+    resolved_annualization = annualization_factor
+    if resolved_annualization is None and forecast_horizon_seconds is not None:
+        resolved_annualization = annualization_factor_from_horizon(forecast_horizon_seconds)
     predictions = [item.prediction for item in normalized]
     actual_returns = [item.actual_return for item in normalized]
     positions = [item.position if item.position is not None else _sign(item.prediction) for item in normalized]
@@ -790,7 +1025,7 @@ def evaluate_observations(
         transaction_costs=costs,
         timestamps=timestamps,
         holding_seconds=holdings,
-        annualization_factor=annualization_factor,
+        annualization_factor=resolved_annualization,
     )
     gross_returns = [position * actual for position, actual in zip(positions, actual_returns)]
     net_returns = [gross - cost for gross, cost in zip(gross_returns, costs)]
@@ -808,6 +1043,7 @@ def evaluate_observations(
             transaction_costs=[item.transaction_cost for item in items],
             timestamps=[item.timestamp for item in items],
             holding_seconds=[item.holding_seconds for item in items],
+            annualization_factor=resolved_annualization,
         )
         for key, items in external_groups.items()
         if items
@@ -817,9 +1053,13 @@ def evaluate_observations(
         equity_curve=tuple(equity_curve),
         net_returns=tuple(net_returns),
         gross_returns=tuple(gross_returns),
-        performance_by_symbol=_group_metrics(normalized, "symbol"),
-        performance_by_model_family=_group_metrics(normalized, "model_family"),
-        performance_by_regime=_group_metrics(normalized, "regime"),
+        performance_by_symbol=_group_metrics(normalized, "symbol", annualization_factor=resolved_annualization),
+        performance_by_model_family=_group_metrics(
+            normalized,
+            "model_family",
+            annualization_factor=resolved_annualization,
+        ),
+        performance_by_regime=_group_metrics(normalized, "regime", annualization_factor=resolved_annualization),
         performance_by_external_ai=external_metrics,
     )
 
@@ -1019,6 +1259,8 @@ class WalkForwardEvaluator:
         timestamp_getter: TimestampGetter | None = None,
         label_end_getter: ValueGetter | None = None,
         annualization_factor: float | None = None,
+        forecast_horizon_seconds: float | None = None,
+        execution_assumptions: ExecutionAssumptions | Mapping[str, Any] | None = None,
         # Friendly aliases for callers used to sklearn-style terminology.
         train_size: int | None = None,
         validation_size: int | None = None,
@@ -1053,6 +1295,14 @@ class WalkForwardEvaluator:
         self.timestamp_getter = timestamp_getter
         self.label_end_getter = label_end_getter
         self.annualization_factor = annualization_factor
+        self.forecast_horizon_seconds = forecast_horizon_seconds
+        self.execution_assumptions = (
+            execution_assumptions
+            if isinstance(execution_assumptions, ExecutionAssumptions)
+            else ExecutionAssumptions.from_mapping(execution_assumptions)
+            if execution_assumptions is not None
+            else None
+        )
 
     def split(self, records: Sequence[Record]) -> Iterator[WalkForwardFold]:
         """Yield sequential folds where model fitting never observes future rows."""
@@ -1212,10 +1462,20 @@ class WalkForwardEvaluator:
                         metadata=observation.metadata,
                     )
                 )
-            fold_result = evaluate_observations(observations, annualization_factor=self.annualization_factor)
+            fold_result = evaluate_observations(
+                observations,
+                annualization_factor=self.annualization_factor,
+                forecast_horizon_seconds=self.forecast_horizon_seconds,
+                execution_assumptions=self.execution_assumptions,
+            )
             fold_results.append(fold_result)
             all_observations.extend(observations)
-        aggregate = evaluate_observations(all_observations, annualization_factor=self.annualization_factor)
+        aggregate = evaluate_observations(
+            all_observations,
+            annualization_factor=self.annualization_factor,
+            forecast_horizon_seconds=self.forecast_horizon_seconds,
+            execution_assumptions=self.execution_assumptions,
+        )
         return WalkForwardResult(folds=folds, evaluation=aggregate, fold_evaluations=tuple(fold_results))
 
 
@@ -1483,28 +1743,211 @@ def analyze_signal_independence(
 signal_correlation_analysis = analyze_signal_independence
 
 
+def _common_signal_timestamps(
+    signal_ids: Sequence[str],
+    series: Mapping[str, SignalSeries],
+) -> tuple[datetime, ...]:
+    timestamp_sets = [set(_mean_by_timestamp(series[signal_id].timestamps, series[signal_id].pnl)) for signal_id in signal_ids]
+    if not timestamp_sets:
+        return ()
+    return tuple(sorted(set.intersection(*timestamp_sets)))
+
+
+def _equal_weight_signal_returns(
+    signal_ids: Sequence[str],
+    series: Mapping[str, SignalSeries],
+    timestamps: Sequence[datetime],
+) -> list[float]:
+    maps = {
+        signal_id: _mean_by_timestamp(series[signal_id].timestamps, series[signal_id].pnl)
+        for signal_id in signal_ids
+    }
+    return [statistics.fmean(maps[signal_id][timestamp] for signal_id in signal_ids) for timestamp in timestamps]
+
+
+def _ensemble_utility_metrics(
+    returns: Sequence[float],
+    timestamps: Sequence[datetime],
+    *,
+    forecast_horizon_seconds: float | None = None,
+) -> dict[str, Any]:
+    if not returns:
+        return {
+            "observation_count": 0,
+            "net_expectancy": None,
+            "total_return": None,
+            "sharpe_ratio": None,
+            "maximum_drawdown": None,
+        }
+    metrics = evaluate_predictions(
+        returns,
+        returns,
+        positions=[1.0] * len(returns),
+        transaction_costs=[0.0] * len(returns),
+        timestamps=timestamps,
+        forecast_horizon_seconds=forecast_horizon_seconds,
+    )
+    return {
+        key: metrics.get(key)
+        for key in (
+            "observation_count",
+            "net_expectancy",
+            "total_return",
+            "sharpe_ratio",
+            "maximum_drawdown",
+        )
+    }
+
+
+def _metric_delta(after: Mapping[str, Any], before: Mapping[str, Any], name: str) -> float | None:
+    left = before.get(name)
+    right = after.get(name)
+    if left is None or right is None:
+        return None
+    return float(right) - float(left)
+
+
+def analyze_ensemble_saturation(
+    signal_ids: Sequence[str],
+    signals: Mapping[str, SignalSeries | Sequence[Record]] | Sequence[Record],
+    *,
+    minimum_marginal_net_expectancy: float = 0.0,
+    forecast_horizon_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Build a deterministic equal-weight utility curve as signals are added."""
+
+    all_series = _signal_series_from_input(signals)
+    ordered = list(dict.fromkeys(signal_id for signal_id in signal_ids if signal_id in all_series))
+    threshold = _as_finite_float(minimum_marginal_net_expectancy, "minimum_marginal_net_expectancy")
+    if not ordered:
+        return {
+            "signal_order": [],
+            "aligned_observations": 0,
+            "curve": [],
+            "saturation_point": None,
+            "diminishing_return_point": None,
+        }
+    common = _common_signal_timestamps(ordered, all_series)
+    curve: list[dict[str, Any]] = []
+    previous = _ensemble_utility_metrics(
+        [0.0] * len(common),
+        common,
+        forecast_horizon_seconds=forecast_horizon_seconds,
+    )
+    previous_marginal: float | None = None
+    saturation_point: int | None = None
+    diminishing_return_point: int | None = None
+    for index, signal_id in enumerate(ordered, start=1):
+        members = ordered[:index]
+        metrics = _ensemble_utility_metrics(
+            _equal_weight_signal_returns(members, all_series, common),
+            common,
+            forecast_horizon_seconds=forecast_horizon_seconds,
+        )
+        delta_expectancy = _metric_delta(metrics, previous, "net_expectancy")
+        delta_sharpe = _metric_delta(metrics, previous, "sharpe_ratio")
+        delta_total_return = _metric_delta(metrics, previous, "total_return")
+        saturated = bool(common) and (
+            delta_expectancy is None or delta_expectancy <= threshold
+        )
+        diminishing = (
+            previous_marginal is not None
+            and delta_expectancy is not None
+            and delta_expectancy < previous_marginal
+        )
+        if saturated and saturation_point is None:
+            saturation_point = index
+        if diminishing and diminishing_return_point is None:
+            diminishing_return_point = index
+        curve.append(
+            {
+                "signal_count": index,
+                "signal_added": signal_id,
+                "members": list(members),
+                "metrics": metrics,
+                "marginal_net_expectancy": delta_expectancy,
+                "marginal_sharpe_ratio": delta_sharpe,
+                "marginal_total_return": delta_total_return,
+                "diminishing_return": diminishing,
+                "saturated": saturated,
+            }
+        )
+        previous = metrics
+        previous_marginal = delta_expectancy
+    return {
+        "signal_order": ordered,
+        "aligned_observations": len(common),
+        "zero_signal_baseline_metrics": _ensemble_utility_metrics(
+            [0.0] * len(common),
+            common,
+            forecast_horizon_seconds=forecast_horizon_seconds,
+        ),
+        "curve": curve,
+        "saturation_point": saturation_point,
+        "diminishing_return_point": diminishing_return_point,
+        "minimum_marginal_net_expectancy": threshold,
+        "forecast_horizon_seconds": forecast_horizon_seconds,
+    }
+
+
 def assess_incremental_contribution(
     candidate_signal_id: str,
     incumbent_signal_ids: Sequence[str],
     signals: Mapping[str, SignalSeries | Sequence[Record]] | Sequence[Record],
     *,
     correlation_threshold: float = 0.80,
+    forecast_horizon_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Return a transparent independence gate before adding a signal to an ensemble."""
+    """Compare equal-weight incumbent utility before and after adding a candidate."""
 
     all_series = _signal_series_from_input(signals)
     if candidate_signal_id not in all_series:
         raise ResearchValidationError(f"candidate signal {candidate_signal_id!r} is not present")
     incumbents = [signal_id for signal_id in incumbent_signal_ids if signal_id in all_series and signal_id != candidate_signal_id]
     if not incumbents:
+        common = _common_signal_timestamps([candidate_signal_id], all_series)
+        before_metrics = _ensemble_utility_metrics(
+            [0.0] * len(common),
+            common,
+            forecast_horizon_seconds=forecast_horizon_seconds,
+        )
+        after_metrics = _ensemble_utility_metrics(
+            _equal_weight_signal_returns([candidate_signal_id], all_series, common),
+            common,
+            forecast_horizon_seconds=forecast_horizon_seconds,
+        )
+        expectancy_delta = _metric_delta(after_metrics, before_metrics, "net_expectancy")
+        sharpe_delta = _metric_delta(after_metrics, before_metrics, "sharpe_ratio")
+        total_return_delta = _metric_delta(after_metrics, before_metrics, "total_return")
+        drawdown_delta = _metric_delta(after_metrics, before_metrics, "maximum_drawdown")
+        positive_utility = expectancy_delta is not None and expectancy_delta > 0.0
         return {
             "candidate_signal_id": candidate_signal_id,
             "incumbent_signal_ids": [],
-            "is_incremental": True,
+            "is_incremental": bool(common) and positive_utility,
             "max_absolute_prediction_correlation": None,
             "max_absolute_pnl_correlation": None,
             "mean_pnl_difference_vs_incumbents": None,
-            "reason_codes": ["NO_INCUMBENT_SIGNALS"],
+            "aligned_oos_observations": len(common),
+            "before_ensemble_metrics": before_metrics,
+            "after_ensemble_metrics": after_metrics,
+            "marginal_utility": {
+                "net_expectancy": expectancy_delta,
+                "sharpe_ratio": sharpe_delta,
+                "total_return": total_return_delta,
+                "maximum_drawdown": drawdown_delta,
+            },
+            "saturation": analyze_ensemble_saturation(
+                [candidate_signal_id],
+                all_series,
+                forecast_horizon_seconds=forecast_horizon_seconds,
+            ),
+            "reason_codes": [
+                "NO_INCUMBENT_SIGNALS",
+                "POSITIVE_MARGINAL_ENSEMBLE_UTILITY"
+                if positive_utility
+                else "NON_POSITIVE_MARGINAL_NET_EXPECTANCY",
+            ],
         }
     candidate = all_series[candidate_signal_id]
     pair_metrics = [_pair_correlation(candidate, all_series[signal_id]) for signal_id in incumbents]
@@ -1516,13 +1959,57 @@ def assess_incremental_contribution(
     mean_difference = candidate_mean - statistics.fmean(usable_incumbents) if candidate_mean is not None and usable_incumbents else None
     maximum = max([*prediction_values, *pnl_values], default=0.0)
     independent = maximum < correlation_threshold
+    comparison_ids = [*incumbents, candidate_signal_id]
+    common = _common_signal_timestamps(comparison_ids, all_series)
+    before_metrics = _ensemble_utility_metrics(
+        _equal_weight_signal_returns(incumbents, all_series, common),
+        common,
+        forecast_horizon_seconds=forecast_horizon_seconds,
+    )
+    after_metrics = _ensemble_utility_metrics(
+        _equal_weight_signal_returns(comparison_ids, all_series, common),
+        common,
+        forecast_horizon_seconds=forecast_horizon_seconds,
+    )
+    expectancy_delta = _metric_delta(after_metrics, before_metrics, "net_expectancy")
+    sharpe_delta = _metric_delta(after_metrics, before_metrics, "sharpe_ratio")
+    total_return_delta = _metric_delta(after_metrics, before_metrics, "total_return")
+    drawdown_delta = _metric_delta(after_metrics, before_metrics, "maximum_drawdown")
+    positive_utility = expectancy_delta is not None and expectancy_delta > 0.0
+    non_degrading_sharpe = sharpe_delta is None or sharpe_delta >= 0.0
+    incremental = bool(common) and independent and positive_utility and non_degrading_sharpe
+    reason_codes: list[str] = []
+    if not common:
+        reason_codes.append("NO_ALIGNED_OOS_OBSERVATIONS")
+    if not independent:
+        reason_codes.append("CORRELATED_SIGNAL_PENALTY")
+    if not positive_utility:
+        reason_codes.append("NON_POSITIVE_MARGINAL_NET_EXPECTANCY")
+    if not non_degrading_sharpe:
+        reason_codes.append("MARGINAL_SHARPE_DEGRADED")
+    if incremental:
+        reason_codes.append("POSITIVE_MARGINAL_ENSEMBLE_UTILITY")
     return {
         "candidate_signal_id": candidate_signal_id,
         "incumbent_signal_ids": incumbents,
-        "is_incremental": independent,
+        "is_incremental": incremental,
         "max_absolute_prediction_correlation": max(prediction_values) if prediction_values else None,
         "max_absolute_pnl_correlation": max(pnl_values) if pnl_values else None,
         "mean_pnl_difference_vs_incumbents": mean_difference,
-        "reason_codes": ["INDEPENDENT_CONTRIBUTION"] if independent else ["CORRELATED_SIGNAL_PENALTY"],
+        "aligned_oos_observations": len(common),
+        "before_ensemble_metrics": before_metrics,
+        "after_ensemble_metrics": after_metrics,
+        "marginal_utility": {
+            "net_expectancy": expectancy_delta,
+            "sharpe_ratio": sharpe_delta,
+            "total_return": total_return_delta,
+            "maximum_drawdown": drawdown_delta,
+        },
+        "reason_codes": reason_codes,
         "pairs": [item.model_dump() for item in pair_metrics],
+        "saturation": analyze_ensemble_saturation(
+            comparison_ids,
+            all_series,
+            forecast_horizon_seconds=forecast_horizon_seconds,
+        ),
     }

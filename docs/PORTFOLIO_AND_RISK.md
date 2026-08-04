@@ -31,9 +31,9 @@ delta, expected risk, risk contribution, urgency, and the source ensemble decisi
 Non-actionable ensembles or nonpositive equity target zero exposure.
 
 This is a deterministic fallback, not mean-variance optimization. The runtime V2
-service currently does not estimate a covariance matrix. Unless a caller supplies a
-`cluster_by_symbol` mapping, each symbol behaves as its own cluster, so the cluster
-cap is not yet a portfolio-wide crypto-beta constraint.
+service currently does not estimate a covariance matrix. It conservatively groups
+stable-quoted and major-crypto-quoted pairs into a `crypto-beta` cluster; callers may
+supply a more specific `cluster_by_symbol` mapping when measured clusters exist.
 
 ## Risk policy
 
@@ -50,7 +50,7 @@ including the champion account and a registered sandbox:
 - maximum recorded portfolio drawdown;
 - cooldown after a sufficiently large recent loss;
 - maximum number of open positions;
-- symbol, gross, net, margin-allocation, and sandbox exposure caps;
+- symbol, gross, net, correlated-cluster, margin-allocation, and sandbox exposure caps;
 - expected transaction-cost ceiling;
 - positive paper cash/equity and minimum paper notional;
 - entry-fee exposure cap.
@@ -63,7 +63,11 @@ blocked by entry gates such as the kill switch.
 The V2 policy chooses leverage from the minimum of the V2 position limit, portfolio
 limit, and paper-engine maximum. Model-requested leverage and margin are not inputs.
 Every decision records `RISK_CONFIGURATION_VERSION`, requested/approved exposure and
-leverage, kill-switch state, market/equity evidence, account, target, and trace IDs.
+leverage, kill-switch state, market/equity evidence, correlated-cluster ID/exposure,
+account, target, and trace IDs. Non-finite, negative, or internally inconsistent
+cluster evidence is rejected rather than treated as zero. Older callers that omit
+cluster evidence use `abs(current_symbol_exposure)` as a conservative, explicitly
+recorded compatibility fallback; the V2 runtime always supplies the full cluster.
 
 ## Sandbox isolation
 
@@ -130,8 +134,8 @@ API. Protective reductions remain available.
   the V2 risk implementation currently gates the cost estimate and source-candle age
   directly; it does not independently consume a measured bid/ask spread or the
   freshness toggle.
-- Portfolio cluster maps and covariance estimates are not populated by the default
-  pipeline.
+- Covariance estimates are not populated by the default pipeline; its conservative
+  `crypto-beta` fallback may group more instruments than a learned cluster model.
 - Health gates depend on recorded monitoring snapshots and are conservative baseline
   controls, not proof that a model is sound.
 - Paper equity and drawdown are simulator records, not broker reconciliations.

@@ -15,6 +15,7 @@ from app.db.models import (
     PortfolioTargetRecord,
     Position,
     RiskDecisionRecord,
+    RiskControlState,
     SimulatedFillRecord,
     SimulatedOrderRecord,
 )
@@ -118,6 +119,7 @@ class PaperExecutionSimulator:
             price=market.price,
             equity=approved_equity,
         )
+        execution_side = self._execution_side(action, position)
         if requested_notional <= 0 or requested_quantity <= 0:
             return ExecutionOutcome(None, None, ExecutionResult("HELD", "Approved target only requires a protective no-op."))
         order = SimulatedOrder(
@@ -143,10 +145,13 @@ class PaperExecutionSimulator:
                 "paper_only": True,
                 "latency_ms": max(int(getattr(settings, "paper_simulated_latency_ms", 0)), 0),
                 "volume_participation": self._bounded_participation(),
+                "action": action,
+                "execution_side": execution_side.value,
+                "reference_market_price": market.price,
                 "simplified_assumptions": [
                     "latency_is_recorded_not_wall_clock_slept",
                     "market_impact_is_deterministic",
-                    "funding_is_an_execution_attribution_estimate",
+                    "funding_is_booked_at_fill_as_a_simplified_cost",
                 ],
             },
         )
@@ -155,7 +160,6 @@ class PaperExecutionSimulator:
         self._transition(row, OrderState.SUBMITTED)
         self._transition(row, OrderState.ACKNOWLEDGED)
 
-        execution_side = self._execution_side(action, position)
         if normalized_order_type == "LIMIT" and not self._limit_is_marketable(
             float(limit_price), market, execution_side
         ):
@@ -172,66 +176,181 @@ class PaperExecutionSimulator:
                 ExecutionResult("PENDING", "Paper limit order acknowledged and resting until marketable or expired."),
             )
 
-        fill_fraction = self._fill_fraction(requested_quantity, market)
-        if fill_fraction <= 0:
-            row.state = OrderState.REJECTED.value
-            row.payload = {**(row.payload or {}), "rejection_reason": "NO_SIMULATED_LIQUIDITY"}
-            row.updated_at = datetime.now(timezone.utc)
+        return self._fill_existing_order(row, market)
+
+    def _domain_order(self, row: SimulatedOrderRecord) -> SimulatedOrder:
+        """Restore a strict order view from the persisted paper state machine."""
+
+        created = row.created_at
+        updated = row.updated_at
+        expires = row.expires_at
+        created = created.replace(tzinfo=timezone.utc) if created.tzinfo is None else created.astimezone(timezone.utc)
+        updated = updated.replace(tzinfo=timezone.utc) if updated.tzinfo is None else updated.astimezone(timezone.utc)
+        if expires is not None:
+            expires = expires.replace(tzinfo=timezone.utc) if expires.tzinfo is None else expires.astimezone(timezone.utc)
+        return SimulatedOrder(
+            order_id=row.order_id,
+            risk_decision_id=row.risk_decision_id,
+            portfolio_target_id=row.portfolio_target_id,
+            symbol=row.symbol,
+            side=Direction(row.side),
+            order_type=row.order_type,
+            requested_quantity=row.requested_quantity,
+            requested_notional=row.requested_notional,
+            limit_price=row.limit_price,
+            state=OrderState(row.state),
+            client_order_id=row.client_order_id,
+            account_id=row.paper_account_id,
+            created_at=created,
+            updated_at=updated,
+            expires_at=expires,
+            metadata=row.payload or {},
+        )
+
+    def _fill_existing_order(self, row: SimulatedOrderRecord, market: MarketSnapshot) -> ExecutionOutcome:
+        """Fill one approved open order up to its remaining risk-authorized amount."""
+
+        order = self._domain_order(row)
+        if row.state not in {OrderState.ACKNOWLEDGED.value, OrderState.PARTIALLY_FILLED.value}:
+            return ExecutionOutcome(order, None, ExecutionResult("REJECTED", "Paper order is not open for filling."))
+        now = datetime.now(timezone.utc)
+        expires = row.expires_at
+        if expires is not None:
+            expires = expires.replace(tzinfo=timezone.utc) if expires.tzinfo is None else expires.astimezone(timezone.utc)
+        if expires is not None and expires <= now:
+            row.state = OrderState.EXPIRED.value
+            row.updated_at = now
             self.session.commit()
-            return ExecutionOutcome(order, None, ExecutionResult("REJECTED", "No simulated liquidity was available."))
-        fill_quantity = requested_quantity * fill_fraction
-        fill_notional = requested_notional * fill_fraction
+            return ExecutionOutcome(self._domain_order(row), None, ExecutionResult("EXPIRED", "Paper order expired before fill."))
+
+        decision = self.session.scalar(
+            select(RiskDecisionRecord).where(RiskDecisionRecord.risk_decision_id == row.risk_decision_id).limit(1)
+        )
+        target = self.session.scalar(
+            select(PortfolioTargetRecord).where(PortfolioTargetRecord.portfolio_target_id == row.portfolio_target_id).limit(1)
+        )
+        if decision is None or target is None or not decision.approved:
+            row.state = OrderState.REJECTED.value
+            row.payload = {**(row.payload or {}), "rejection_reason": "RISK_OR_TARGET_MISSING"}
+            row.updated_at = now
+            self.session.commit()
+            return ExecutionOutcome(self._domain_order(row), None, ExecutionResult("REJECTED", "Approved risk lineage is unavailable."))
+
+        payload = row.payload or {}
+        action = str(payload.get("action") or ("BUY" if row.side == Direction.LONG.value else "SELL")).upper()
+        try:
+            execution_side = Direction(str(payload.get("execution_side") or row.side).upper())
+        except ValueError:
+            row.state = OrderState.ERROR.value
+            row.payload = {**payload, "error": "INVALID_EXECUTION_SIDE"}
+            self.session.commit()
+            return ExecutionOutcome(self._domain_order(row), None, ExecutionResult("ERROR", "Persisted execution side is invalid."))
+        execution_market_error = self._execution_market_error(row, market, action=action, now=now)
+        if execution_market_error:
+            row.state = OrderState.REJECTED.value
+            row.payload = {**payload, "rejection_reason": execution_market_error}
+            row.updated_at = now
+            self.session.commit()
+            return ExecutionOutcome(self._domain_order(row), None, ExecutionResult("REJECTED", execution_market_error))
+        if row.order_type == "LIMIT" and row.limit_price is not None and not self._limit_is_marketable(
+            float(row.limit_price), market, execution_side
+        ):
+            return ExecutionOutcome(order, None, ExecutionResult("PENDING", "Paper limit order remains resting."))
+
+        filled_quantity = float(
+            self.session.scalar(
+                select(func.coalesce(func.sum(SimulatedFillRecord.quantity), 0.0)).where(
+                    SimulatedFillRecord.order_id == row.order_id
+                )
+            )
+            or 0.0
+        )
+        filled_notional = float(
+            self.session.scalar(
+                select(func.coalesce(func.sum(SimulatedFillRecord.notional), 0.0)).where(
+                    SimulatedFillRecord.order_id == row.order_id
+                )
+            )
+            or 0.0
+        )
+        remaining_quantity = max(float(row.requested_quantity) - filled_quantity, 0.0)
+        remaining_notional = max(float(row.requested_notional) - filled_notional, 0.0)
+        completion_measure = remaining_quantity if action == "CLOSE" else remaining_notional
+        if completion_measure <= 1e-10:
+            row.state = OrderState.FILLED.value
+            row.updated_at = now
+            self.session.commit()
+            return ExecutionOutcome(self._domain_order(row), None, ExecutionResult("FILLED", "Paper order was already fully reconciled."))
+
+        fill_fraction = self._fill_fraction(
+            remaining_quantity,
+            market,
+            already_partially_filled=filled_quantity > 0 or filled_notional > 0,
+        )
+        if fill_fraction <= 0:
+            if row.order_type == "LIMIT":
+                row.payload = {**payload, "last_fill_skip": "NO_SIMULATED_LIQUIDITY"}
+                self.session.commit()
+                return ExecutionOutcome(self._domain_order(row), None, ExecutionResult("PENDING", "No simulated liquidity is currently available."))
+            row.state = OrderState.REJECTED.value
+            row.payload = {**payload, "rejection_reason": "NO_SIMULATED_LIQUIDITY"}
+            row.updated_at = now
+            self.session.commit()
+            return ExecutionOutcome(self._domain_order(row), None, ExecutionResult("REJECTED", "No simulated liquidity was available."))
+
+        planned_quantity = remaining_quantity * fill_fraction
+        planned_notional = remaining_notional * fill_fraction
         simulated_price = self._execution_price(
             market,
             execution_side,
-            requested_quantity=fill_quantity,
-            limit_price=float(limit_price) if limit_price is not None else None,
+            requested_quantity=planned_quantity,
+            limit_price=float(row.limit_price) if row.limit_price is not None else None,
         )
-        engine = PaperEngine(self.session, paper_account_id=account_id)
+        funding_cost = planned_notional * self._funding_rate(market)
+        engine = PaperEngine(self.session, paper_account_id=row.paper_account_id)
         result = engine.execute_signal(
-            symbol=persisted_target.symbol,
+            symbol=row.symbol,
             action=action,
             confidence=1.0,
             reason="V2 approved paper target",
             price=simulated_price,
-            quantity=fill_quantity if action == "CLOSE" else None,
-            notional=fill_notional if action != "CLOSE" else None,
-            risk_decision_id=persisted.risk_decision_id,
-            decision_trace_id=persisted.decision_trace_id,
-            simulated_order_id=order.order_id,
-            paper_account_id=account_id,
+            quantity=planned_quantity if action == "CLOSE" else None,
+            notional=planned_notional if action != "CLOSE" else None,
+            risk_decision_id=row.risk_decision_id,
+            decision_trace_id=row.decision_trace_id,
+            simulated_order_id=row.order_id,
+            paper_account_id=row.paper_account_id,
+            simulated_funding_cost=funding_cost,
         )
         if result.status != "FILLED":
-            row.state = OrderState.REJECTED.value
-            row.updated_at = datetime.now(timezone.utc)
+            row.state = OrderState.ERROR.value if filled_quantity > 0 or filled_notional > 0 else OrderState.REJECTED.value
+            row.payload = {**payload, "fill_error": result.message}
+            row.updated_at = now
             self.session.commit()
-            return ExecutionOutcome(order, None, result)
+            return ExecutionOutcome(self._domain_order(row), None, result)
 
         trade = self.session.get(PaperTrade, result.trade_id) if result.trade_id else None
         if trade is None:
             row.state = OrderState.ERROR.value
             self.session.commit()
-            return ExecutionOutcome(order, None, ExecutionResult("ERROR", "Paper engine filled without a trade record."))
-        if fill_fraction < 1.0:
-            self._transition(row, OrderState.PARTIALLY_FILLED)
-        else:
-            self._transition(row, OrderState.FILLED)
+            return ExecutionOutcome(self._domain_order(row), None, ExecutionResult("ERROR", "Paper engine filled without a trade record."))
         fill = SimulatedFill(
-            order_id=order.order_id,
-            symbol=persisted_target.symbol,
-            side=side,
+            order_id=row.order_id,
+            symbol=row.symbol,
+            side=execution_side,
             quantity=trade.quantity,
             price=trade.price,
             notional=trade.notional,
             fee=trade.fee,
             slippage=abs(trade.price - market.price) / market.price if market.price else 0.0,
-            funding=fill_notional * self._funding_rate(market),
+            funding=funding_cost,
             metadata={
                 "paper_trade_id": trade.id,
-                "fill_fraction": fill_fraction,
-                "remaining_quantity": max(requested_quantity - fill_quantity, 0.0),
+                "fill_fraction_of_remainder": fill_fraction,
                 "volume_participation": self._bounded_participation(),
                 "funding_rate": self._funding_rate(market),
+                "funding_cash_flow": -funding_cost,
+                "funding_booked": True,
                 "market_impact_coefficient": max(
                     float(getattr(settings, "paper_simulated_market_impact_coefficient", 0.0)), 0.0
                 ),
@@ -241,8 +360,8 @@ class PaperExecutionSimulator:
             SimulatedFillRecord(
                 fill_id=fill.fill_id,
                 order_id=fill.order_id,
-                decision_trace_id=persisted.decision_trace_id,
-                paper_account_id=account_id,
+                decision_trace_id=row.decision_trace_id,
+                paper_account_id=row.paper_account_id,
                 symbol=fill.symbol,
                 side=fill.side.value,
                 quantity=fill.quantity,
@@ -255,18 +374,142 @@ class PaperExecutionSimulator:
                 payload=fill.metadata,
             )
         )
-        trade.risk_decision_id = persisted.risk_decision_id
-        trade.simulated_order_id = order.order_id
-        trade.decision_trace_id = persisted.decision_trace_id
-        trade.paper_account_id = account_id
+        trade.risk_decision_id = row.risk_decision_id
+        trade.simulated_order_id = row.order_id
+        trade.decision_trace_id = row.decision_trace_id
+        trade.paper_account_id = row.paper_account_id
+        self.session.flush()
+        total_quantity = filled_quantity + fill.quantity
+        total_notional = filled_notional + fill.notional
+        complete = (
+            total_quantity >= float(row.requested_quantity) - 1e-10
+            if action == "CLOSE"
+            else total_notional >= float(row.requested_notional) - 1e-8
+        )
+        self._transition(row, OrderState.FILLED if complete else OrderState.PARTIALLY_FILLED)
         row.payload = {
-            **(row.payload or {}),
-            "filled_quantity": fill.quantity,
-            "remaining_quantity": max(requested_quantity - fill.quantity, 0.0),
-            "fill_fraction": fill_fraction,
+            **payload,
+            "filled_quantity": total_quantity,
+            "filled_notional": total_notional,
+            "remaining_quantity": max(float(row.requested_quantity) - total_quantity, 0.0),
+            "remaining_notional": max(float(row.requested_notional) - total_notional, 0.0),
+            "fill_attempts": int(payload.get("fill_attempts") or 0) + 1,
         }
         self.session.commit()
-        return ExecutionOutcome(order, fill, result)
+        return ExecutionOutcome(self._domain_order(row), fill, result)
+
+    def process_resting_orders(
+        self,
+        markets: dict[str, MarketSnapshot],
+        *,
+        now: datetime | None = None,
+        limit: int = 200,
+    ) -> dict[str, object]:
+        """Match bounded resting paper limits against a new public market snapshot."""
+
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+        safe_limit = max(min(int(limit), 1_000), 1)
+        rows = list(
+            self.session.scalars(
+                select(SimulatedOrderRecord)
+                .where(
+                    SimulatedOrderRecord.order_type == "LIMIT",
+                    SimulatedOrderRecord.state.in_(
+                        (OrderState.ACKNOWLEDGED.value, OrderState.PARTIALLY_FILLED.value)
+                    ),
+                )
+                .order_by(SimulatedOrderRecord.created_at)
+                .limit(safe_limit)
+            )
+        )
+        summary: dict[str, object] = {
+            "paper_only": True,
+            "inspected": len(rows),
+            "filled": 0,
+            "partially_filled": 0,
+            "pending": 0,
+            "expired": 0,
+            "rejected_or_error": 0,
+            "outcomes": [],
+        }
+        outcomes: list[dict[str, object]] = []
+        for row in rows:
+            expires = row.expires_at
+            if expires is not None:
+                expires = expires.replace(tzinfo=timezone.utc) if expires.tzinfo is None else expires.astimezone(timezone.utc)
+            if expires is not None and expires <= now:
+                row.state = OrderState.EXPIRED.value
+                row.updated_at = now
+                summary["expired"] = int(summary["expired"]) + 1
+                outcomes.append({"order_id": row.order_id, "status": "EXPIRED"})
+                continue
+            market = markets.get(row.symbol.upper())
+            if market is None or market.price <= 0:
+                summary["pending"] = int(summary["pending"]) + 1
+                outcomes.append({"order_id": row.order_id, "status": "PENDING", "reason": "MARKET_UNAVAILABLE"})
+                continue
+            outcome = self._fill_existing_order(row, market)
+            status = outcome.order.state.value if outcome.order is not None else outcome.result.status
+            if status == OrderState.FILLED.value:
+                summary["filled"] = int(summary["filled"]) + 1
+            elif status == OrderState.PARTIALLY_FILLED.value:
+                summary["partially_filled"] = int(summary["partially_filled"]) + 1
+            elif status in {OrderState.REJECTED.value, OrderState.ERROR.value}:
+                summary["rejected_or_error"] = int(summary["rejected_or_error"]) + 1
+            else:
+                summary["pending"] = int(summary["pending"]) + 1
+            outcomes.append(
+                {
+                    "order_id": row.order_id,
+                    "status": status,
+                    "fill_id": outcome.fill.fill_id if outcome.fill else None,
+                    "message": outcome.result.message,
+                }
+            )
+        self.session.commit()
+        summary["outcomes"] = outcomes
+        return summary
+
+    def _execution_market_error(
+        self,
+        row: SimulatedOrderRecord,
+        market: MarketSnapshot,
+        *,
+        action: str,
+        now: datetime,
+    ) -> str | None:
+        """Recheck volatile safety facts when a resting approval is finally matched."""
+
+        if market.symbol.upper() != row.symbol.upper():
+            return "Execution market symbol does not match the approved paper order."
+        protective_close = action == "CLOSE"
+        kill_state = self.session.scalar(
+            select(RiskControlState).order_by(RiskControlState.updated_at.desc()).limit(1)
+        )
+        if not protective_close and (
+            bool(getattr(settings, "risk_kill_switch_enabled", False))
+            or bool(kill_state and kill_state.enabled)
+        ):
+            return "Emergency paper-risk kill switch blocks this resting exposure increase."
+        observed = market.observed_at
+        observed = observed.replace(tzinfo=timezone.utc) if observed.tzinfo is None else observed.astimezone(timezone.utc)
+        if observed > now + timedelta(seconds=5):
+            return "Execution market snapshot is future-dated."
+        if (
+            not protective_close
+            and bool(getattr(settings, "risk_require_fresh_data", True))
+            and int(getattr(settings, "risk_max_market_data_age_seconds", 180)) > 0
+            and (now - observed).total_seconds()
+            > int(getattr(settings, "risk_max_market_data_age_seconds", 180))
+        ):
+            return "Execution market snapshot is stale."
+        bid, ask = self._book_prices(market)
+        spread = max(ask - bid, 0.0) / max(float(market.price), 1e-12)
+        max_spread = float(getattr(settings, "risk_max_spread_pct", 0.005))
+        if not protective_close and max_spread > 0 and spread > max_spread:
+            return "Execution spread exceeds the independent paper-risk limit."
+        return None
 
     def cancel_order(self, order_id: str, *, reason: str = "operator_cancel") -> SimulatedOrderRecord:
         """Cancel one non-terminal simulated order with persisted state transitions."""
@@ -621,8 +864,18 @@ class PaperExecutionSimulator:
             value = 0.0
         return max(min(value, 1.0), 0.0) if math.isfinite(value) else 0.0
 
-    def _fill_fraction(self, requested_quantity: float, market: MarketSnapshot) -> float:
-        fraction = 0.5 if getattr(settings, "paper_simulated_partial_fill_enabled", False) else 1.0
+    def _fill_fraction(
+        self,
+        requested_quantity: float,
+        market: MarketSnapshot,
+        *,
+        already_partially_filled: bool = False,
+    ) -> float:
+        fraction = (
+            0.5
+            if getattr(settings, "paper_simulated_partial_fill_enabled", False) and not already_partially_filled
+            else 1.0
+        )
         if market.available_volume is None:
             return fraction
         try:

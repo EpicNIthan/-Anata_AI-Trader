@@ -210,6 +210,27 @@
         text: "FILL " + (fill.side || ""),
       }));
     });
+    (overlays.portfolio_targets || []).forEach((target) => {
+      const targetEpoch = target.created_at ? Math.floor(new Date(target.created_at).getTime() / 1000) : null;
+      items.push(eventMarker(targetEpoch, {
+        position: "belowBar",
+        color: "#54d4e7",
+        shape: "square",
+        text: "TARGET REQUEST " + number(target.requested_target_exposure, 4),
+      }));
+    });
+    (overlays.risk_decisions || []).forEach((risk) => {
+      const riskEpoch = risk.created_at ? Math.floor(new Date(risk.created_at).getTime() / 1000) : null;
+      const approved = risk.approved === true;
+      items.push(eventMarker(riskEpoch, {
+        position: "aboveBar",
+        color: approved ? "#36d399" : "#fb7185",
+        shape: "square",
+        text: approved
+          ? "RISK APPROVED " + number(risk.approved_exposure, 4)
+          : "RISK REJECTED",
+      }));
+    });
     (overlays.news_events || []).forEach((event) => {
       items.push(eventMarker(event.epoch, {
         position: "aboveBar", color: "#f8ca5b", shape: "circle", text: event.event_type || event.title || "NEWS",
@@ -313,14 +334,20 @@
     setText("stateExposure", number(target.requested_target_exposure, 4) + " / " + number(risk.approved_exposure, 4));
     setText("statePosition", position.side ? position.side + " " + number(position.quantity, 6) : "No recorded open position");
     setText("statePnl", money(position.unrealized_pnl));
+    const externalProviders = Array.isArray(external.providers) && external.providers.length
+      ? external.providers.join(", ")
+      : external.provider;
+    const externalFallback = external.source === "latest_symbol_request_fallback" ? " · latest fallback" : "";
     setText("stateExternal", external.status === "not_recorded"
       ? "Not recorded"
-      : (external.status || "-") + (external.provider ? " · " + external.provider : ""));
+      : (external.status || "-") + (externalProviders ? " · " + externalProviders : "") + externalFallback);
     setText("decisionSource", payload?.source || "-");
     setText("factFeature", feature.id ? (feature.schema_version || "feature") + " · " + timeText(feature.as_of) : "Not recorded");
     setText("factTarget", target.portfolio_target_id ? number(target.requested_target_exposure, 4) + " requested" : "Not recorded");
     setText("factRisk", risk.risk_decision_id ? (risk.approved ? "Approved " + number(risk.approved_exposure, 4) : "Rejected / reduced") : "Not recorded");
-    setText("factNewsModel", payload?.local_news_model?.version || "Not recorded");
+    const localNews = payload?.local_news_model || {};
+    setText("factNewsModel", (localNews.version || "Not recorded")
+      + (localNews.source === "latest_global_news_sentiment_fallback" ? " · latest fallback" : ""));
     setText("factFreshness", payload?.data_status?.latest_candle_at
       ? age(payload.data_status.candle_age_seconds) + (payload.data_status.stale ? " · stale" : "")
       : "No candle timestamp");
@@ -331,9 +358,17 @@
         ? codes.map((item) => "<li>" + html(typeof item === "string" ? item : JSON.stringify(item)) + "</li>").join("")
         : "<li>No structured reason codes are recorded for the current state.</li>";
     }
-    setText("decisionNote", payload?.source === "legacy"
-      ? "Legacy records are partial evidence. Missing V2 stages are not inferred."
-      : (external.status === "not_recorded" ? "External AI has no recorded request for this state." : ""));
+    const lineageNotes = [];
+    if (payload?.source === "legacy") lineageNotes.push("Legacy records are partial evidence. Missing V2 stages are not inferred.");
+    if (external.source === "latest_symbol_request_fallback") {
+      lineageNotes.push("External AI is the latest symbol request fallback and is not linked to the displayed decision.");
+    } else if (external.status === "not_recorded") {
+      lineageNotes.push("External AI has no recorded evidence for this state.");
+    }
+    if (localNews.source === "latest_global_news_sentiment_fallback") {
+      lineageNotes.push("The local news version is a latest global fallback and is not linked to the displayed decision.");
+    }
+    setText("decisionNote", lineageNotes.join(" "));
   }
 
   function tone(value) {
@@ -369,16 +404,22 @@
   function renderHistory(payload) {
     const metrics = payload?.metrics || {};
     setText("metricTrades", number(metrics.trade_count, 0));
+    setText("metricLedgerEvents", number(metrics.ledger_event_count, 0));
     setText("metricWins", number(metrics.win_count, 0) + " / " + number(metrics.loss_count, 0));
     setText("metricWinRate", percent(metrics.win_rate));
-    setText("metricPnl", money(metrics.net_realized_pnl));
+    setText("metricPnl", money(metrics.closed_paper_pnl));
+    setText("metricLedgerPnl", money(metrics.ledger_total_paper_pnl));
     setText("metricProfitFactor", number(metrics.profit_factor));
     setText("metricFees", money(metrics.fees, 4));
     setText("metricDrawdown", money(metrics.maximum_drawdown));
     setText("metricCosts", metrics.slippage === null && metrics.funding === null
       ? "Not recorded"
       : money(metrics.slippage || 0, 4) + " / " + money(metrics.funding || 0, 4));
-    setText("historyStatus", (payload?.legacy_trades || []).length + " legacy fills · " + (payload?.simulated_fills || []).length + " V2 fills");
+    const ledger = payload?.paper_ledger_events || payload?.legacy_trades || [];
+    const traced = ledger.filter((item) => item.source === "v2-paper-ledger").length;
+    const legacy = ledger.filter((item) => item.source === "legacy").length;
+    setText("historyStatus", ledger.length + " paper-ledger events (" + traced + " traced V2 / " + legacy
+      + " legacy) · " + (payload?.simulated_fills || []).length + " simulated fills");
     setText("historyNote", payload?.availability?.note || "");
   }
 

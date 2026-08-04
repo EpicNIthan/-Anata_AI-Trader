@@ -8,6 +8,8 @@ adapter without giving an intelligence provider any execution capability.
 from __future__ import annotations
 
 import hashlib
+import html
+from html.parser import HTMLParser
 import json
 import re
 import uuid
@@ -19,6 +21,43 @@ from typing import Any, Iterable, Mapping
 
 class IntelligenceValidationError(ValueError):
     """Raised when untrusted intelligence data violates the accepted schema."""
+
+
+class _NewsTextExtractor(HTMLParser):
+    """Small stdlib-only HTML-to-text boundary for untrusted news input."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in {"script", "style", "noscript"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style", "noscript"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.parts.append(data)
+
+
+def clean_news_text(value: str) -> str:
+    """Normalize HTML/entities/control whitespace before hashing or inference."""
+
+    raw = html.unescape(str(value or ""))
+    if "<" in raw and ">" in raw:
+        parser = _NewsTextExtractor()
+        try:
+            parser.feed(raw)
+            parser.close()
+            raw = " ".join(parser.parts)
+        except Exception:
+            # Malformed markup remains plain text; it never becomes executable HTML.
+            raw = re.sub(r"<[^>]*>", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
 
 
 class EventType(str, Enum):
@@ -244,8 +283,10 @@ class NewsDocument:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        title = self.title.strip()
-        content = self.content.strip()
+        original_title = self.title
+        original_content = self.content
+        title = clean_news_text(original_title)
+        content = clean_news_text(original_content)
         source = self.source.strip()
         if not title:
             raise IntelligenceValidationError("document title is required")
@@ -263,6 +304,26 @@ class NewsDocument:
         object.__setattr__(self, "available_to_model_at", as_utc(self.available_to_model_at, field_name="available_to_model_at"))
         normalized_assets = tuple(normalize_asset_symbol(asset) for asset in self.relevant_assets)
         object.__setattr__(self, "relevant_assets", tuple(dict.fromkeys(normalized_assets)))
+        metadata = dict(self.metadata)
+        metadata.setdefault(
+            "missing_fields",
+            [
+                name
+                for name, missing in (
+                    ("url", not self.url),
+                    ("published_at", self.published_at is None),
+                    ("received_at", self.received_at is None),
+                    ("available_to_model_at", self.available_to_model_at is None),
+                    ("relevant_assets", not normalized_assets),
+                )
+                if missing
+            ],
+        )
+        metadata.setdefault(
+            "text_cleanup_applied",
+            title != str(original_title).strip() or content != str(original_content).strip(),
+        )
+        object.__setattr__(self, "metadata", metadata)
         calculated_hash = hashlib.sha256(f"{title}\n{content}".encode("utf-8")).hexdigest()
         if self.content_hash and not re.fullmatch(r"[a-fA-F0-9]{64}", self.content_hash):
             raise IntelligenceValidationError("content_hash must be a SHA-256 hexadecimal digest")
@@ -281,14 +342,23 @@ class NewsDocument:
         assets = value.get("relevant_assets", value.get("affected_assets", ())) or ()
         if isinstance(assets, str):
             assets = (assets,)
+        received_at = value.get("received_at") or value.get("created_at")
+        # Older collector archives predate the explicit availability field but
+        # retain a trustworthy ingestion time. Receipt is the earliest time the
+        # row could have reached a model, so preserve PIT ordering with it.
+        available_to_model_at = (
+            value.get("available_to_model_at")
+            or value.get("available_to_model_time")
+            or received_at
+        )
         return cls(
             title=str(value.get("title", "")),
             content=str(value.get("content", value.get("raw_text", value.get("text", "")))),
             source=str(value.get("source", value.get("source_name", "unknown"))),
             url=value.get("url"),
             published_at=value.get("published_at", value.get("published_time")),
-            received_at=value.get("received_at", value.get("created_at")),
-            available_to_model_at=value.get("available_to_model_at", value.get("available_to_model_time")),
+            received_at=received_at,
+            available_to_model_at=available_to_model_at,
             content_hash=value.get("content_hash"),
             is_duplicate=bool(value.get("is_duplicate", False)),
             relevant_assets=tuple(assets),
@@ -315,6 +385,8 @@ class StructuredNewsEvent:
     factual_claims: tuple[FactualClaim, ...]
     confidence: float
     source_summary: str
+    source_reliability: float = 0.5
+    affected_asset_probabilities: Mapping[str, float] = field(default_factory=dict)
     source_reference: str | None = None
     provider: str = "unknown"
     model: str | None = None
@@ -340,6 +412,27 @@ class StructuredNewsEvent:
         if len(assets) > 20:
             raise IntelligenceValidationError("affected_assets cannot contain more than 20 entries")
         object.__setattr__(self, "affected_assets", tuple(dict.fromkeys(assets)))
+        object.__setattr__(
+            self,
+            "source_reliability",
+            bounded_float(self.source_reliability, "source_reliability", low=0.0, high=1.0),
+        )
+        if not isinstance(self.affected_asset_probabilities, Mapping):
+            raise IntelligenceValidationError("affected_asset_probabilities must be an object")
+        asset_probabilities: dict[str, float] = {}
+        for raw_asset, probability in self.affected_asset_probabilities.items():
+            asset = normalize_asset_symbol(str(raw_asset))
+            if asset not in self.affected_assets:
+                raise IntelligenceValidationError(
+                    "affected_asset_probabilities keys must also appear in affected_assets"
+                )
+            asset_probabilities[asset] = bounded_float(
+                probability,
+                f"affected_asset_probabilities[{asset}]",
+                low=0.0,
+                high=1.0,
+            )
+        object.__setattr__(self, "affected_asset_probabilities", asset_probabilities)
         object.__setattr__(
             self,
             "affected_entities",
@@ -415,6 +508,17 @@ class StructuredNewsEvent:
             affected_assets = (affected_assets,)
         if isinstance(affected_entities, str):
             affected_entities = (affected_entities,)
+        metadata = dict(value.get("metadata") or {})
+        affected_asset_probabilities = value.get("affected_asset_probabilities")
+        if affected_asset_probabilities is None:
+            affected_asset_probabilities = metadata.get("affected_asset_probabilities")
+        if affected_asset_probabilities is None:
+            affected_asset_probabilities = {
+                normalize_asset_symbol(str(asset)): 0.5 for asset in affected_assets
+            }
+        source_reliability = value.get("source_reliability")
+        if source_reliability is None:
+            source_reliability = metadata.get("source_reliability", 0.5)
         event = cls(
             event_type=_enum(value["event_type"], EventType, "event_type"),
             affected_assets=tuple(affected_assets),
@@ -428,6 +532,13 @@ class StructuredNewsEvent:
             factual_claims=tuple(FactualClaim.from_value(item) for item in value.get("factual_claims") or ()),
             confidence=bounded_float(value["confidence"], "confidence", low=0.0, high=1.0),
             source_summary=str(value["source_summary"]),
+            source_reliability=bounded_float(
+                source_reliability,
+                "source_reliability",
+                low=0.0,
+                high=1.0,
+            ),
+            affected_asset_probabilities=affected_asset_probabilities,
             source_reference=source_reference or value.get("source_reference"),
             provider=provider or str(value.get("provider", "unknown")),
             model=model or value.get("model"),
@@ -435,7 +546,7 @@ class StructuredNewsEvent:
             validation_status=ValidationStatus.VALID,
             event_id=str(value.get("event_id") or uuid.uuid4()),
             generated_at=value.get("generated_at") or utc_now(),
-            metadata=dict(value.get("metadata") or {}),
+            metadata=metadata,
         )
         warnings = event.validate_against_source(source_text) if source_text else ()
         if warnings and reject_unverifiable_numbers:

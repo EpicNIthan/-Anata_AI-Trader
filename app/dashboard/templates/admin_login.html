@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Anata admin sign-in</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 30rem; margin: 10vh auto; padding: 1rem; background: #0d1117; color: #e6edf3; }
+      form { display: grid; gap: 1rem; padding: 1.5rem; border: 1px solid #30363d; border-radius: .75rem; background: #161b22; }
+      input, button { box-sizing: border-box; width: 100%; padding: .75rem; border-radius: .4rem; }
+      input { color: #e6edf3; background: #0d1117; border: 1px solid #484f58; }
+      button { cursor: pointer; border: 0; color: white; background: #238636; }
+      p { color: #8b949e; }
+    </style>
+  </head>
+  <body>
+    <h1>Anata admin sign-in</h1>
+    <p>The token is submitted in the request body and stored only in an HTTP-only cookie.</p>
+    <form method="post" action="/admin/session" autocomplete="off">
+      <input type="hidden" name="next" value="{{ next_path }}">
+      <label>Admin token <input type="password" name="admin_token" required></label>
+      <button type="submit">Open dashboard</button>
+    </form>
+  </body>
+</html>

@@ -9,7 +9,13 @@ from pathlib import Path
 
 from research_utils import ensure_new_output, load_candidate, observation_period, read_research_rows, sha256_file
 
-from app.research import ExperimentDefinition, build_experiment_report, evaluate_observations, write_experiment_report
+from app.research import (
+    ExecutionAssumptions,
+    ExperimentDefinition,
+    build_experiment_report,
+    evaluate_observations,
+    write_experiment_report,
+)
 
 
 def main() -> None:
@@ -21,6 +27,7 @@ def main() -> None:
     parser.add_argument("--feature-version", default="unknown")
     parser.add_argument("--code-version", default="local")
     parser.add_argument("--annualization-factor", type=float)
+    parser.add_argument("--execution-assumptions", type=Path, help="Optional deterministic assumptions JSON.")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     ensure_new_output(args.report, overwrite=args.overwrite)
@@ -28,6 +35,12 @@ def main() -> None:
     if not rows:
         raise SystemExit("No input rows found.")
     candidate = load_candidate(args.candidate)
+    assumptions = None
+    if args.execution_assumptions is not None:
+        payload = json.loads(args.execution_assumptions.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise SystemExit("Execution assumptions JSON must contain an object.")
+        assumptions = ExecutionAssumptions.from_mapping(payload)
     dataset_version = args.dataset_version or f"sha256:{sha256_file(args.input)}"
     period = observation_period(rows)
     definition = ExperimentDefinition(
@@ -38,11 +51,21 @@ def main() -> None:
         code_version=args.code_version,
         random_seed=candidate.random_seed,
         test_period=period,
-        configuration={"input": str(args.input), "mode": "historical_stored_predictions"},
+        configuration={
+            "input": str(args.input),
+            "mode": "historical_stored_predictions",
+            "forecast_horizon_seconds": candidate.forecast_horizon,
+            "execution_assumptions": assumptions.model_dump() if assumptions else "recorded_oos_costs",
+        },
         notes="Point-in-time historical evaluation of already recorded predictions; no promotion decision is made.",
     )
     started_at = datetime.now(timezone.utc)
-    result = evaluate_observations(rows, annualization_factor=args.annualization_factor)
+    result = evaluate_observations(
+        rows,
+        annualization_factor=args.annualization_factor,
+        forecast_horizon_seconds=candidate.forecast_horizon,
+        execution_assumptions=assumptions,
+    )
     report = build_experiment_report(
         definition,
         result,

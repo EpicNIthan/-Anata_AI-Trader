@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import models as db_models
 from app.db.session import get_session
-from app.pipeline.monitoring import paper_pnl_attribution
+from app.pipeline.attribution import paper_pnl_attribution
 from app.security import require_admin
 
 router = APIRouter(prefix="/api/vision", tags=["vision"], dependencies=[Depends(require_admin)])
@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 _SYMBOL_RE = re.compile(r"^[A-Z0-9_.:-]{3,32}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
-_MAIN_ACCOUNT_IDS = {"", "main", "default", "legacy", "champion"}
 _MAX_CANDLES = 1_000
 _MAX_EVENTS = 250
 _MAX_ROWS = 200
@@ -327,7 +326,7 @@ def _champion_assignment(session: Session, symbol: str) -> Any | None:
 def _latest_risk_for_target(session: Session, target: Any | None, account_id: str | None) -> Any | None:
     target_id = _value(target, "portfolio_target_id", "id") if target else None
     if target_id is None:
-        return _latest_v2(session, "RiskDecisionRecord", account_id=account_id)
+        return None
     rows = _query_v2_by_value(
         session,
         "RiskDecisionRecord",
@@ -394,11 +393,18 @@ def _legacy_trade_marker(row: Any, decision_id: int | None = None) -> dict[str, 
     action = str(_value(row, "action", default="")).upper()
     marker_kind = "exit" if intent == "close" or action == "CLOSE" else "entry"
     created_at = _value(row, "created_at")
+    trace_id = _identifier(row, "decision_trace_id", "trace_id")
+    traced_v2 = bool(trace_id)
+    source = "v2-paper-ledger" if traced_v2 else "legacy"
     return {
-        "id": f"legacy-trade:{_identifier(row, 'id') or 'unknown'}",
+        "id": f"{'v2-paper-trade' if traced_v2 else 'legacy-trade'}:{_identifier(row, 'id') or 'unknown'}",
         "trade_id": _identifier(row, "id"),
         "decision_id": decision_id,
-        "source": "legacy",
+        "decision_trace_id": trace_id,
+        "risk_decision_id": _identifier(row, "risk_decision_id"),
+        "simulated_order_id": _identifier(row, "simulated_order_id"),
+        "paper_account_id": _identifier(row, "paper_account_id", "account_id"),
+        "source": source,
         "time": _dt(created_at),
         "epoch": _epoch(created_at),
         "kind": marker_kind,
@@ -542,6 +548,7 @@ def _serialize_target(row: Any) -> dict[str, Any]:
         "portfolio_target_id": _identifier(row, "portfolio_target_id", "id"),
         "decision_trace_id": _identifier(row, "decision_trace_id", "trace_id"),
         "source_ensemble_decision_id": _identifier(row, "source_ensemble_decision_id", "ensemble_decision_id"),
+        "paper_account_id": _identifier(row, "paper_account_id", "account_id", "paper_sandbox_account_id"),
         "symbol": _value(row, "symbol"),
         "created_at": _dt(created_at),
         "current_exposure": _value(row, "current_exposure"),
@@ -648,6 +655,7 @@ def _serialize_external_request(row: Any) -> dict[str, Any]:
         "symbol": _value(row, "symbol"),
         "provider": _value(row, "provider"),
         "model": _value(row, "model"),
+        "prompt_version": _value(row, "prompt_version"),
         "status": _value(row, "status"),
         "requested_at": _dt(_value(row, "requested_at", "created_at")),
         "completed_at": _dt(_value(row, "completed_at")),
@@ -656,6 +664,144 @@ def _serialize_external_request(row: Any) -> dict[str, Any]:
         "retry_count": _value(row, "retry_count"),
         "external_ai_available": _value(row, "external_ai_available"),
     }
+
+
+def _decision_intelligence(
+    session: Session,
+    *,
+    symbol: str,
+    decision_trace_id: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return intelligence lineage for the displayed decision, never a silent latest-row substitution."""
+    trace_prediction_rows = (
+        _query_v2_trace(session, "ModelPredictionRecord", decision_trace_id, limit=_MAX_ROWS)
+        if decision_trace_id
+        else []
+    )
+    prediction_rows = [
+        row
+        for row in trace_prediction_rows
+        if not _value(row, "symbol") or str(_value(row, "symbol")).upper() == symbol
+    ]
+    if prediction_rows:
+        payloads = [_mapping(_value(row, "payload", "metadata")) for row in prediction_rows]
+
+        def distinct_text(key: str) -> list[str]:
+            return sorted(
+                {
+                    str(payload[key]).strip()
+                    for payload in payloads
+                    if payload.get(key) is not None and str(payload[key]).strip()
+                }
+            )
+
+        providers = distinct_text("external_ai_provider")
+        prompt_versions = distinct_text("external_ai_prompt_version")
+        local_versions = distinct_text("local_news_model_version")
+        external_available = any(
+            bool(_value(row, "external_context_available"))
+            or bool(payload.get("external_ai_available"))
+            for row, payload in zip(prediction_rows, payloads)
+        )
+        external_failed = any(bool(payload.get("external_ai_failed")) for payload in payloads)
+        generated_at = _value(prediction_rows[0], "generated_at", "created_at")
+        external_status = (
+            ("available" if providers else "available_provider_unrecorded")
+            if external_available
+            else ("failed_local_fallback" if external_failed else "unavailable")
+        )
+        external_ai = {
+            "id": None,
+            "symbol": symbol,
+            "provider": providers[0] if providers else None,
+            "providers": providers,
+            "model": None,
+            "prompt_version": prompt_versions[0] if prompt_versions else None,
+            "prompt_versions": prompt_versions,
+            "status": external_status,
+            "requested_at": None,
+            "completed_at": None,
+            "cache_hit": None,
+            "error_category": None,
+            "retry_count": None,
+            "external_ai_available": external_available,
+            "external_ai_missing": not external_available,
+            "external_ai_failed": external_failed,
+            "source": "displayed_decision_predictions",
+            "decision_trace_id": decision_trace_id,
+            "displayed_decision_trace_id": decision_trace_id,
+            "lineage_match": True,
+            "prediction_ids": [
+                _identifier(row, "prediction_id", "id") for row in prediction_rows
+            ],
+            "as_of": _dt(generated_at),
+        }
+        local_news_model = {
+            "version": local_versions[0] if local_versions else None,
+            "versions": local_versions,
+            "status": "recorded" if local_versions else "not_recorded_for_decision",
+            "source": "displayed_decision_predictions",
+            "decision_trace_id": decision_trace_id,
+            "displayed_decision_trace_id": decision_trace_id,
+            "lineage_match": True,
+            "as_of": _dt(generated_at),
+        }
+        return external_ai, local_news_model
+
+    external_row = _latest_v2(session, "ExternalAIRequest", symbol=symbol)
+    if external_row:
+        external_ai = _serialize_external_request(external_row)
+        external_ai.update(
+            {
+                "source": "latest_symbol_request_fallback",
+                "decision_trace_id": None,
+                "displayed_decision_trace_id": decision_trace_id,
+                "lineage_match": False,
+            }
+        )
+    else:
+        external_ai = {
+            "id": None,
+            "symbol": symbol,
+            "provider": None,
+            "providers": [],
+            "model": None,
+            "prompt_version": None,
+            "prompt_versions": [],
+            "status": "not_recorded",
+            "requested_at": None,
+            "completed_at": None,
+            "cache_hit": None,
+            "error_category": None,
+            "retry_count": None,
+            "external_ai_available": False,
+            "external_ai_missing": True,
+            "external_ai_failed": False,
+            "source": "unavailable_no_displayed_decision_predictions",
+            "decision_trace_id": None,
+            "displayed_decision_trace_id": decision_trace_id,
+            "lineage_match": False,
+        }
+
+    latest_sentiment = _safe_scalar(
+        session,
+        select(db_models.NewsSentiment).order_by(desc(db_models.NewsSentiment.created_at)).limit(1),
+    )
+    local_news_model = {
+        "version": _value(latest_sentiment, "model_name"),
+        "versions": [_value(latest_sentiment, "model_name")] if _value(latest_sentiment, "model_name") else [],
+        "status": "latest_fallback" if latest_sentiment else "not_recorded",
+        "source": (
+            "latest_global_news_sentiment_fallback"
+            if latest_sentiment
+            else "unavailable_no_displayed_decision_predictions"
+        ),
+        "decision_trace_id": None,
+        "displayed_decision_trace_id": decision_trace_id,
+        "lineage_match": False,
+        "as_of": _dt(_value(latest_sentiment, "created_at")),
+    }
+    return external_ai, local_news_model
 
 
 def _legacy_news(
@@ -944,7 +1090,6 @@ def vision_overlays(
     account_id = _normal_identifier(account_id, field="account_id")
     start, end = _window(start, end)
     safe_limit = _bounded(limit, default=_DEFAULT_LIMIT, maximum=_MAX_EVENTS)
-    legacy_allowed = (account_id or "").lower() in _MAIN_ACCOUNT_IDS
     effective_account_id = account_id or "champion"
 
     legacy_trades = _legacy_trades(
@@ -954,7 +1099,7 @@ def vision_overlays(
         end=end,
         limit=safe_limit,
         paper_account_id=effective_account_id,
-    ) if legacy_allowed else []
+    )
     trade_ids = [int(row.id) for row in legacy_trades if row.id is not None]
     decision_ids = _legacy_trade_decision_ids(session, trade_ids)
     trades = [_legacy_trade_marker(row, decision_ids.get(int(row.id))) for row in legacy_trades]
@@ -1074,7 +1219,7 @@ def vision_overlays(
         "news_events": [*legacy_news, *structured_news],
         "liquidation_events": liquidations,
         "availability": {
-            "legacy_main_account_visible": legacy_allowed,
+            "paper_ledger_account_scoped": True,
             "v2_records_available": bool(
                 prediction_rows or ensemble_rows or target_rows or risk_rows or order_rows or fill_rows
             ),
@@ -1091,7 +1236,6 @@ def vision_state(
     """Return the latest recorded state behind a paper decision for one symbol."""
     symbol = _normal_symbol(symbol)
     account_id = _normal_identifier(account_id, field="account_id")
-    legacy_allowed = (account_id or "").lower() in _MAIN_ACCOUNT_IDS
     effective_account_id = account_id or "champion"
 
     feature = _safe_scalar(
@@ -1105,36 +1249,60 @@ def vision_state(
         .order_by(desc(db_models.AiDecision.created_at))
         .limit(1),
     )
-    position = None
-    account = None
-    if legacy_allowed:
-        position_statement = (
-            select(db_models.Position)
-            .where(
-                db_models.Position.symbol == symbol,
-                db_models.Position.status == "OPEN",
-                db_models.Position.paper_account_id == effective_account_id,
-            )
-            .order_by(desc(db_models.Position.opened_at))
-            .limit(1)
+    position_statement = (
+        select(db_models.Position)
+        .where(
+            db_models.Position.symbol == symbol,
+            db_models.Position.status == "OPEN",
+            db_models.Position.paper_account_id == effective_account_id,
         )
-        position = _safe_scalar(
-            session,
-            position_statement,
-        )
-        account = _safe_scalar(
-            session,
-            select(db_models.AccountEquity)
-            .where(db_models.AccountEquity.paper_account_id == effective_account_id)
-            .order_by(desc(db_models.AccountEquity.timestamp))
-            .limit(1),
-        )
+        .order_by(desc(db_models.Position.opened_at))
+        .limit(1)
+    )
+    position = _safe_scalar(session, position_statement)
+    account = _safe_scalar(
+        session,
+        select(db_models.AccountEquity)
+        .where(db_models.AccountEquity.paper_account_id == effective_account_id)
+        .order_by(desc(db_models.AccountEquity.timestamp))
+        .limit(1),
+    )
 
     assignment = _champion_assignment(session, symbol)
-    ensemble_row = _latest_v2(session, "EnsembleDecisionRecord", symbol=symbol)
     target_row = _latest_v2(session, "PortfolioTargetRecord", symbol=symbol, account_id=effective_account_id)
+    ensemble_row = None
+    source_ensemble_id = _value(target_row, "source_ensemble_decision_id") if target_row else None
+    if source_ensemble_id is not None:
+        linked_ensembles = _query_v2_by_value(
+            session,
+            "EnsembleDecisionRecord",
+            ("ensemble_decision_id", "id"),
+            source_ensemble_id,
+            limit=1,
+        )
+        candidate_ensemble = linked_ensembles[0] if linked_ensembles else None
+        target_trace_id = _identifier(target_row, "decision_trace_id", "trace_id")
+        candidate_trace_id = _identifier(candidate_ensemble, "decision_trace_id", "trace_id")
+        candidate_symbol = _value(candidate_ensemble, "symbol")
+        if candidate_ensemble is not None and (
+            not candidate_symbol or str(candidate_symbol).upper() == symbol
+        ) and (
+            not target_trace_id or not candidate_trace_id or target_trace_id == candidate_trace_id
+        ):
+            ensemble_row = candidate_ensemble
+    if target_row is None and ensemble_row is None:
+        ensemble_row = _latest_v2(session, "EnsembleDecisionRecord", symbol=symbol)
     risk_row = _latest_risk_for_target(session, target_row, effective_account_id)
-    external_row = _latest_v2(session, "ExternalAIRequest", symbol=symbol)
+    decision_trace_id = (
+        _identifier(target_row, "decision_trace_id", "trace_id")
+        or _identifier(risk_row, "decision_trace_id", "trace_id")
+        or _identifier(ensemble_row, "decision_trace_id", "trace_id")
+    )
+    external_ai, local_news_model = _decision_intelligence(
+        session,
+        symbol=symbol,
+        decision_trace_id=decision_trace_id,
+    )
 
     active_model = _safe_scalar(
         session,
@@ -1151,10 +1319,6 @@ def vision_state(
             .where(db_models.ModelVersion.id == _value(assignment, "model_version_id"))
             .limit(1),
         )
-    latest_sentiment = _safe_scalar(
-        session,
-        select(db_models.NewsSentiment).order_by(desc(db_models.NewsSentiment.created_at)).limit(1),
-    )
     latest_candle = _safe_scalar(
         session,
         select(db_models.Candle)
@@ -1196,26 +1360,11 @@ def vision_state(
     if not reason_codes and legacy_decision and legacy_decision.get("reason"):
         reason_codes.append(legacy_decision["reason"])
 
-    if external_row:
-        external_ai = _serialize_external_request(external_row)
-    else:
-        external_ai = {
-            "id": None,
-            "symbol": symbol,
-            "provider": None,
-            "model": None,
-            "status": "not_recorded",
-            "requested_at": None,
-            "completed_at": None,
-            "cache_hit": None,
-            "error_category": None,
-            "retry_count": None,
-            "external_ai_available": False,
-        }
     legacy_position = None
     if position:
         legacy_position = {
-            "source": "legacy",
+            "source": "paper_account_position",
+            "paper_account_id": position.paper_account_id,
             "symbol": position.symbol,
             "side": position.side,
             "quantity": position.quantity,
@@ -1233,7 +1382,8 @@ def vision_state(
     return {
         "symbol": symbol,
         "account_id": effective_account_id,
-        "source": "v2" if any((assignment, ensemble_row, target_row, risk_row, external_row)) else "legacy",
+        "decision_trace_id": decision_trace_id,
+        "source": "v2" if any((assignment, ensemble_row, target_row, risk_row)) else "legacy",
         "champion": champion,
         "ensemble": ensemble,
         "portfolio_target": target,
@@ -1250,11 +1400,7 @@ def vision_state(
         if account
         else None,
         "external_ai": external_ai,
-        "local_news_model": {
-            "version": _value(latest_sentiment, "model_name"),
-            "source": "legacy_news_sentiment" if latest_sentiment else "unavailable",
-            "as_of": _dt(_value(latest_sentiment, "created_at")),
-        },
+        "local_news_model": local_news_model,
         "legacy": {
             "latest_decision": legacy_decision,
             "feature_snapshot": {
@@ -1447,7 +1593,6 @@ def vision_history(
     account_id = _normal_identifier(account_id, field="account_id")
     start, end = _window(start, end)
     safe_limit = _bounded(limit, default=_DEFAULT_LIMIT, maximum=_MAX_EVENTS)
-    legacy_allowed = (account_id or "").lower() in _MAIN_ACCOUNT_IDS
     effective_account_id = account_id or "champion"
     legacy_rows = _legacy_trades(
         session,
@@ -1456,7 +1601,7 @@ def vision_history(
         end=end,
         limit=safe_limit,
         paper_account_id=effective_account_id,
-    ) if legacy_allowed else []
+    )
     legacy_trades = [_legacy_trade_marker(row) for row in legacy_rows]
     v2_fills = [
         _serialize_fill(row)
@@ -1473,40 +1618,19 @@ def vision_history(
         )
     ]
 
-    realized_values = [float(item["realized_pnl"] or 0.0) for item in legacy_trades if item["realized_pnl"] is not None]
-    winners = [value for value in realized_values if value > 0]
-    losers = [value for value in realized_values if value < 0]
     fees = sum(float(item["fee"] or 0.0) for item in legacy_trades if item["fee"] is not None)
 
-    equity_rows: list[Any] = []
-    if legacy_allowed:
-        equity = db_models.AccountEquity
-        equity_statement = select(equity).where(equity.paper_account_id == effective_account_id)
-        if start is not None:
-            equity_statement = equity_statement.where(equity.timestamp >= start)
-        if end is not None:
-            equity_statement = equity_statement.where(equity.timestamp <= end)
-        equity_rows = list(reversed(_safe_rows(session, equity_statement.order_by(desc(equity.timestamp)).limit(_MAX_EVENTS))))
+    equity = db_models.AccountEquity
+    equity_statement = select(equity).where(equity.paper_account_id == effective_account_id)
+    if start is not None:
+        equity_statement = equity_statement.where(equity.timestamp >= start)
+    if end is not None:
+        equity_statement = equity_statement.where(equity.timestamp <= end)
+    equity_rows = list(
+        reversed(_safe_rows(session, equity_statement.order_by(desc(equity.timestamp)).limit(_MAX_EVENTS)))
+    )
     drawdowns = [float(_value(row, "drawdown") or 0.0) for row in equity_rows]
 
-    profit_factor = None
-    if losers:
-        profit_factor = sum(winners) / abs(sum(losers))
-    metrics = {
-        "trade_count": len(legacy_trades),
-        "win_count": len(winners),
-        "loss_count": len(losers),
-        "win_rate": (len(winners) / len(realized_values)) if realized_values else None,
-        "average_win": (sum(winners) / len(winners)) if winners else None,
-        "average_loss": (sum(losers) / len(losers)) if losers else None,
-        "net_realized_pnl": sum(realized_values) if realized_values else None,
-        "profit_factor": profit_factor,
-        "fees": fees if legacy_trades else None,
-        "maximum_drawdown": max(drawdowns) if drawdowns else None,
-        "slippage": None,
-        "funding": None,
-        "net_expectancy": (sum(realized_values) / len(realized_values)) if realized_values else None,
-    }
     attribution = paper_pnl_attribution(
         session,
         symbol=symbol,
@@ -1515,6 +1639,37 @@ def vision_history(
         end=end,
         limit=safe_limit,
     )
+    closed_values = [
+        float(item["total_paper_pnl"] or 0.0)
+        for item in attribution["trades"]
+        if item.get("is_closed_pnl")
+    ]
+    winners = [value for value in closed_values if value > 0]
+    losers = [value for value in closed_values if value < 0]
+    closed_paper_pnl = sum(closed_values)
+    ledger_total_paper_pnl = float(attribution["total_paper_pnl"] or 0.0)
+    profit_factor = None
+    if losers:
+        profit_factor = sum(winners) / abs(sum(losers))
+    metrics = {
+        "trade_count": len(closed_values),
+        "closed_trade_count": len(closed_values),
+        "ledger_event_count": int(attribution["trade_count"]),
+        "win_count": len(winners),
+        "loss_count": len(losers),
+        "win_rate": (len(winners) / len(closed_values)) if closed_values else None,
+        "average_win": (sum(winners) / len(winners)) if winners else None,
+        "average_loss": (sum(losers) / len(losers)) if losers else None,
+        "closed_paper_pnl": closed_paper_pnl,
+        "ledger_total_paper_pnl": ledger_total_paper_pnl,
+        "net_realized_pnl": closed_paper_pnl,
+        "profit_factor": profit_factor,
+        "fees": fees if legacy_trades else None,
+        "maximum_drawdown": max(drawdowns) if drawdowns else None,
+        "slippage": None,
+        "funding": None,
+        "net_expectancy": (closed_paper_pnl / len(closed_values)) if closed_values else None,
+    }
     metrics["slippage"] = attribution["components"]["slippage"]
     metrics["funding"] = attribution["components"]["funding"]
     return {
@@ -1522,6 +1677,7 @@ def vision_history(
         "account_id": effective_account_id,
         "start": _dt(start),
         "end": _dt(end),
+        "paper_ledger_events": legacy_trades,
         "legacy_trades": legacy_trades,
         "simulated_fills": v2_fills,
         "equity": [
@@ -1551,13 +1707,22 @@ def vision_history(
             for key, value in attribution["by_regime"].items()
         ],
         "performance_by_external_ai": attribution["by_external_ai_availability"],
+        "performance_by_external_ai_provider": attribution["by_external_ai_provider"],
+        "performance_by_ensemble_weighting": attribution["by_ensemble_weighting"],
+        "performance_by_portfolio_sizing": attribution["by_portfolio_sizing"],
+        "performance_by_risk_resizing": attribution["by_risk_resizing"],
+        "performance_by_time_period": attribution["by_time_period"],
         "attribution": attribution,
         "availability": {
-            "legacy_main_account_visible": legacy_allowed,
+            "paper_ledger_account_scoped": True,
+            "paper_ledger": "traced_v2_and_legacy_compatible_rows_explicitly_labeled",
             "slippage": "estimated_for_v2_fills_only",
-            "funding": "recorded_for_v2_fills_only",
-            "attribution": "trace_based_with_explicit_counterfactual_limitations",
-            "note": "Legacy opening fills record entry fees as realized PnL; they are not closed-trade attribution.",
+            "funding": "booked_cash_flow_or_unbooked_estimate_explicitly_labeled",
+            "attribution": "bounded_trace_based_reconciled_with_explicit_coverage",
+            "note": (
+                "Outcome metrics use closed-PnL events only. Ledger event count and total include opening, "
+                "increase, reduction, close, fee, and funding events when recorded."
+            ),
         },
     }
 

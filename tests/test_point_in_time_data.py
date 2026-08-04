@@ -24,6 +24,7 @@ from app.db.models import (
 )
 from app.features.feature_builder import FeatureBuilder
 from app.pipeline.data_quality import PointInTimeValidator
+from app.pipeline.narrow_models import NewsEventModel
 from app.services.data_lifecycle import compact_database
 
 
@@ -195,6 +196,93 @@ class PointInTimeDataTests(unittest.TestCase):
 
         self.assertEqual(result["sentiment_articles_used"], 0)
         self.assertEqual(result["sentiment_score"], 0.0)
+
+    def test_local_event_is_base_news_and_its_version_reaches_prediction_lineage(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        article = NewsArticle(
+            source="local-fixture",
+            source_name="local-fixture",
+            title="Bitcoin adoption expands",
+            url="https://example.test/local-event",
+            published_at=now - timedelta(minutes=20),
+            event_time=now - timedelta(minutes=20),
+            received_time=now - timedelta(minutes=10),
+            processed_time=now - timedelta(minutes=9),
+            available_to_model_time=now - timedelta(minutes=9),
+            raw_text="Bitcoin adoption expands.",
+        )
+        self.session.add(article)
+        self.session.flush()
+        self.session.add(
+            NewsSentiment(
+                article_id=article.id,
+                sentiment_score=-1.0,
+                risk_score=1.0,
+                affected_symbols=["BTCUSDT"],
+                confidence=1.0,
+            )
+        )
+        local_event = {
+            "event_type": "market_move",
+            "affected_assets": ["BTC"],
+            "affected_asset_probabilities": {"BTC": 0.9},
+            "direction": "bullish",
+            "sentiment": 0.8,
+            "severity": 0.1,
+            "importance": 0.8,
+            "novelty": 0.7,
+            "confidence": 0.9,
+            "source_reliability": 0.8,
+            "provider": "local_student",
+            "model": "student-pit-v1",
+        }
+        self.session.add_all(
+            [
+                StructuredNewsEvent(
+                    article_id=article.id,
+                    primary_symbol="BTCUSDT",
+                    event_type="market_move",
+                    affected_assets=["BTC"],
+                    direction="bearish",
+                    sentiment=-1.0,
+                    severity=1.0,
+                    importance=1.0,
+                    confidence=1.0,
+                    provider="external-overlay-must-not-be-base",
+                    validation_status="VALID",
+                    available_to_model_time=now - timedelta(minutes=9),
+                    payload={"local_event": local_event, "external_ai_available": True},
+                ),
+                StructuredNewsEvent(
+                    primary_symbol="BTCUSDT",
+                    event_type="market_move",
+                    affected_assets=["BTC"],
+                    validation_status="VALID",
+                    available_to_model_time=now + timedelta(hours=1),
+                    payload={
+                        "local_event": {
+                            **local_event,
+                            "sentiment": -0.9,
+                            "model": "future-student-must-not-leak",
+                        }
+                    },
+                ),
+            ]
+        )
+        self.session.commit()
+
+        base = FeatureBuilder(self.session)._recent_news_features("BTCUSDT", now)
+        self.assertGreater(base["sentiment_score"], 0.0)
+        self.assertEqual(base["local_news_provider"], "local_student")
+        self.assertEqual(base["local_news_model_version"], "student-pit-v1")
+        self.assertEqual(base["base_news_source"], "structured_news_events.local_event")
+
+        feature = FeatureBuilder(self.session).build_for_symbol("BTCUSDT", store=False)
+        snapshot = PointInTimeValidator().snapshot_from_feature(feature)
+        prediction = NewsEventModel().predict(snapshot)
+        self.assertEqual(snapshot.external_context["local_news_provider"], "local_student")
+        self.assertEqual(snapshot.external_context["local_news_model_version"], "student-pit-v1")
+        self.assertEqual(prediction.metadata["local_news_model_version"], "student-pit-v1")
 
     def test_feature_builder_runs_without_external_context_rows(self) -> None:
         feature = FeatureBuilder(self.session).build_for_symbol("BTCUSDT", store=False)

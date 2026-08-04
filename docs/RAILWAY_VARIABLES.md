@@ -9,6 +9,10 @@ DATABASE_URL=
 ADMIN_TOKEN=
 ```
 
+`ADMIN_TOKEN` must be non-empty unless both dashboard username and password are set.
+Administrative/dashboard routes return `503` when neither authentication method is
+configured; only `/health` remains public. Never pass the token in a URL query string.
+
 Optional:
 
 ```text
@@ -100,7 +104,8 @@ External AI is disabled by default. If enabled deliberately, configure a provide
 model, declared input/output prices, daily limit, and monthly budget. The runtime
 supports OpenAI-compatible Gemini, Groq, Hugging Face router, and generic endpoints.
 Unknown prices fail the pre-request budget gate. Never add provider secrets to source
-files or model metadata.
+files or model metadata. Keep `EXTERNAL_AI_PROVIDER_MIN_INTERVAL_SECONDS` positive
+(the default is `1`) so retries and consecutive requests remain provider-rate-limited.
 
 ## Remove from Railway if you did not intentionally override them
 

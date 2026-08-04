@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
+import io
 import json
 import sys
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
@@ -29,17 +32,71 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def iter_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
-    """Yield JSON-object rows while retaining their one-based source line number."""
+def _parse_jsonl_lines(lines: Iterable[str], *, source: str) -> Iterator[tuple[int, dict[str, Any]]]:
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        parsed = json.loads(line)
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{source}:{line_number} must contain a JSON object")
+        yield line_number, parsed
 
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            parsed = json.loads(line)
-            if not isinstance(parsed, dict):
-                raise ValueError(f"{path}:{line_number} must contain a JSON object")
-            yield line_number, parsed
+
+def _iter_jsonl_file(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as archive:
+            members = sorted(
+                name
+                for name in archive.namelist()
+                if Path(name).name.lower() in {"news_articles.jsonl", "news_articles.jsonl.gz"}
+            )
+            if not members:
+                raise ValueError(f"{path} contains no news_articles.jsonl(.gz) member")
+            for member in members:
+                with archive.open(member) as raw:
+                    if member.lower().endswith(".gz"):
+                        binary: Any = gzip.GzipFile(fileobj=raw)
+                    else:
+                        binary = raw
+                    with io.TextIOWrapper(binary, encoding="utf-8") as handle:
+                        yield from _parse_jsonl_lines(handle, source=f"{path}!{member}")
+        return
+    opener = gzip.open if path.suffix.lower() == ".gz" else Path.open
+    if opener is gzip.open:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            yield from _parse_jsonl_lines(handle, source=str(path))
+    else:
+        with path.open("r", encoding="utf-8") as handle:
+            yield from _parse_jsonl_lines(handle, source=str(path))
+
+
+def iter_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
+    """Yield JSON objects from JSONL, gzip, a daily ZIP, or a ZIP directory.
+
+    Directory traversal is deterministic and accepts only ``.jsonl``,
+    ``.jsonl.gz``, and ``.zip`` inputs. Daily raw-data ZIPs are narrowed to their
+    ``news_articles.jsonl.gz`` member, so operational JSONL files cannot
+    accidentally become teacher examples.
+    """
+
+    if path.is_dir():
+        inputs = sorted(
+            candidate
+            for candidate in path.rglob("*")
+            if candidate.is_file()
+            and (
+                candidate.suffix.lower() in {".jsonl", ".zip"}
+                or candidate.name.lower().endswith(".jsonl.gz")
+            )
+        )
+        if not inputs:
+            raise ValueError(f"{path} contains no JSONL, JSONL.GZ, or ZIP inputs")
+        for candidate in inputs:
+            yield from _iter_jsonl_file(candidate)
+        return
+    if not path.is_file():
+        raise FileNotFoundError(f"Input does not exist: {path}")
+    yield from _iter_jsonl_file(path)
 
 
 def ensure_writable_output(path: Path, *, overwrite: bool) -> None:

@@ -9,7 +9,13 @@ from pathlib import Path
 
 from research_utils import ensure_new_output, load_candidate, read_research_rows, sha256_file
 
-from app.research import ExperimentDefinition, WalkForwardEvaluator, build_experiment_report, write_experiment_report
+from app.research import (
+    ExecutionAssumptions,
+    ExperimentDefinition,
+    WalkForwardEvaluator,
+    build_experiment_report,
+    write_experiment_report,
+)
 
 
 def main() -> None:
@@ -28,6 +34,7 @@ def main() -> None:
     parser.add_argument("--feature-version", default="unknown")
     parser.add_argument("--code-version", default="local")
     parser.add_argument("--annualization-factor", type=float)
+    parser.add_argument("--execution-assumptions", type=Path, help="Optional deterministic assumptions JSON.")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.train_size < 1 or args.test_size < 1 or min(args.validation_size, args.purge_size, args.embargo_size) < 0:
@@ -37,6 +44,12 @@ def main() -> None:
     if not rows:
         raise SystemExit("No input rows found.")
     candidate = load_candidate(args.candidate)
+    assumptions = None
+    if args.execution_assumptions is not None:
+        payload = json.loads(args.execution_assumptions.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise SystemExit("Execution assumptions JSON must contain an object.")
+        assumptions = ExecutionAssumptions.from_mapping(payload)
     evaluator = WalkForwardEvaluator(
         train_size=args.train_size,
         validation_size=args.validation_size,
@@ -46,6 +59,8 @@ def main() -> None:
         purge_window=args.purge_size,
         embargo_window=args.embargo_size,
         annualization_factor=args.annualization_factor,
+        forecast_horizon_seconds=candidate.forecast_horizon,
+        execution_assumptions=assumptions,
     )
     started_at = datetime.now(timezone.utc)
     walk_forward = evaluator.evaluate(rows)
@@ -66,6 +81,8 @@ def main() -> None:
             "purge_size": args.purge_size,
             "embargo_size": args.embargo_size,
             "expanding": not args.rolling,
+            "forecast_horizon_seconds": candidate.forecast_horizon,
+            "execution_assumptions": assumptions.model_dump() if assumptions else "recorded_oos_costs",
         },
         notes="Walk-forward evaluation of stored predictions; it has no model activation or trading side effect.",
     )

@@ -51,6 +51,7 @@ DEFAULT_MODEL_FAMILIES: tuple[str, ...] = (
 
 _DURATION_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>s|m|h|d|w)$", re.IGNORECASE)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+PERSISTED_RESEARCH_ID_MAX_LENGTH = 64
 _UNSAFE_PARAMETER_KEYS = {
     "code",
     "source",
@@ -206,6 +207,22 @@ def stable_fingerprint(value: Any) -> str:
     return hashlib.sha256(stable_json_dumps(value).encode("utf-8")).hexdigest()
 
 
+def persisted_research_id(value: str, *, field_name: str = "research_id") -> str:
+    """Return a stable PostgreSQL-safe identifier no longer than 64 characters.
+
+    Declarative identifiers remain human-readable when already bounded. Longer valid
+    identifiers retain a readable prefix plus a collision-resistant digest instead of
+    relying on database truncation.
+    """
+
+    normalized = _require_identifier(value, field_name)
+    if len(normalized) <= PERSISTED_RESEARCH_ID_MAX_LENGTH:
+        return normalized
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    prefix_length = PERSISTED_RESEARCH_ID_MAX_LENGTH - len(digest) - 1
+    return f"{normalized[:prefix_length]}-{digest}"
+
+
 @dataclass(frozen=True, slots=True)
 class TimeRange:
     """A half-open UTC interval ``[start, end)`` used by all research splits."""
@@ -270,7 +287,7 @@ class CandidateStrategySpec:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        candidate_id = _require_identifier(self.candidate_id, "candidate_id")
+        candidate_id = persisted_research_id(self.candidate_id, field_name="candidate_id")
         model_family = _require_identifier(self.model_family, "model_family")
         target_name = _require_identifier(self.target_name, "target_name")
         if isinstance(self.feature_families, (str, bytes)):
@@ -652,7 +669,11 @@ class ExperimentDefinition:
     notes: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "experiment_id", _require_identifier(self.experiment_id, "experiment_id"))
+        object.__setattr__(
+            self,
+            "experiment_id",
+            persisted_research_id(self.experiment_id, field_name="experiment_id"),
+        )
         object.__setattr__(self, "dataset_version", _require_identifier(self.dataset_version, "dataset_version"))
         object.__setattr__(self, "feature_version", _require_identifier(self.feature_version, "feature_version"))
         object.__setattr__(self, "code_version", _require_identifier(self.code_version, "code_version"))

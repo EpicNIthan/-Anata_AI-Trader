@@ -305,6 +305,7 @@ class AutoTraderService:
                     else None
                 ),
                 paper_data_collection_exploration=data_collection_exploration,
+                compatibility_source=f"auto-trader.legacy.{decision_source}",
             )
 
         execution = {
@@ -313,6 +314,10 @@ class AutoTraderService:
             "trade_id": execution_result.trade_id,
             "balance": execution_result.balance,
             "equity": execution_result.equity,
+            "risk_decision_id": execution_result.risk_decision_id,
+            "decision_trace_id": execution_result.decision_trace_id,
+            "triggered_limits": list(execution_result.triggered_limits),
+            "rejection_reasons": list(execution_result.rejection_reasons),
             "trade_plan": self._trade_plan_payload(decision) if decision_source == "model" else None,
             "paper_data_collection_exploration": data_collection_exploration,
         }

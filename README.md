@@ -51,6 +51,9 @@ python scripts/run_worker.py --role all --host 0.0.0.0 --port 8000
 The V2-specific local training and registry CLIs are also executable directly:
 
 ```powershell
+python scripts/run_local_research_cycle.py --input datasets/processed/YOUR_DATASET.csv.gz `
+  --output-dir local_data/research
+
 python scripts/train_narrow_return_model.py --input datasets/processed/YOUR_DATASET.csv.gz `
   --output models/narrow_return_v1.json --target target_future_return_5m `
   --report research_reports/narrow_return_v1.json
@@ -58,12 +61,16 @@ python scripts/train_narrow_return_model.py --input datasets/processed/YOUR_DATA
 python scripts/manage_model_registry.py register-challenger `
   --artifact models/narrow_return_v1.json --name narrow-return `
   --version v1 --model-family alpha.linear_return
+
+python scripts/run_paper_cycle.py --symbols BTCUSDT,ETHUSDT
 ```
 
 The complete command matrix is in
 [`docs/OPERATIONS_RUNBOOK.md`](docs/OPERATIONS_RUNBOOK.md). Architecture, migration,
 risk, execution, external-AI, monitoring, and Vision details are indexed under
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). None of these components claims
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The implementation and real archived-data
+validation record is in
+[`docs/ANATA_V2_ACCEPTANCE.md`](docs/ANATA_V2_ACCEPTANCE.md). None of these components claims
 profitability, and the simulator is not a full exchange/order-book model.
 
 ## Local Setup
@@ -115,11 +122,14 @@ Open:
 
 ## Security
 
-`/health` is public. The dashboard and all `/api/*` lab endpoints are private when either `ADMIN_TOKEN` or `DASHBOARD_USERNAME` plus `DASHBOARD_PASSWORD` is configured.
+`/health` is public. The dashboard and all `/api/*` lab endpoints fail closed unless
+either `ADMIN_TOKEN` or `DASHBOARD_USERNAME` plus `DASHBOARD_PASSWORD` is configured.
 
 Browser login options:
 
-- Open `/dashboard?admin_token=YOUR_TOKEN` when using `ADMIN_TOKEN`.
+- Open `/admin/login?next=/dashboard` when using `ADMIN_TOKEN`. The form submits the
+  token in the request body and stores it in a strict HTTP-only cookie; URL query
+  tokens are deliberately rejected so access logs cannot capture them.
 - Or use browser Basic Auth with `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD`.
 
 Script/API calls can pass:
@@ -507,7 +517,8 @@ Data lifecycle rules:
 - Railway defaults to `RAILWAY_DATA_FACTORY_MODE=true`.
 - Useful training memory is `candles`, `news_articles`, `news_sentiment`, `external_data_events`, `training_features`, and `experience_buffer`.
 - Operational/debug data is short-lived: live chart updates, raw payloads, debug `features`, `ai_decisions`, `paper_trades`, and dense `account_equity` rows are trimmed daily.
-- Finished-day useful data is deleted from Railway only after you download bundles with `--delete-finished-from-railway`.
+- Finished-day useful data is deleted from Railway only after an exact verified local
+  copy and an explicit run with `--cleanup-after-download --delete-railway-db-rows`.
 - The unfinished/current day remains in Railway so collection continues nonstop.
 - The dashboard `DB Storage` tab shows total DB size, largest tables, raw/JSON estimates, last cleanup, and buttons for `Compact DB` or `Archive + Compact`.
 - `POST /api/db/compact` strips bulky raw/debug fields and trims operational tables while keeping compact training memory.
@@ -769,7 +780,7 @@ confirmed V2 endpoint after reviewing compatibility and evidence:
 curl -X POST https://your-app.up.railway.app/api/v2/models/123/promote `
   -H "x-admin-token: YOUR_ADMIN_TOKEN" `
   -H "Content-Type: application/json" `
-  -d "{\"model_family\":\"alpha.short_horizon_momentum\",\"symbol_scope\":\"BTCUSDT\",\"reason\":\"manual review completed\",\"confirm\":true}"
+  -d "{\"model_family\":\"MODEL_FAMILY_FROM_REGISTRATION\",\"symbol_scope\":\"BTCUSDT\",\"reason\":\"manual review completed\",\"confirm\":true}"
 ```
 
 `scripts/activate_model.py` and `/api/models/activate` remain deprecated legacy
@@ -785,9 +796,9 @@ curl -H "x-admin-token: YOUR_ADMIN_TOKEN" https://your-app.up.railway.app/api/mo
 
 Every saved model records `model_id`, `version`, `feature_schema_version`, `feature_columns`, `created_at`, metrics, model type, and training dataset hash. Old models are kept in `model_versions`; new models can use a larger feature list while old models keep reading only the columns they were trained on.
 
-With `ANATA_V2_ENABLED=true`, the auto trader runs the mandatory deterministic narrow
-pipeline. A registry assignment alone does not silently wire an arbitrary legacy
-artifact into a narrow family; verify the actual prediction/model IDs in Vision.
+With `ANATA_V2_ENABLED=true`, the auto trader runs the mandatory narrow pipeline.
+Active champion assignments are loaded only after artifact, schema, lifecycle, and
+health validation; verify the selected prediction/model IDs in Vision.
 
 ## Replay And Future Data
 

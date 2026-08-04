@@ -37,6 +37,7 @@ from app.db.models import (
     Position,
     RiskControlState,
     RiskDecisionRecord,
+    SimulatedFillRecord,
     SimulatedOrderRecord,
 )
 from app.db.migrations import run_additive_migrations
@@ -448,6 +449,57 @@ class V2RiskControlRegressionTests(IsolatedSqliteCase):
         self.assertTrue(decision.approved)
         self.assertLess(abs(decision.approved_exposure), abs(target.requested_target_exposure))
         self.assertIn("MAX_FEE_EXPOSURE", decision.triggered_limits)
+
+    def test_correlated_cluster_exposure_is_independently_resized_and_invalid_evidence_rejects(self) -> None:
+        now = _utc_now()
+        target = self._target(requested=0.10)
+        self._persist_target(target)
+        policy = self._policy(max_correlated_cluster_exposure_pct=0.25)
+
+        resized = self._risk_approval(
+            target,
+            self._inputs(
+                now,
+                current_gross_exposure=0.22,
+                current_net_exposure=0.22,
+                current_correlated_cluster_exposure=0.22,
+                correlated_cluster_id="crypto-beta",
+            ),
+            policy,
+        )
+        self.assertTrue(resized.approved)
+        self.assertAlmostEqual(resized.approved_exposure, 0.03, places=8)
+        self.assertIn("MAX_CORRELATED_CLUSTER_EXPOSURE", resized.triggered_limits)
+
+        compatibility_target = self._target(requested=0.10, current=0.05, symbol="SOLUSDT")
+        self._persist_target(compatibility_target)
+        compatibility = self._risk_approval(
+            compatibility_target,
+            self._inputs(
+                now,
+                market=MarketSnapshot(symbol="SOLUSDT", price=100.0, observed_at=now),
+            ),
+            policy,
+        )
+        self.assertTrue(compatibility.approved)
+        self.assertNotIn("INCONSISTENT_CORRELATED_CLUSTER_EXPOSURE", compatibility.rejection_reasons)
+
+        invalid_target = self._target(requested=0.10, symbol="ETHUSDT")
+        self._persist_target(invalid_target)
+        invalid = self._risk_approval(
+            invalid_target,
+            self._inputs(
+                now,
+                market=MarketSnapshot(symbol="ETHUSDT", price=100.0, observed_at=now),
+                current_correlated_cluster_exposure=float("nan"),
+                correlated_cluster_id="crypto-beta",
+            ),
+            policy,
+        )
+        self.assertFalse(invalid.approved)
+        self.assertIn("INVALID_CORRELATED_CLUSTER_EXPOSURE", invalid.rejection_reasons)
+        with self.assertRaisesRegex(ValueError, "between 0 and 1"):
+            self._policy(max_correlated_cluster_exposure_pct=1.01)
 
     def test_stale_market_data_cannot_be_bypassed(self) -> None:
         now = _utc_now()
@@ -935,6 +987,110 @@ class V2ExecutionAndIsolationTests(IsolatedSqliteCase):
             None,
         )
 
+    def test_resting_limit_matches_later_and_completes_one_partial_fill(self) -> None:
+        target = self._target(requested=0.10, symbol="ADAUSDT")
+        trace_id = self._persist_target(target)
+        approved = RiskDecision(
+            portfolio_target_id=target.portfolio_target_id,
+            approved=True,
+            requested_exposure=0.10,
+            approved_exposure=0.10,
+            requested_leverage=2.0,
+            approved_leverage=2.0,
+        )
+        self._persist_risk(approved, target=target, account_id="champion", trace_id=trace_id)
+        execution_settings, paper_engine_settings = self._execution_settings()
+        execution_settings.paper_simulated_partial_fill_enabled = True
+        execution_settings.paper_simulated_funding_rate = 0.001
+        with patch("app.pipeline.execution.settings", execution_settings), patch(
+            "app.trading.paper_engine.settings", paper_engine_settings
+        ):
+            simulator = PaperExecutionSimulator(self.session)
+            resting = simulator.submit_target(
+                target=target,
+                risk_decision=approved,
+                market=MarketSnapshot(symbol=target.symbol, price=100.0, observed_at=_utc_now()),
+                equity=10_000.0,
+                account_id="champion",
+                decision_trace_id=trace_id,
+                order_type="LIMIT",
+                limit_price=90.0,
+            )
+            first = simulator.process_resting_orders(
+                {target.symbol: MarketSnapshot(symbol=target.symbol, price=89.0, observed_at=_utc_now())}
+            )
+            second = simulator.process_resting_orders(
+                {target.symbol: MarketSnapshot(symbol=target.symbol, price=89.0, observed_at=_utc_now())}
+            )
+
+        self.assertEqual(resting.result.status, "PENDING")
+        self.assertEqual(first["partially_filled"], 1)
+        self.assertEqual(second["filled"], 1)
+        fills = list(
+            self.session.scalars(
+                select(SimulatedFillRecord).where(SimulatedFillRecord.order_id == resting.order.order_id)
+            )
+        )
+        self.assertEqual(len(fills), 2)
+        self.assertAlmostEqual(sum(row.notional for row in fills), 1_000.0, places=6)
+        self.assertTrue(all((row.payload or {}).get("funding_booked") for row in fills))
+        self.assertEqual(
+            self.session.scalar(
+                select(SimulatedOrderRecord.state).where(SimulatedOrderRecord.order_id == resting.order.order_id)
+            ),
+            "FILLED",
+        )
+
+    def test_resting_limit_rechecks_stale_market_before_increasing_exposure(self) -> None:
+        target = self._target(requested=0.10, symbol="SOLUSDT")
+        trace_id = self._persist_target(target)
+        approved = RiskDecision(
+            portfolio_target_id=target.portfolio_target_id,
+            approved=True,
+            requested_exposure=0.10,
+            approved_exposure=0.10,
+            requested_leverage=2.0,
+            approved_leverage=2.0,
+        )
+        self._persist_risk(approved, target=target, account_id="champion", trace_id=trace_id)
+        execution_settings, paper_engine_settings = self._execution_settings()
+        execution_settings.risk_require_fresh_data = True
+        execution_settings.risk_max_market_data_age_seconds = 30
+        with patch("app.pipeline.execution.settings", execution_settings), patch(
+            "app.trading.paper_engine.settings", paper_engine_settings
+        ):
+            simulator = PaperExecutionSimulator(self.session)
+            resting = simulator.submit_target(
+                target=target,
+                risk_decision=approved,
+                market=MarketSnapshot(symbol=target.symbol, price=100.0, observed_at=_utc_now()),
+                equity=10_000.0,
+                account_id="champion",
+                decision_trace_id=trace_id,
+                order_type="LIMIT",
+                limit_price=90.0,
+            )
+            summary = simulator.process_resting_orders(
+                {
+                    target.symbol: MarketSnapshot(
+                        symbol=target.symbol,
+                        price=89.0,
+                        observed_at=_utc_now() - timedelta(minutes=5),
+                    )
+                }
+            )
+
+        self.assertEqual(summary["rejected_or_error"], 1)
+        self.assertEqual(
+            self.session.scalar(
+                select(SimulatedOrderRecord.state).where(SimulatedOrderRecord.order_id == resting.order.order_id)
+            ),
+            "REJECTED",
+        )
+        self.assertIsNone(
+            self.session.scalar(select(PaperTrade.id).where(PaperTrade.simulated_order_id == resting.order.order_id))
+        )
+
     def test_volume_participation_funding_impact_and_account_reconciliation(self) -> None:
         target = self._target(requested=0.10, symbol="XRPUSDT")
         trace_id = self._persist_target(target)
@@ -977,6 +1133,8 @@ class V2ExecutionAndIsolationTests(IsolatedSqliteCase):
         self.assertGreater(outcome.fill.quantity, 1.9)
         self.assertLessEqual(outcome.fill.quantity, 2.0)
         self.assertAlmostEqual(outcome.fill.funding, outcome.fill.notional * 0.001, places=8)
+        self.assertGreater(outcome.fill.fee, 0.0)
+        self.assertGreater(outcome.fill.slippage, 0.0)
         self.assertGreater(outcome.fill.price, 100.0)
         self.assertEqual(
             self.session.scalar(select(SimulatedOrderRecord.state).where(SimulatedOrderRecord.order_id == outcome.order.order_id)),
@@ -1048,10 +1206,10 @@ class V2ApiAndVisionIntegrationTests(IsolatedSqliteCase):
             vision_refresh_seconds=37,
             vision_default_limit=17,
         )
-        credentials = SimpleNamespace(admin_token=None, dashboard_username=None, dashboard_password=None)
+        credentials = SimpleNamespace(admin_token="vision-token", dashboard_username=None, dashboard_password=None)
         with patch("app.dashboard.routes.settings", dashboard_settings), patch("app.security.settings", credentials):
             with TestClient(app) as client:
-                response = client.get("/vision")
+                response = client.get("/vision", headers={"x-admin-token": "vision-token"})
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("refreshSeconds: 37", response.text)
@@ -1093,11 +1251,12 @@ class V2ApiAndVisionIntegrationTests(IsolatedSqliteCase):
         )
         self.session.commit()
 
-        credentials = SimpleNamespace(admin_token=None, dashboard_username=None, dashboard_password=None)
+        credentials = SimpleNamespace(admin_token="vision-token", dashboard_username=None, dashboard_password=None)
         with patch("app.security.settings", credentials):
             with TestClient(self._vision_app()) as client:
                 response = client.get(
                     "/api/vision/chart",
+                    headers={"x-admin-token": "vision-token"},
                     params={
                         "symbol": "BTCUSDT",
                         "start": (start + timedelta(minutes=1)).isoformat(),
@@ -1138,11 +1297,19 @@ class V2ApiAndVisionIntegrationTests(IsolatedSqliteCase):
         )
         self.session.commit()
 
-        credentials = SimpleNamespace(admin_token=None, dashboard_username=None, dashboard_password=None)
+        credentials = SimpleNamespace(admin_token="vision-token", dashboard_username=None, dashboard_password=None)
         with patch("app.security.settings", credentials):
             with TestClient(self._vision_app()) as client:
-                btc_response = client.get("/api/vision/state", params={"symbol": "BTCUSDT"})
-                missing_response = client.get("/api/vision/state", params={"symbol": "SOLUSDT"})
+                btc_response = client.get(
+                    "/api/vision/state",
+                    headers={"x-admin-token": "vision-token"},
+                    params={"symbol": "BTCUSDT"},
+                )
+                missing_response = client.get(
+                    "/api/vision/state",
+                    headers={"x-admin-token": "vision-token"},
+                    params={"symbol": "SOLUSDT"},
+                )
 
         self.assertEqual(btc_response.status_code, 200, btc_response.text)
         self.assertEqual(btc_response.json()["external_ai"]["symbol"], "BTCUSDT")

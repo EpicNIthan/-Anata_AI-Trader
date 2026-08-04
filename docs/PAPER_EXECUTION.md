@@ -21,14 +21,40 @@ same:
 Any mismatch fails closed. A unique client order ID and risk-decision lookup make each
 approval single-use, so replaying an approved request cannot create another order.
 
+### Compatibility entry points
+
+The retained `/api/paper-trade`, `/api/strategy/{symbol}/paper`, `/api/signal`, and
+V2-disabled auto-trader paths all enter `PaperEngine` through the same legacy
+compatibility boundary. Before an exposure-increasing fill, that boundary independently
+checks confidence, the database/configuration kill switch, market freshness, daily
+loss, portfolio drawdown, recent-loss cooldown, open-position count, leverage, margin,
+cash, fee exposure, and position sizing. Leverage, margin, notional, stops, and targets
+from an API or model plan remain untrusted request data and cannot suppress those gates.
+Protective reductions remain available while the kill switch is active.
+
+Every compatibility evaluation, including a rejection or hold, is committed before
+execution as a clearly labelled compatibility `ensemble_decisions` placeholder,
+`portfolio_targets` row, and `risk_decisions` row. The risk payload records the fixed
+entry-point source, account, symbol, requested values, evaluated cash/equity/market
+state, triggered limits, rejection reasons, and configuration version
+`legacy-compatibility-universal-risk-v1`. An approved fill stores that risk ID and trace
+ID on `paper_trades`; the same IDs are also returned as additive response fields. If
+the audit chain cannot be persisted, the session is rolled back and the request is
+rejected before a fill.
+
+This compatibility approval is deliberately scoped to one synchronous
+`PaperEngine.execute_signal()` call. It does not create a `simulated_orders` row and
+cannot be replayed through the stricter V2 order-consumption path. New V2 submissions
+continue to require their persisted V2 target, approval, and simulated order.
+
 ## State and records
 
 The typed order contract supports:
 
 ```text
 CREATED -> RISK_APPROVED -> SUBMITTED -> ACKNOWLEDGED
-  -> FILLED | PARTIALLY_FILLED | CANCEL_PENDING | REJECTED | ERROR
-CANCEL_PENDING -> CANCELLED | PARTIALLY_FILLED | FILLED | ERROR
+  -> FILLED | PARTIALLY_FILLED | CANCEL_PENDING | EXPIRED | REJECTED | ERROR
+CANCEL_PENDING -> CANCELLED | PARTIALLY_FILLED | FILLED | EXPIRED | ERROR
 ```
 
 The default V2 pipeline exercises the create/approve/submit/acknowledge and
@@ -52,8 +78,10 @@ configured spread, then adds deterministic slippage and optional square-root mar
 impact. `PaperEngine` applies the configured paper fee and approved leverage and
 updates the fake account. When partial fills are enabled, the baseline cap is 50% of
 requested quantity/notional. If a market snapshot supplies volume, the fill is also
-capped by configured participation. A funding estimate is recorded on the fill for
-attribution; it is not yet posted as a separate cash-ledger transaction.
+capped by configured participation. A funding scenario cost is recorded on the fill
+for attribution. New V2 fills also persist a signed `funding_cash_flow` and immediately
+book that simplified cost into fake cash and realized PnL. Legacy fills without the
+signed field remain explicitly labeled as unbooked estimates.
 
 ```env
 TRADING_MODE=paper
@@ -113,11 +141,13 @@ Latency is recorded as metadata rather than slept in wall-clock time. The defaul
 runtime does not currently populate bid/ask, available volume, or observed funding in
 its `MarketSnapshot`, so configured fallbacks are used and participation/impact cannot
 be calibrated from the default candle-only path. There is no order-book depth, queue
-position, stochastic impact, venue outage, time-varying spread process, residual-fill
-scheduler, or delisting engine. Resting limit orders do not have an automatic market
-event loop. For these reasons the simulator is useful for architecture, accounting,
-and deterministic risk tests, but it is not a full market simulator and does not
-establish profitability.
+position, stochastic impact, venue outage, time-varying spread process, scheduled
+resting-order event loop, or delisting engine. `process_resting_orders()` can consume
+later market snapshots and complete partial fills, but an operator/worker must invoke
+it; it is not a venue feed. Funding is a non-negative per-fill scenario cost rather
+than directional, periodic exchange settlement. For these reasons the simulator is
+useful for architecture, accounting, and deterministic risk tests, but it is not a
+full market simulator and does not establish profitability.
 
 See [PORTFOLIO_AND_RISK.md](PORTFOLIO_AND_RISK.md) for approval controls and
 [AI_VISION_DASHBOARD.md](AI_VISION_DASHBOARD.md) for trace replay.

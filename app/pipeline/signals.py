@@ -16,6 +16,14 @@ from app.pipeline.domain import (
 from app.pipeline.narrow_models import CostEstimate
 
 
+_TRADABLE_LIFECYCLES = {
+    SignalLifecycle.PAPER,
+    SignalLifecycle.LIMITED,
+    SignalLifecycle.PRODUCTION,
+    SignalLifecycle.REDUCED,
+}
+
+
 class SignalFactory:
     """Deterministic forecast-to-signal adapter with no execution dependency."""
 
@@ -89,5 +97,5 @@ class SignalFactory:
             if signal.is_valid_at(now)
             and signal.direction != Direction.FLAT
             and signal.health_status not in {HealthStatus.SUSPENDED, HealthStatus.RETIRED}
-            and signal.lifecycle_status not in {SignalLifecycle.SUSPENDED, SignalLifecycle.RETIRED, SignalLifecycle.SHADOW}
+            and signal.lifecycle_status in _TRADABLE_LIFECYCLES
         ]

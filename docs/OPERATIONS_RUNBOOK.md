@@ -142,8 +142,20 @@ python scripts/prepare_training_data.py --input local_data/raw_days `
   --output-dir local_data/processed --news-converter smart
 ```
 
-Train a forecast-only V2 narrow artifact with chronological train/validation/test
-splits and forward-label purging:
+Run the complete multi-family forecast-only research cycle. It detects newly
+available/corrected labels, searches bounded ridge/Huber baselines, refits inside
+chronological walk-forward folds with label-overlap purging and embargo, packages one
+challenger per available family, and registers each as `TRAINED` without promotion:
+
+```powershell
+python scripts/run_local_research_cycle.py `
+  --input local_data/processed/YOUR_DATASET.csv.gz `
+  --output-dir local_data/research
+```
+
+Run the same command again after synchronization; it exits with
+`waiting_for_labels` until enough new labels exist. For one single-family artifact,
+the lower-level trainer remains available:
 
 ```powershell
 python scripts/train_narrow_return_model.py `
@@ -154,9 +166,9 @@ python scripts/train_narrow_return_model.py `
   --report research_reports/narrow_return_v1.json
 ```
 
-The artifact can emit expected return only; leverage/sizing/order targets are rejected.
-The production V2 process also includes deterministic narrow baseline families. There
-is not yet one CLI that independently fits every V2 family.
+Artifacts emit expected return only; leverage/sizing/order targets are rejected. The
+cycle writes immutable evaluation reports, checksummed packages, and stored OOS
+metrics, but it never starts shadow/sandbox or promotes a champion.
 
 The older, broader baseline comparison trainer remains available as
 `scripts/train_best_model.py`, but `train_narrow_return_model.py` is the direct V2
@@ -234,15 +246,15 @@ $Sandbox = Invoke-RestMethod -Method Post "$Url/api/v2/models/$ModelVersionId/sa
 Invoke-RestMethod -Method Post "$Url/api/v2/pipeline/run" -Headers $Headers `
   -Body (ConvertTo-Json @{symbol="BTCUSDT";paper_account_id=$Sandbox.sandbox.paper_account_id})
 
-# Explicit manual champion promotion.
+# Explicit manual champion promotion; use the family returned by registration.
 Invoke-RestMethod -Method Post "$Url/api/v2/models/$ModelVersionId/promote" `
   -Headers $Headers `
-  -Body '{"model_family":"alpha.short_horizon_momentum","symbol_scope":"BTCUSDT","reason":"manual review completed","confirm":true}'
+  -Body '{"model_family":"alpha.linear_return","symbol_scope":"BTCUSDT","reason":"manual review completed","confirm":true}'
 
 # Restore the prior recorded champion.
 Invoke-RestMethod -Method Post "$Url/api/v2/registry/rollback" `
   -Headers $Headers `
-  -Body '{"model_family":"alpha.short_horizon_momentum","symbol_scope":"BTCUSDT","reason":"operator rollback","confirm":true}'
+  -Body '{"model_family":"alpha.linear_return","symbol_scope":"BTCUSDT","reason":"operator rollback","confirm":true}'
 ```
 
 A champion assignment is loaded by the V2 family/symbol resolver only after artifact,
@@ -263,6 +275,15 @@ python scripts/manage_model_registry.py rollback --model-family alpha.linear_ret
   --symbol-scope BTCUSDT --reason "operator rollback"
 ```
 
+Run one bounded local paper cycle against the collected operational database:
+
+```powershell
+python scripts/run_paper_cycle.py --symbols BTCUSDT,ETHUSDT
+```
+
+For a sandbox, add `--paper-account-id sandbox-...`. The command refuses to run
+unless `TRADING_MODE=paper`.
+
 ## Monitoring and incident checks
 
 ```powershell
@@ -276,17 +297,15 @@ During an incident, enable the kill switch before debugging new exposure. Preser
 database/log evidence, inspect collector freshness, then decide whether to suspend,
 roll back, or restart a paper-only worker.
 
-## Command gaps that require additional code
+## Deliberate boundaries and remaining operator wrappers
 
 - No Alembic/dedicated migration CLI; use `create_db_and_tables()` as shown.
-- No exporter currently builds the evaluator's chronological
-  `observations.jsonl` directly from V2 database records.
-- No train-all-V2-narrow-families/package-all command.
 - No continuous local research daemon or automatic challenger uploader.
 - Cancel/replace, open-order recovery, and account reconciliation exist as simulator
   service methods and tests, but have no authenticated operator REST/CLI wrapper or
   scheduled startup invocation.
 - No automatic champion promotion by design.
 
-These gaps should not be worked around with generated Python execution or live-order
-credentials.
+The standalone stored-prediction evaluators consume `observations.jsonl`; the working
+prepared-data train/refit/walk-forward path is `run_local_research_cycle.py`. These
+boundaries should not be worked around with live-order credentials.

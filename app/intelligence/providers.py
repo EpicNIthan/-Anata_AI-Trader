@@ -10,6 +10,7 @@ import asyncio
 import json
 import math
 import re
+import zipfile
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -27,6 +28,9 @@ from .schemas import (
     StructuredNewsEvent,
     TimeHorizon,
 )
+
+NEWS_STUDENT_MODEL_FAMILY = "intelligence.news_student_naive_bayes"
+NEWS_STUDENT_ARTIFACT_MEMBER = "student_artifact.json"
 
 
 class IntelligenceProviderError(RuntimeError):
@@ -157,6 +161,85 @@ def _assets_from_text(text: str, seeded: tuple[str, ...] = ()) -> tuple[str, ...
     return tuple(dict.fromkeys(assets))
 
 
+def _source_reliability(
+    *,
+    source: str | None,
+    text: str,
+    url: str | None = None,
+    published_at: Any = None,
+    received_at: Any = None,
+    is_duplicate: bool = False,
+) -> float:
+    """Return a bounded evidence-completeness prior without external lookups.
+
+    This deliberately does not claim that a named publisher is truthful.  It rewards
+    locally observable provenance fields and sufficient source text, and penalizes a
+    duplicate.  The same deterministic fallback is available to rule and student
+    providers when an older trained artifact has no reliability head.
+    """
+    normalized_source = str(source or "").strip().lower()
+    value = 0.30
+    if normalized_source and normalized_source not in {"unknown", "untitled"}:
+        value += 0.15
+    if str(url or "").lower().startswith("https://"):
+        value += 0.10
+    if published_at is not None:
+        value += 0.08
+    if received_at is not None:
+        value += 0.07
+    value += min(len(tokenize_news_text(text)), 200) / 1_000.0
+    if is_duplicate:
+        value -= 0.20
+    return _clamp(value, 0.05, 0.95)
+
+
+def _affected_asset_probabilities(
+    text: str,
+    assets: tuple[str, ...] | list[str],
+    *,
+    seeded: tuple[str, ...] = (),
+) -> dict[str, float]:
+    lowered = text.lower()
+    seeded_assets = {str(asset).upper() for asset in seeded}
+    probabilities: dict[str, float] = {}
+    for raw_asset in assets:
+        asset = str(raw_asset).upper()
+        keywords = _ASSET_KEYWORDS.get(asset, {asset.lower()})
+        hits = sum(
+            len(re.findall(rf"\b{re.escape(str(keyword).lower())}\b", lowered))
+            for keyword in keywords
+        )
+        probability = 0.45 + min(hits, 4) * 0.10 + (0.20 if asset in seeded_assets else 0.0)
+        probabilities[asset] = _clamp(probability, 0.05, 0.95)
+    return probabilities
+
+
+def _safe_asset_probabilities(
+    value: Any,
+    *,
+    assets: tuple[str, ...] | list[str],
+    fallback: Mapping[str, Any],
+    text: str,
+    seeded: tuple[str, ...] = (),
+) -> dict[str, float]:
+    normalized_assets = tuple(dict.fromkeys(str(asset).upper() for asset in assets))
+    deterministic = _affected_asset_probabilities(text, normalized_assets, seeded=seeded)
+    source = value if isinstance(value, Mapping) else fallback
+    output: dict[str, float] = {}
+    for asset in normalized_assets:
+        raw = source.get(asset) if isinstance(source, Mapping) else None
+        if raw is None and isinstance(source, Mapping):
+            raw = source.get(asset.lower())
+        try:
+            probability = float(raw) if raw is not None else deterministic.get(asset, 0.5)
+            if not math.isfinite(probability):
+                raise ValueError
+        except (TypeError, ValueError):
+            probability = deterministic.get(asset, 0.5)
+        output[asset] = _clamp(probability, 0.0, 1.0)
+    return output
+
+
 def _first_claims(text: str, *, limit: int = 3) -> list[dict[str, Any]]:
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
     claims: list[dict[str, Any]] = []
@@ -214,10 +297,25 @@ class LocalRuleProvider:
         summary = document.title
         if len(summary) < 20:
             summary = document.content[:300]
+        affected_assets = _assets_from_text(document.text, document.relevant_assets)
+        source_reliability = _source_reliability(
+            source=document.source,
+            text=document.text,
+            url=document.url,
+            published_at=document.published_at,
+            received_at=document.received_at,
+            is_duplicate=document.is_duplicate,
+        )
+        asset_probabilities = _affected_asset_probabilities(
+            document.text,
+            affected_assets,
+            seeded=document.relevant_assets,
+        )
         event = StructuredNewsEvent.from_mapping(
             {
                 "event_type": event_type.value,
-                "affected_assets": _assets_from_text(document.text, document.relevant_assets),
+                "affected_assets": affected_assets,
+                "affected_asset_probabilities": asset_probabilities,
                 "affected_entities": (),
                 "direction": direction.value,
                 "sentiment": sentiment,
@@ -228,12 +326,15 @@ class LocalRuleProvider:
                 "factual_claims": _first_claims(document.text),
                 "confidence": confidence,
                 "source_summary": summary[:1_000],
+                "source_reliability": source_reliability,
                 "metadata": {
                     "level": 0,
                     "positive_keyword_count": positive,
                     "negative_keyword_count": negative,
                     "event_keyword_count": event_hits,
                     "is_duplicate": document.is_duplicate,
+                    "source_reliability": source_reliability,
+                    "affected_asset_probabilities": asset_probabilities,
                 },
             },
             provider=self.name,
@@ -268,7 +369,70 @@ def validate_json_student_artifact(artifact: Mapping[str, Any]) -> None:
             raise IntelligenceValidationError(f"student artifact task {name!r} is invalid")
 
 
-def predict_json_student_artifact(artifact: Mapping[str, Any], text: str) -> dict[str, Any]:
+def load_json_student_artifact(
+    path: str | Path,
+    *,
+    artifact_member: str | None = None,
+    verify_package: bool = True,
+) -> dict[str, Any]:
+    """Load one declarative student from JSON or a checksummed registry ZIP."""
+    target = Path(path)
+    if not target.is_file():
+        raise ProviderUnavailableError("local student artifact is not installed")
+    try:
+        if target.suffix.lower() == ".json":
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        elif target.suffix.lower() == ".zip":
+            if verify_package:
+                # Local import keeps the provider schema independent of registry
+                # initialization while applying the same durable-package verifier.
+                from app.pipeline.artifact_store import verify_package_checksum_manifest
+
+                verify_package_checksum_manifest(target.read_bytes(), require_manifest=True)
+            with zipfile.ZipFile(target) as archive:
+                names = archive.namelist()
+                if len(names) != len(set(names)):
+                    raise IntelligenceValidationError("student package contains duplicate members")
+                member = artifact_member
+                if not member and "model_metadata.json" in names:
+                    metadata = json.loads(archive.read("model_metadata.json").decode("utf-8"))
+                    if isinstance(metadata, Mapping):
+                        member = str(metadata.get("model_file") or metadata.get("artifact") or "") or None
+                member = member or NEWS_STUDENT_ARTIFACT_MEMBER
+                matched = next(
+                    (
+                        name
+                        for name in names
+                        if name == member or Path(name).name == Path(member).name
+                    ),
+                    None,
+                )
+                if matched is None or Path(matched).suffix.lower() != ".json":
+                    raise IntelligenceValidationError("student package has no declared JSON artifact")
+                payload = json.loads(archive.read(matched).decode("utf-8"))
+        else:
+            raise IntelligenceValidationError("local student artifact must be JSON or a package ZIP")
+    except IntelligenceProviderError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
+        raise ProviderUnavailableError("local student artifact could not be loaded") from exc
+    if not isinstance(payload, dict):
+        raise IntelligenceValidationError("student artifact must contain a JSON object")
+    validate_json_student_artifact(payload)
+    return payload
+
+
+def predict_json_student_artifact(
+    artifact: Mapping[str, Any],
+    text: str,
+    *,
+    source: str | None = None,
+    url: str | None = None,
+    published_at: Any = None,
+    received_at: Any = None,
+    is_duplicate: bool = False,
+    seeded_assets: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """Run the compact JSON Naive-Bayes student without scikit-learn."""
 
     validate_json_student_artifact(artifact)
@@ -301,6 +465,14 @@ def predict_json_student_artifact(artifact: Mapping[str, Any], text: str) -> dic
         for asset, keywords in asset_keywords.items()
         if any(str(keyword).lower() in text.lower() for keyword in (keywords or ()))
     ]
+    normalized_assets = tuple(dict.fromkeys([*seeded_assets, *assets]))
+    asset_probabilities = _safe_asset_probabilities(
+        artifact.get("affected_asset_probabilities"),
+        assets=normalized_assets,
+        fallback={},
+        text=text,
+        seeded=seeded_assets,
+    )
     return {
         "sentiment": sentiment,
         "sentiment_label": sentiment_label,
@@ -311,7 +483,16 @@ def predict_json_student_artifact(artifact: Mapping[str, Any], text: str) -> dic
         "severity": _clamp(float(numeric_means.get("severity", 0.20)), 0.0, 1.0),
         "novelty": _clamp(float(numeric_means.get("novelty", 0.40)), 0.0, 1.0),
         "confidence": _clamp((sentiment_confidence + event_type_probability) / 2, 0.0, 1.0),
-        "affected_assets": tuple(dict.fromkeys(assets)),
+        "affected_assets": normalized_assets,
+        "affected_asset_probabilities": asset_probabilities,
+        "source_reliability": _source_reliability(
+            source=source,
+            text=text,
+            url=url,
+            published_at=published_at,
+            received_at=received_at,
+            is_duplicate=is_duplicate,
+        ),
         "time_horizon": str(artifact.get("default_time_horizon", TimeHorizon.SHORT_TERM.value)),
         "local_model_version": str(artifact.get("version", "unknown")),
     }
@@ -329,13 +510,39 @@ class LocalStudentProvider:
         *,
         predictor: Callable[[str], Mapping[str, Any] | Awaitable[Mapping[str, Any]]] | None = None,
         model_name: str | None = None,
+        artifact_member: str | None = None,
     ) -> None:
         self.artifact_path = Path(artifact_path) if artifact_path else None
         self.predictor = predictor
+        self.artifact_member = artifact_member
         self.model = model_name or (self.artifact_path.stem if self.artifact_path else "local-student")
         self._artifact: Any = None
         self._loaded = False
         self._fallback = LocalRuleProvider()
+
+    @classmethod
+    def from_artifact(
+        cls,
+        artifact_path: str | Path,
+        *,
+        model_name: str | None = None,
+        artifact_member: str | None = None,
+    ) -> "LocalStudentProvider":
+        """Eagerly validate one installed artifact before selecting the provider."""
+        provider = cls(
+            artifact_path,
+            model_name=model_name,
+            artifact_member=artifact_member,
+        )
+        artifact = load_json_student_artifact(
+            artifact_path,
+            artifact_member=artifact_member,
+        )
+        provider._artifact = artifact
+        provider._loaded = True
+        if not model_name:
+            provider.model = str(artifact.get("version") or provider.model)
+        return provider
 
     def _load_artifact(self) -> Any:
         if self._loaded:
@@ -346,9 +553,11 @@ class LocalStudentProvider:
         if not self.artifact_path.exists():
             raise ProviderUnavailableError("local student artifact is not installed")
         try:
-            if self.artifact_path.suffix.lower() == ".json":
-                self._artifact = json.loads(self.artifact_path.read_text(encoding="utf-8"))
-                validate_json_student_artifact(self._artifact)
+            if self.artifact_path.suffix.lower() in {".json", ".zip"}:
+                self._artifact = load_json_student_artifact(
+                    self.artifact_path,
+                    artifact_member=self.artifact_member,
+                )
             else:
                 import joblib  # Existing optional lightweight dependency; imported only when used.
 
@@ -369,7 +578,16 @@ class LocalStudentProvider:
             return outcome
         artifact = self._load_artifact()
         if isinstance(artifact, Mapping):
-            return predict_json_student_artifact(artifact, document.text)
+            return predict_json_student_artifact(
+                artifact,
+                document.text,
+                source=document.source,
+                url=document.url,
+                published_at=document.published_at,
+                received_at=document.received_at,
+                is_duplicate=document.is_duplicate,
+                seeded_assets=document.relevant_assets,
+            )
         if artifact is None:
             raise ProviderUnavailableError("local student artifact is not installed")
         try:
@@ -393,10 +611,28 @@ class LocalStudentProvider:
             sentiment = {"positive": 1.0, "bullish": 1.0, "negative": -1.0, "bearish": -1.0}.get(label, 0.0)
         sentiment = _clamp(float(sentiment), -1.0, 1.0)
         direction = EventDirection.BULLISH.value if sentiment > 0.15 else EventDirection.BEARISH.value if sentiment < -0.15 else EventDirection.NEUTRAL.value
+        affected_assets = tuple(predicted.get("affected_assets", base["affected_assets"]) or ())
+        base_metadata = dict(base.get("metadata") or {})
+        source_reliability = predicted.get("source_reliability", base.get("source_reliability", 0.5))
+        try:
+            source_reliability = float(source_reliability)
+            if not math.isfinite(source_reliability):
+                raise ValueError
+        except (TypeError, ValueError):
+            source_reliability = float(base.get("source_reliability", 0.5))
+        source_reliability = _clamp(source_reliability, 0.0, 1.0)
+        asset_probabilities = _safe_asset_probabilities(
+            predicted.get("affected_asset_probabilities"),
+            assets=affected_assets,
+            fallback=base.get("affected_asset_probabilities", {}),
+            text=document.text,
+            seeded=document.relevant_assets,
+        )
         base.update(
             {
                 "event_type": predicted.get("event_type", base["event_type"]),
-                "affected_assets": predicted.get("affected_assets", base["affected_assets"]),
+                "affected_assets": affected_assets,
+                "affected_asset_probabilities": asset_probabilities,
                 "direction": predicted.get("direction", direction),
                 "sentiment": sentiment,
                 "severity": predicted.get("severity", base["severity"]),
@@ -407,12 +643,15 @@ class LocalStudentProvider:
                     "confidence", predicted.get("sentiment_confidence", base["confidence"])
                 ),
                 "source_summary": base["source_summary"],
+                "source_reliability": source_reliability,
                 "metadata": {
-                    **dict(base.get("metadata") or {}),
+                    **base_metadata,
                     "level": 1,
                     "event_type_probability": predicted.get("event_type_probability"),
                     "sentiment_confidence": predicted.get("sentiment_confidence"),
                     "local_model_version": predicted.get("local_model_version", self.model),
+                    "source_reliability": source_reliability,
+                    "affected_asset_probabilities": asset_probabilities,
                 },
             }
         )

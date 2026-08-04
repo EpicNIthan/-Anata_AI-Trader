@@ -61,6 +61,8 @@ class DeterministicPortfolioConstructor:
         self.minimum_edge = max(minimum_edge, 1e-9)
 
     def construct(self, ensemble: EnsembleDecision, context: PortfolioContext) -> PortfolioTarget:
+        if not isinstance(ensemble, EnsembleDecision):
+            raise TypeError("portfolio construction requires an EnsembleDecision")
         current = float(context.exposures.get(ensemble.symbol, 0.0))
         if ensemble.decision_status != EnsembleStatus.ACTIONABLE or context.equity <= 0:
             requested = 0.0

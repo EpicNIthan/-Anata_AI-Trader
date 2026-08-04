@@ -4,6 +4,11 @@ Audit date: 2026-07-23
 Scope: current `EpicNIthan/-Anata_AI-Trader` checkout before the V2 migration.  
 Classification vocabulary: **BLOCKER**, **CRITICAL**, **HIGH**, **MEDIUM**, **LOW**.
 
+> This file preserves the pre-implementation audit. The 2026-08-04 implementation
+> and real-data validation outcome is recorded in
+> [ANATA_V2_ACCEPTANCE.md](ANATA_V2_ACCEPTANCE.md); findings below describe the state
+> observed at audit time, not unresolved claims about the current checkout.
+
 ## Executive summary
 
 The repository is an operational paper-only FastAPI application with useful public-data

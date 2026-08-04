@@ -25,6 +25,12 @@ from app.db.models import (
 )
 from app.pipeline.domain import ModelLifecycle, ModelPrediction
 from app.pipeline.artifact_models import ArtifactModelError, RegisteredArtifactModel
+from app.pipeline.artifact_store import (
+    ArtifactIntegrityError,
+    ModelArtifactStore,
+    resolve_model_artifact,
+    verify_artifact_bytes,
+)
 
 
 REQUIRED_PACKAGE_FILES = {
@@ -68,12 +74,23 @@ class ArtifactValidator:
             return ArtifactValidation(False, checksum, payload if isinstance(payload, dict) else {}, ("MISSING_FEATURE_COLUMNS",))
         if target.suffix.lower() == ".zip":
             try:
+                content = target.read_bytes()
+                package_integrity = verify_artifact_bytes(
+                    content,
+                    filename=target.name,
+                    expected_checksum=checksum,
+                    require_package_manifest=False,
+                )
                 with zipfile.ZipFile(target) as archive:
                     names = set(archive.namelist())
                     missing = sorted(REQUIRED_PACKAGE_FILES - names)
                     manifest: dict[str, Any] = {
                         "package_files": sorted(names),
                         "missing_required_package_files": missing,
+                        "checksum_manifest_verified": package_integrity[
+                            "package_checksum_manifest"
+                        ]
+                        is not None,
                     }
                     if "model_metadata.json" in names:
                         metadata = json.loads(archive.read("model_metadata.json").decode("utf-8"))
@@ -104,6 +121,8 @@ class ArtifactValidator:
                         manifest,
                         tuple(f"MISSING_PACKAGE_FILE:{name}" for name in missing),
                     )
+            except ArtifactIntegrityError as exc:
+                return ArtifactValidation(False, checksum, {}, (str(exc),))
             except (OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError):
                 return ArtifactValidation(False, checksum, {}, ("INVALID_ARTIFACT_PACKAGE",))
         # Standalone joblib packages remain readable for existing deployments when
@@ -149,7 +168,10 @@ class ModelRegistry:
         training_dataset_version: str | None = None,
         forecast_horizon_seconds: int = 300,
         parent_model_id: str | None = None,
+        raw_payload: dict[str, Any] | None = None,
     ) -> ModelVersion:
+        if lifecycle == ModelLifecycle.CHAMPION:
+            raise ValueError("Register candidates before using the explicit promotion workflow")
         validation = self.validator.validate(path)
         if not validation.compatible:
             raise ValueError("Model artifact is incompatible: " + ", ".join(validation.errors))
@@ -171,11 +193,26 @@ class ModelRegistry:
             parent_model_id=parent_model_id,
             metrics=metrics or {},
             package_manifest=validation.manifest,
-            raw_payload={"artifact_validation": {"legacy_compatible": validation.legacy_compatible, "errors": list(validation.errors)}},
+            raw_payload={
+                **dict(raw_payload or {}),
+                "artifact_validation": {
+                    "legacy_compatible": validation.legacy_compatible,
+                    "errors": list(validation.errors),
+                },
+            },
         )
         self.session.add(row)
         self.session.flush()
+        self.store_artifact(row, path)
         return row
+
+    def store_artifact(self, model: ModelVersion, path: str | Path | None = None) -> None:
+        """Idempotently attach artifact bytes to ``model`` in this transaction."""
+
+        try:
+            ModelArtifactStore(self.session).put_path(model, path or model.path)
+        except ArtifactIntegrityError as exc:
+            raise ValueError(f"Model artifact could not be stored safely: {exc}") from exc
 
     def champion(self, *, model_family: str, symbol: str) -> ModelVersion | None:
         assignment = self.session.scalar(
@@ -202,6 +239,8 @@ class ModelRegistry:
             raise ValueError("Model version does not exist")
         if candidate.model_family and candidate.model_family != model_family:
             raise ValueError("Promotion family must match the registered model family")
+        if model_family == "intelligence.news_student_naive_bayes" and symbol_scope != "*":
+            raise ValueError("The context-only news student must be activated with wildcard scope")
         if candidate.lifecycle_state in {ModelLifecycle.SUSPENDED.value, ModelLifecycle.RETIRED.value}:
             raise ValueError("Suspended or retired models cannot become champion")
         if str(candidate.health_status or "").upper() in {"SUSPENDED", "RETIRED"}:
@@ -309,6 +348,8 @@ class ModelRegistry:
         model = self.session.get(ModelVersion, model_version_id)
         if model is None:
             raise ValueError("Model version does not exist")
+        if model.model_family == "intelligence.news_student_naive_bayes":
+            raise ValueError("The news student is context-only and cannot enter a trading sandbox")
         if model.lifecycle_state in {ModelLifecycle.SUSPENDED.value, ModelLifecycle.RETIRED.value}:
             raise ValueError("Suspended or retired models cannot enter a sandbox")
         validation = self._validate_runtime_model(model, action="start sandbox")
@@ -331,6 +372,8 @@ class ModelRegistry:
         model = self.session.get(ModelVersion, model_version_id)
         if model is None:
             raise ValueError("Model version does not exist")
+        if model.model_family == "intelligence.news_student_naive_bayes":
+            raise ValueError("The news student is context-only and cannot enter trading-model shadow inference")
         if model.lifecycle_state in {ModelLifecycle.SUSPENDED.value, ModelLifecycle.RETIRED.value}:
             raise ValueError("Suspended or retired models cannot enter shadow mode")
         self._validate_runtime_model(model, action="start shadow")
@@ -364,7 +407,14 @@ class ModelRegistry:
         return row
 
     def _validate_runtime_model(self, model: ModelVersion, *, action: str) -> ArtifactValidation:
-        validation = self.validator.validate(model.path)
+        try:
+            runtime_path = resolve_model_artifact(model, session=self.session)
+            # Lifecycle checks opportunistically backfill trusted pre-store rows
+            # while their original local artifact is still available.
+            self.store_artifact(model, runtime_path)
+        except ArtifactIntegrityError as exc:
+            raise ValueError(f"Cannot {action}: artifact integrity check failed ({exc})") from exc
+        validation = self.validator.validate(runtime_path)
         if not validation.compatible:
             raise ValueError(f"Cannot {action}: incompatible model artifact ({', '.join(validation.errors)})")
         if not model.feature_schema_version:
@@ -373,6 +423,24 @@ class ModelRegistry:
             raise ValueError(f"Cannot {action}: preprocessing version is missing")
         if not model.feature_columns:
             raise ValueError(f"Cannot {action}: required feature columns are missing")
+        if model.model_family == "intelligence.news_student_naive_bayes":
+            try:
+                from app.intelligence.providers import load_json_student_artifact
+
+                raw_payload = model.raw_payload if isinstance(model.raw_payload, dict) else {}
+                load_json_student_artifact(
+                    runtime_path,
+                    artifact_member=str(
+                        raw_payload.get("model_member")
+                        or raw_payload.get("model_file")
+                        or "student_artifact.json"
+                    ),
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"Cannot {action}: news student artifact load check failed ({type(exc).__name__}: {exc})"
+                ) from exc
+            return validation
         try:
             RegisteredArtifactModel.from_record(model)
         except ArtifactModelError as exc:

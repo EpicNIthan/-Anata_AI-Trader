@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import json
 import shutil
 import zipfile
@@ -70,6 +71,45 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the digest of an export file after its writer has closed it."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _actual_time_range(
+    session: Session,
+    spec: RawTableSpec,
+    *,
+    start: datetime | None,
+    end: datetime | None,
+    symbols: list[str] | None,
+) -> dict[str, str | None]:
+    """Return the actual first/last exported timestamps, not requested bounds."""
+
+    statement = select(func.min(spec.time_column), func.max(spec.time_column)).select_from(spec.model)
+    if start is not None:
+        statement = statement.where(spec.time_column >= start)
+    if end is not None:
+        statement = statement.where(spec.time_column < end)
+    if spec.model is Candle:
+        statement = statement.where(Candle.is_closed.is_(True))
+    symbol_column = getattr(spec.model, "symbol", None)
+    if symbols and symbol_column is not None:
+        statement = statement.where(symbol_column.in_([symbol.upper() for symbol in symbols]))
+    first, last = session.execute(statement).one()
+    first_utc = _as_utc(first)
+    last_utc = _as_utc(last)
+    return {
+        "first_timestamp": first_utc.isoformat() if first_utc else None,
+        "last_timestamp": last_utc.isoformat() if last_utc else None,
+    }
 
 
 def _parse_dt(value: Any, *, until: bool = False) -> datetime | None:
@@ -262,6 +302,8 @@ def _write_raw_folder(
     row_counts: dict[str, int] = {}
     tables_exported: dict[str, str] = {}
     file_sizes: dict[str, int] = {}
+    file_checksums: dict[str, str] = {}
+    table_time_ranges: dict[str, dict[str, str | None]] = {}
     warnings: list[str] = []
 
     for spec in selected_tables:
@@ -274,6 +316,14 @@ def _write_raw_folder(
         row_counts[spec.name] = rows_written
         tables_exported[spec.name] = path.name
         file_sizes[path.name] = path.stat().st_size
+        file_checksums[path.name] = _sha256_file(path)
+        table_time_ranges[spec.name] = _actual_time_range(
+            session,
+            spec,
+            start=start,
+            end=end,
+            symbols=symbols,
+        )
 
     if row_counts.get("news_articles", 0) == 0 and any(spec.name == "news_articles" for spec in selected_tables):
         warnings.append("No news articles exported for this range.")
@@ -296,6 +346,8 @@ def _write_raw_folder(
         "tables_exported": tables_exported,
         "row_counts": row_counts,
         "file_sizes": file_sizes,
+        "file_checksums_sha256": file_checksums,
+        "table_time_ranges": table_time_ranges,
         "symbols": _symbol_values(session, start, end, symbols),
         "time_range": {
             "start": start.isoformat() if start else None,
@@ -303,6 +355,12 @@ def _write_raw_folder(
         },
         "options": options,
         "warnings": warnings,
+        "verification": {
+            "writers_closed": True,
+            "manifest_complete": True,
+            "news_count": int(row_counts.get("news_articles", 0)),
+            "derivatives_count": int(row_counts.get("external_data_events", 0)),
+        },
     }
     manifest_path = folder / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")

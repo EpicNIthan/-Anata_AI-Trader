@@ -90,8 +90,8 @@ _ORDER_TRANSITIONS: dict[OrderState, set[OrderState]] = {
     OrderState.CREATED: {OrderState.RISK_APPROVED, OrderState.REJECTED, OrderState.ERROR},
     OrderState.RISK_APPROVED: {OrderState.SUBMITTED, OrderState.REJECTED, OrderState.ERROR},
     OrderState.SUBMITTED: {OrderState.ACKNOWLEDGED, OrderState.REJECTED, OrderState.ERROR, OrderState.EXPIRED},
-    OrderState.ACKNOWLEDGED: {OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCEL_PENDING, OrderState.REJECTED, OrderState.ERROR},
-    OrderState.PARTIALLY_FILLED: {OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCEL_PENDING, OrderState.ERROR},
+    OrderState.ACKNOWLEDGED: {OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCEL_PENDING, OrderState.REJECTED, OrderState.EXPIRED, OrderState.ERROR},
+    OrderState.PARTIALLY_FILLED: {OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCEL_PENDING, OrderState.EXPIRED, OrderState.ERROR},
     OrderState.CANCEL_PENDING: {OrderState.CANCELLED, OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.ERROR},
 }
 
