@@ -18,6 +18,14 @@
     if (!panel || panel.dataset.handoffReady === "1") return;
     panel.dataset.handoffReady = "1";
 
+    // dashboard.js still updates this old warning every refresh. Hide it so the
+    // user sees one stable handoff status instead of two messages blinking.
+    const oldWarning = document.getElementById("dbStorageWarning");
+    if (oldWarning) {
+      oldWarning.textContent = "";
+      oldWarning.style.display = "none";
+    }
+
     const tools = panel.querySelector(".panel-tools");
     if (!tools) return;
     tools.innerHTML = `
@@ -34,62 +42,64 @@
     const downloadButton = document.getElementById("handoffDownloadButton");
     const deleteButton = document.getElementById("handoffDeleteButton");
     const output = document.getElementById("dbStorageActionResult");
+    let pollTimer = null;
 
-    downloadButton?.addEventListener("click", async () => {
-      downloadButton.disabled = true;
-      if (output) output.textContent = "Preparing one complete ZIP. Keep this page open...";
+    async function refreshDownloadState() {
       try {
-        const data = await api("/api/data/handoff/prepare", { method: "POST" });
-        if (data.status === "empty") {
-          if (output) output.textContent = data.message || "No finished data yet.";
-          return;
+        const status = await api("/api/data/handoff/status");
+        if (status.download_completed_at && status.download_ready_to_delete) {
+          if (output) {
+            output.textContent = `Download completed: ${status.latest_archive_id}. The downloaded range is now safe to delete.`;
+          }
+          if (pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
         }
-        if (output) {
-          output.textContent = `ZIP ready: ${data.archive_id} · ${data.start || "-"} → ${data.end || "-"}`;
-        }
-        const anchor = document.createElement("a");
-        anchor.href = data.download_url;
-        anchor.download = data.archive_id;
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-      } catch (error) {
-        if (output) output.textContent = `Download preparation failed: ${error.message}`;
-      } finally {
-        downloadButton.disabled = false;
+      } catch (_) {}
+    }
+
+    downloadButton?.addEventListener("click", () => {
+      if (output) {
+        output.textContent = "Preparing and downloading the ZIP in one request. Keep this page open until the browser finishes the download...";
       }
+      const anchor = document.createElement("a");
+      anchor.href = `/api/data/handoff/download-latest?ts=${Date.now()}`;
+      anchor.download = "anata_dataset.zip";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(refreshDownloadState, 3000);
+      setTimeout(refreshDownloadState, 1500);
     });
 
     deleteButton?.addEventListener("click", async () => {
       const ok = window.confirm(
-        "Delete only the dataset range from the ZIP you just downloaded? " +
-        "The bot's small strategy-history cache and operational state will be kept."
+        "Delete only the dataset range whose ZIP finished downloading? " +
+        "The paper bot's required strategy history and operational state will be kept."
       );
       if (!ok) return;
+
       deleteButton.disabled = true;
-      if (output) output.textContent = "Deleting downloaded rows and rebuilding the bot history cache...";
+      if (output) output.textContent = "Checking completed download, then deleting only that downloaded range...";
       try {
         const data = await api("/api/data/handoff/delete-latest", { method: "POST" });
         const deleted = Object.values(data.deleted_rows || {}).reduce((sum, value) => sum + Number(value || 0), 0);
-        const ready = Object.values(data.strategy_history?.symbols || {}).every((item) => item.status === "ready");
+        const statuses = Object.values(data.strategy_history?.symbols || {});
+        const ready = statuses.length > 0 && statuses.every((item) => item.status === "ready");
         if (output) {
-          output.textContent = `Deleted ${deleted.toLocaleString()} downloaded rows. Bot history: ${ready ? "READY" : "building/partial"}. Next file starts ${data.next_archive_start || "-"}.`;
+          output.textContent = `Deleted ${deleted.toLocaleString()} downloaded rows. Bot history: ${ready ? "READY" : "building/partial"}. Next dataset starts ${data.next_archive_start || "-"}.`;
         }
       } catch (error) {
-        if (output) output.textContent = `Delete failed: ${error.message}`;
+        if (output) output.textContent = `Delete blocked: ${error.message}`;
       } finally {
         deleteButton.disabled = false;
       }
     });
 
-    function rewriteWarning() {
-      const warning = document.getElementById("dbStorageWarning");
-      if (warning && warning.textContent.trim()) {
-        warning.textContent = "Database is large. Download the complete dataset ZIP first, then delete only that downloaded range.";
-      }
-    }
-    rewriteWarning();
-    setInterval(rewriteWarning, 3000);
+    refreshDownloadState();
   }
 
   if (document.readyState === "loading") {
