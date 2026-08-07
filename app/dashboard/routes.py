@@ -29,7 +29,6 @@ def _fmt(value: object | None, digits: int = 2) -> str:
 
 
 def _dashboard_symbols() -> list[str]:
-    """Return the configured symbol universe used by dashboard pages."""
     return list(
         dict.fromkeys(
             [
@@ -42,9 +41,16 @@ def _dashboard_symbols() -> list[str]:
 
 
 def _template_response(request: Request, template_name: str, context: dict[str, Any]) -> HTMLResponse:
-    """Render an authenticated dashboard page without accepting URL credentials."""
+    response = templates.TemplateResponse(request, template_name, context)
+    if template_name != "dashboard.html":
+        return response
 
-    return templates.TemplateResponse(request, template_name, context)
+    body = response.body.decode("utf-8")
+    dashboard_script = '<script src="/static/dashboard.js?v=trade-terminal-v19"></script>'
+    storage_script = '<script src="/static/storage_handoff.js?v=handoff-v1"></script>'
+    if dashboard_script in body:
+        body = body.replace(dashboard_script, f"{storage_script}\n    {dashboard_script}", 1)
+    return HTMLResponse(content=body, status_code=response.status_code)
 
 
 def _safe_dashboard_next(value: str | None) -> str:
@@ -65,8 +71,6 @@ def admin_login(request: Request, next: str = "/vision") -> HTMLResponse:
 
 @router.post("/admin/session", include_in_schema=False)
 async def create_admin_session(request: Request) -> RedirectResponse:
-    """Exchange a form-body token for an HTTP-only cookie; never read secrets from URLs."""
-
     fields = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
     token = (fields.get("admin_token") or [""])[0]
     next_path = _safe_dashboard_next((fields.get("next") or ["/vision"])[0])
@@ -119,7 +123,6 @@ def vision(
     request: Request,
     _: None = Depends(require_admin),
 ) -> HTMLResponse:
-    """Render the read-only AI Vision page without changing the admin dashboard."""
     dashboard_symbols = _dashboard_symbols()
     context: dict[str, Any] = {
         "request": request,

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.api.chart_overlay import router as chart_overlay_router
+from app.api.dataset_handoff import router as dataset_handoff_router
 from app.api.raw_data_maintenance import router as raw_data_maintenance_router
 from app.api.regime_pullback import router as regime_pullback_router
 from app.api.routes import router as api_router
@@ -22,6 +23,7 @@ from app.services.auto_trader import AutoTraderService
 from app.services.data_lifecycle import DataLifecycleService
 from app.services.enrichment_service import EnrichmentService
 from app.services.regime_label_builder import RegimeLabelMaintenanceService
+from app.services.strategy_history_bootstrap import StrategyHistoryBootstrapService
 from app.services.training_service import TrainingService
 from app.strategies.regime_pullback_v1 import STRATEGY_NAME, STRATEGY_VERSION
 
@@ -30,13 +32,12 @@ setup_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Importing the strategy service above registers its additive SQLAlchemy models
-    # before create_all. No legacy table or row is dropped or rewritten.
     create_db_and_tables()
     settings.model_dir.mkdir(parents=True, exist_ok=True)
     manager = WorkerManager()
     auto_trader = AutoTraderService()
     label_service = RegimeLabelMaintenanceService()
+    history_service = StrategyHistoryBootstrapService()
     data_lifecycle = DataLifecycleService(interval_seconds=settings.data_lifecycle_interval_seconds)
     training_service = TrainingService()
     enrichment_service = EnrichmentService()
@@ -46,6 +47,7 @@ async def lifespan(app: FastAPI):
     app.state.worker_manager = manager
     app.state.auto_trader = auto_trader
     app.state.regime_label_service = label_service
+    app.state.strategy_history = history_service
     app.state.data_lifecycle = data_lifecycle
     app.state.training_service = training_service
     app.state.enrichment_service = enrichment_service
@@ -53,8 +55,10 @@ async def lifespan(app: FastAPI):
     run_collectors = role in {"all", "collector"}
     run_paper_trader = role in {"all", "paper-trader"}
     run_enrichment = role in {"all", "enrichment"}
-    if run_collectors:
-        await data_lifecycle.start()
+
+    # Collected data is no longer deleted by an automatic retention worker.
+    # Deletion happens only after the user downloads a handoff ZIP and confirms it.
+
     if run_collectors and settings.enable_market_collector:
         await manager.start("market")
     if run_collectors and settings.enable_spot_context_collector:
@@ -76,6 +80,8 @@ async def lifespan(app: FastAPI):
         await manager.start("liquidations")
     if run_enrichment and settings.enrichment_enabled:
         await enrichment_service.start()
+    if run_paper_trader:
+        await history_service.start()
     if run_paper_trader and settings.auto_trader_enabled:
         await auto_trader.start()
         await label_service.start()
@@ -83,6 +89,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await label_service.stop()
+        await history_service.stop()
         await data_lifecycle.stop()
         await enrichment_service.stop()
         await auto_trader.stop()
@@ -101,6 +108,7 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 app.include_router(webhook_router)
 app.include_router(api_router)
 app.include_router(chart_overlay_router)
+app.include_router(dataset_handoff_router)
 app.include_router(v2_router)
 app.include_router(vision_router)
 app.include_router(raw_data_maintenance_router)
@@ -121,6 +129,7 @@ def health() -> dict[str, object]:
             "paper_only": True,
             "live_trading_enabled": False,
         }
+    history = getattr(app.state, "strategy_history", None)
     return {
         "status": "ok",
         "database": database_ok,
@@ -132,6 +141,8 @@ def health() -> dict[str, object]:
         "worker_role": settings.worker_role,
         "symbols": getattr(getattr(app.state, "auto_trader", None), "symbols", settings.binance_symbols),
         "auto_trader_enabled": settings.auto_trader_enabled,
+        "strategy_history": history.status() if history else None,
+        "dataset_cleanup_mode": "manual_after_download",
         "derivatives_enabled": settings.derivatives_enabled,
         "external_collectors_enabled": {
             "spot_context": settings.enable_spot_context_collector,
