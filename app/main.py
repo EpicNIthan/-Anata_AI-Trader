@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from app.api.chart_overlay import router as chart_overlay_router
 from app.api.raw_data_maintenance import router as raw_data_maintenance_router
 from app.api.regime_pullback import router as regime_pullback_router
 from app.api.routes import router as api_router
@@ -99,6 +100,7 @@ static_dir = Path("app/dashboard/static")
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 app.include_router(webhook_router)
 app.include_router(api_router)
+app.include_router(chart_overlay_router)
 app.include_router(v2_router)
 app.include_router(vision_router)
 app.include_router(raw_data_maintenance_router)

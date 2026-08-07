@@ -44,7 +44,21 @@ def _dashboard_symbols() -> list[str]:
 def _template_response(request: Request, template_name: str, context: dict[str, Any]) -> HTMLResponse:
     """Render an authenticated dashboard page without accepting URL credentials."""
 
-    return templates.TemplateResponse(request, template_name, context)
+    response = templates.TemplateResponse(request, template_name, context)
+    if template_name != "dashboard.html":
+        return response
+
+    # Load the chart extension before dashboard.js. It expands historical candle
+    # requests and decorates the existing paper-only chart with entry/exit/SL/TP.
+    body = response.body.decode("utf-8")
+    dashboard_script = '<script src="/static/dashboard.js?v=trade-terminal-v19"></script>'
+    extension_scripts = (
+        '<script src="/static/chart_extension.js?v=regime-chart-v1"></script>\n    '
+        + dashboard_script
+    )
+    if dashboard_script in body:
+        body = body.replace(dashboard_script, extension_scripts, 1)
+    return HTMLResponse(content=body, status_code=response.status_code, headers=dict(response.headers))
 
 
 def _safe_dashboard_next(value: str | None) -> str:
