@@ -10,7 +10,11 @@ from app.db.models import Base
 from app.db.session import get_session
 from app.security import require_admin
 from app.services import dataset_handoff as handoff
-from app.services.handoff_download import download_status, prepare_archive_path, stream_archive
+from app.services.handoff_stream import (
+    handoff_download_status,
+    prepare_stream_plan,
+    stream_dataset_archive,
+)
 from app.services.strategy_history_bootstrap import ensure_strategy_history
 
 router = APIRouter(
@@ -47,14 +51,13 @@ def _exact_dataset_specs() -> list[tuple[str, Any, Any]]:
 handoff._dataset_specs = _exact_dataset_specs
 
 
-def _stream_response(archive_id: str, path_size: int) -> StreamingResponse:
-    safe_name = archive_id.replace('"', '')
+def _stream_response(archive_id: str) -> StreamingResponse:
+    safe_name = archive_id.replace('"', "")
     return StreamingResponse(
-        stream_archive(archive_id),
+        stream_dataset_archive(archive_id),
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{safe_name}"',
-            "Content-Length": str(path_size),
             "Cache-Control": "no-store",
             "X-Accel-Buffering": "no",
         },
@@ -63,13 +66,13 @@ def _stream_response(archive_id: str, path_size: int) -> StreamingResponse:
 
 @router.get("/status")
 def status(session: Session = Depends(get_session)) -> dict:
-    return download_status(session)
+    return handoff_download_status(session)
 
 
 @router.post("/prepare")
 def prepare(session: Session = Depends(get_session)) -> dict:
     try:
-        return handoff.prepare_handoff(session)
+        return prepare_stream_plan(session)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Dataset preparation failed: {type(exc).__name__}: {exc}") from exc
 
@@ -77,12 +80,10 @@ def prepare(session: Session = Depends(get_session)) -> dict:
 @router.get("/download-latest")
 def download_latest(session: Session = Depends(get_session)) -> StreamingResponse:
     try:
-        plan = handoff.prepare_handoff(session)
+        plan = prepare_stream_plan(session)
         if plan.get("status") == "empty":
             raise HTTPException(status_code=404, detail=plan.get("message") or "No dataset is available yet")
-        archive_id = str(plan["archive_id"])
-        path = prepare_archive_path(session, archive_id)
-        return _stream_response(archive_id, path.stat().st_size)
+        return _stream_response(str(plan["archive_id"]))
     except HTTPException:
         raise
     except Exception as exc:
@@ -91,13 +92,10 @@ def download_latest(session: Session = Depends(get_session)) -> StreamingRespons
 
 @router.get("/download/{archive_id}")
 def download(archive_id: str, session: Session = Depends(get_session)) -> StreamingResponse:
-    try:
-        path = prepare_archive_path(session, archive_id)
-        return _stream_response(archive_id, path.stat().st_size)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Prepared dataset archive not found") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Dataset download failed: {type(exc).__name__}: {exc}") from exc
+    state = handoff._state(session)
+    if state.latest_archive_id != archive_id or state.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Prepared dataset archive not found")
+    return _stream_response(archive_id)
 
 
 @router.post("/delete-latest")

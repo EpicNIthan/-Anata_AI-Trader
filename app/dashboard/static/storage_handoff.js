@@ -18,8 +18,6 @@
     if (!panel || panel.dataset.handoffReady === "1") return;
     panel.dataset.handoffReady = "1";
 
-    // dashboard.js still updates this old warning every refresh. Hide it so the
-    // user sees one stable handoff status instead of two messages blinking.
     const oldWarning = document.getElementById("dbStorageWarning");
     if (oldWarning) {
       oldWarning.textContent = "";
@@ -49,7 +47,7 @@
         const status = await api("/api/data/handoff/status");
         if (status.download_completed_at && status.download_ready_to_delete) {
           if (output) {
-            output.textContent = `Download completed: ${status.latest_archive_id}. The downloaded range is now safe to delete.`;
+            output.textContent = `Server finished sending ${status.latest_archive_id}. Check that the ZIP exists on your PC before deleting its DB range.`;
           }
           if (pollTimer) {
             clearInterval(pollTimer);
@@ -61,11 +59,10 @@
 
     downloadButton?.addEventListener("click", () => {
       if (output) {
-        output.textContent = "Preparing and downloading the ZIP in one request. Keep this page open until the browser finishes the download...";
+        output.textContent = "Streaming the dataset directly from PostgreSQL into a ZIP download. Keep this page and the download open...";
       }
       const anchor = document.createElement("a");
       anchor.href = `/api/data/handoff/download-latest?ts=${Date.now()}`;
-      anchor.download = "anata_dataset.zip";
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -78,12 +75,12 @@
     deleteButton?.addEventListener("click", async () => {
       const ok = window.confirm(
         "Delete only the dataset range whose ZIP finished downloading? " +
-        "The paper bot's required strategy history and operational state will be kept."
+        "Do this only after you can see the ZIP on your PC. The paper bot's strategy history and operational state will be kept."
       );
       if (!ok) return;
 
       deleteButton.disabled = true;
-      if (output) output.textContent = "Checking completed download, then deleting only that downloaded range...";
+      if (output) output.textContent = "Checking completed transfer, then deleting only that downloaded range...";
       try {
         const data = await api("/api/data/handoff/delete-latest", { method: "POST" });
         const deleted = Object.values(data.deleted_rows || {}).reduce((sum, value) => sum + Number(value || 0), 0);

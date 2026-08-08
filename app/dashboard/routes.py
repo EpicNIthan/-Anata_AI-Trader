@@ -45,11 +45,16 @@ def _template_response(request: Request, template_name: str, context: dict[str, 
     if template_name != "dashboard.html":
         return response
 
+    # Load extensions before dashboard.js. chart_extension must patch fetch and
+    # register the Lightweight Charts hooks before dashboard.js creates the series.
     body = response.body.decode("utf-8")
     dashboard_script = '<script src="/static/dashboard.js?v=trade-terminal-v19"></script>'
-    storage_script = '<script src="/static/storage_handoff.js?v=handoff-v1"></script>'
+    extension_scripts = (
+        '<script src="/static/storage_handoff.js?v=handoff-v3"></script>\n'
+        '    <script src="/static/chart_extension.js?v=chart-signals-v2"></script>'
+    )
     if dashboard_script in body:
-        body = body.replace(dashboard_script, f"{storage_script}\n    {dashboard_script}", 1)
+        body = body.replace(dashboard_script, f"{extension_scripts}\n    {dashboard_script}", 1)
     return HTMLResponse(content=body, status_code=response.status_code)
 
 
